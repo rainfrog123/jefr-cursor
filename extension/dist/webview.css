@@ -486,7 +486,7 @@ body {
 	z-index: 10;
 	margin-left: 0;
 	margin-right: 0;
-	margin-bottom: 12px;
+	margin-bottom: 8px;
 	padding: 0;
 	box-shadow: var(--shadow-sm);
 }
@@ -498,19 +498,19 @@ body {
 
 .input-box {
 	width: 100%;
-	padding: 14px 16px 8px;
+	padding: 10px 12px 4px;
 	background: transparent;
 	color: var(--input-fg);
 	border: none !important;
 	border-radius: 0;
 	resize: none;
 	font-family: var(--font-ui);
-	font-size: var(--text-base);
-	line-height: 1.55;
+	font-size: var(--text-sm);
+	line-height: 1.45;
 	outline: none !important;
 	box-shadow: none !important;
-	min-height: 72px;
-	max-height: 180px;
+	min-height: 44px;
+	max-height: 120px;
 }
 
 .input-box:focus,
@@ -534,8 +534,8 @@ input:focus-visible {
 
 .input-actions {
 	display: flex;
-	gap: 8px;
-	padding: 8px 10px 10px;
+	gap: 6px;
+	padding: 4px 8px 6px;
 	align-items: center;
 	justify-content: flex-end;
 }
@@ -550,8 +550,8 @@ input:focus-visible {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
-	width: 32px;
-	height: 32px;
+	width: 28px;
+	height: 28px;
 	border: 1px solid var(--border);
 	border-radius: 999px;
 	background: transparent;
@@ -1721,9 +1721,9 @@ input:focus-visible {
 .compose-attachments,
 .pasted-images {
 	display: flex;
-	gap: 8px;
+	gap: 6px;
 	flex-wrap: wrap;
-	padding: 12px 14px 0;
+	padding: 8px 10px 0;
 }
 
 .attach-file-chip {
