@@ -30110,7 +30110,7 @@ var LOG_FILE = path.join(DATA_DIR, "server.log");
 var POLL_INTERVAL = 100;
 var HEARTBEAT_INTERVAL = Number(process.env.MESSENGER_HEARTBEAT_INTERVAL_MS) || 8e3;
 var MAX_WAIT_MS = Number(process.env.MESSENGER_MAX_WAIT_MS) || 12e4;
-var SYSTEM_SUFFIX = "\n\n---\n[system] The message above was sent by the user via the plugin. After replying, call the jefr cursor MCP check_messages tool to keep listening for new messages.";
+var SYSTEM_SUFFIX = "\n\n---\n[system] The message above was sent by the user via the plugin. After replying, call the jefr MCP check_messages tool to keep listening for new messages.";
 async function ensureDataDir() {
   await fs.mkdir(DATA_DIR, { recursive: true });
 }
@@ -30249,7 +30249,7 @@ async function processMessage(msg) {
   }
 }
 var server = new McpServer({
-  name: "jefr cursor",
+  name: "jefr",
   version: "1.0.0"
 }, {
   capabilities: {
@@ -30291,7 +30291,7 @@ async function emitHeartbeat(extra, message) {
     await server.sendLoggingMessage(
       {
         level: "info",
-        logger: "jefr cursor",
+        logger: "jefr",
         data: message
       },
       extra.sessionId
@@ -30385,7 +30385,7 @@ server.tool(
       if (Date.now() >= nextHeartbeatAt) {
         await emitHeartbeat(
           extra,
-          "jefr cursor is still waiting for the next user message."
+          "jefr is still waiting for the next user message."
         );
         nextHeartbeatAt = Date.now() + HEARTBEAT_INTERVAL;
       }
@@ -30547,7 +30547,7 @@ server.tool(
       if (Date.now() >= nextHeartbeatAt) {
         await emitHeartbeat(
           extra,
-          "jefr cursor is still waiting for the user's answer."
+          "jefr is still waiting for the user's answer."
         );
         nextHeartbeatAt = Date.now() + HEARTBEAT_INTERVAL;
       }

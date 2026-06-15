@@ -68,7 +68,7 @@ jefr cursor is a Cursor IDE extension that uses the **Model Context Protocol (MC
 - **Responsibilities**:
   - Text/image/file input (with drag-and-drop)
   - Single/multi-select questions with custom text
-  - Reply summary modal
+  - Unified send/reply history list (history-item-v2 rows)
   - Send history with resend
   - Pending message queue
   - Tutorial tab
@@ -133,7 +133,7 @@ The MCP server and extension are **separate processes** sharing a directory.
 ### 4.5 Agent pushes reply summary
 
 1. Agent calls `check_messages` with optional `reply`
-2. Summary written to `reply.json` → shown in Webview modal
+2. Summary written to `reply.json` → appended to the Send history list in Webview
 
 ---
 

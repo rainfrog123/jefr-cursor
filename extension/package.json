@@ -1,8 +1,8 @@
 {
 	"name": "jefr-cursor",
-	"displayName": "jefr cursor",
-	"description": "jefr cursor - Cursor AI side-panel chat via MCP",
-	"version": "8.9.3",
+	"displayName": "jefr",
+	"description": "jefr - Cursor AI side-panel chat via MCP",
+	"version": "8.9.0",
 	"publisher": "jefr",
 	"license": "MIT",
 	"engines": {
@@ -11,14 +11,16 @@
 	"categories": [
 		"Other"
 	],
-	"activationEvents": ["onStartupFinished"],
+	"activationEvents": [
+		"onStartupFinished"
+	],
 	"main": "./dist/extension.js",
 	"contributes": {
 		"viewsContainers": {
 			"panel": [
 				{
 					"id": "mcpMessenger",
-					"title": "jefr cursor",
+					"title": "jefr",
 					"icon": "media/icon.svg"
 				}
 			]
@@ -28,26 +30,26 @@
 				{
 					"type": "webview",
 					"id": "mcpMessenger.mainView",
-					"name": "jefr cursor"
+					"name": "jefr"
 				}
 			]
 		},
 		"commands": [
 			{
 				"command": "mcpMessenger.setupMcp",
-				"title": "jefr cursor: Install MCP config"
+				"title": "jefr: Install MCP config"
 			},
 			{
 				"command": "mcpMessenger.removeMcp",
-				"title": "jefr cursor: Remove MCP config"
+				"title": "jefr: Remove MCP config"
 			},
 			{
 				"command": "mcpMessenger.sendFile",
-				"title": "jefr cursor: Send file to queue"
+				"title": "jefr: Send file to queue"
 			},
 			{
 				"command": "mcpMessenger.openConsole",
-				"title": "jefr cursor: Open local console"
+				"title": "jefr: Open local console"
 			}
 		],
 		"menus": {
@@ -81,5 +83,10 @@
 		"react": "^18.2.0",
 		"react-dom": "^18.2.0",
 		"typescript": "^5.0.0"
+	},
+	"__metadata": {
+		"installedTimestamp": 1781545266118,
+		"targetPlatform": "undefined",
+		"size": 1401230
 	}
 }

@@ -99,6 +99,12 @@ function writeQueue(items) {
   ensureDir();
   fs.writeFileSync(QUEUE_FILE, JSON.stringify(items, null, 2), "utf-8");
 }
+function formatHistoryTime(date = new Date()) {
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
+}
+function pushHistoryItem(item) {
+  mainPanel?.webview.postMessage({ type: "historyAppend", item });
+}
 function sendText(text) {
   const queue = readQueue();
   queue.push({
@@ -417,6 +423,9 @@ function applyMcpServerEntry(config, messengerDataDir) {
   if (config.mcpServers["jefr cursor"]) {
     delete config.mcpServers["jefr cursor"];
   }
+  if (config.mcpServers["jefr"]) {
+    delete config.mcpServers["jefr"];
+  }
   const mcpServerConfig = {
     command: "node",
     args: [getMcpServerPath()]
@@ -424,7 +433,7 @@ function applyMcpServerEntry(config, messengerDataDir) {
   if (messengerDataDir) {
     mcpServerConfig.env = { MESSENGER_DATA_DIR: messengerDataDir };
   }
-  config.mcpServers["jefr cursor"] = mcpServerConfig;
+  config.mcpServers["jefr"] = mcpServerConfig;
   return config;
 }
 function setupGlobalMcpConfig(messengerDataDir) {
@@ -485,7 +494,7 @@ function removeMcpConfig(workspaceFolder) {
       const config = JSON.parse(fs.readFileSync(mcpJsonPath, "utf-8"));
       if (!config.mcpServers)
         config.mcpServers = {};
-      const keys = ["jefr cursor", "jefr cursor", "moyu-message"];
+      const keys = ["jefr", "jefr cursor", "moyu-message"];
       for (const key of keys) {
         if (config.mcpServers[key]) {
           delete config.mcpServers[key];
@@ -525,7 +534,7 @@ alwaysApply: true
 8. Users may add custom text (Other field) on each question; no extra option needed for that.
 9. After \`ask_question\` returns an answer, still call \`check_messages\` to keep listening.
 10. Do not use \`ask_question\` at the end of every turn to ask "anything else?"; end turns with \`check_messages\` only. Use \`ask_question\` only when a real decision is needed.
-11. \`check_messages\` accepts optional \`reply\` (string, Markdown): summary appended to **Reply history** in the Send history tab (no popup). Example: \`{ "reply": "## Summary\nChanges complete..." }\`
+11. \`check_messages\` accepts optional \`reply\` (string, Markdown): summary shown in the plugin modal. Example: \`{ "reply": "## Summary\nChanges complete..." }\`
 12. Before ending a session, prefer passing \`reply\` with key conclusions; omit \`reply\` if no summary is needed.
 13. Do not spawn subagents for parallel tasks.
 14. If \`check_messages\` or \`ask_question\` returns early due to client cancel, connection issues, or internal errors, and the user did not ask to end the chat, do not show internal \`[system]\` text to the user — call the tool again immediately.
@@ -533,7 +542,7 @@ alwaysApply: true
 16. \`progress\` should include: what was done, current approach, next step. Use concise Markdown.
 
 ---
-**End of turn (mandatory)**: Only after the reply is **fully complete**, the last step must call the jefr cursor MCP \`check_messages\` tool (CallMcpTool, server identifier for jefr cursor, toolName \`check_messages\`, arguments \`{}\`). Never call it at the start of a turn or before the reply is done. Use \`ask_question\` only when the user must make a choice during the task (e.g. pick a framework or plan).`;
+**End of turn (mandatory)**: Only after the reply is **fully complete**, the last step must call the jefr MCP \`check_messages\` tool (CallMcpTool, server identifier for jefr, toolName \`check_messages\`, arguments \`{}\`). Never call it at the start of a turn or before the reply is done. Use \`ask_question\` only when the user must make a choice during the task (e.g. pick a framework or plan).`;
 function setupCursorRules(workspaceFolder) {
   const rulesDir = path.join(workspaceFolder, ".cursor", "rules");
   if (!fs.existsSync(rulesDir)) {
@@ -884,7 +893,7 @@ function getControlPanelHtml() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>jefr cursor - Remote Console</title>
+<title>jefr - Remote Console</title>
 <style>
 :root{--bg:#0f1117;--bg2:#161822;--bg3:#1c1f2e;--fg:#c8cdd8;--fg2:rgba(200,205,216,0.5);--border:#252840;--accent:#7c6bf5;--accent2:#60a5fa;--accent-soft:rgba(124,107,245,0.1);--success:#22c55e;--danger:#ef4444;--warn:#f59e0b;--radius:12px}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -968,7 +977,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;
 </head>
 <body>
 <div class="wrap">
-	<div class="hdr"><h1>jefr cursor</h1><p>Remote Console</p></div>
+	<div class="hdr"><h1>jefr</h1><p>Remote Console</p></div>
 
 	<div class="stat-row">
 		<div class="stat-card"><div id="statConn" class="stat-val off">-</div><div class="stat-label">Connection</div></div>
@@ -1301,7 +1310,7 @@ function activate(context) {
   autoSetupMcp();
   setWorkspaceInfo(getWorkspaceName(), getWorkspacePath() || "");
   startLocalServer().then((port) => {
-    console.log(`jefr cursor console started: http://127.0.0.1:${port}`);
+    console.log(`jefr console started: http://127.0.0.1:${port}`);
   }).catch((e) => {
     console.error("Failed to start console server:", e);
   });
@@ -1496,14 +1505,14 @@ function autoSetupMcp(workspaceFolders = vscode.workspace.workspaceFolders || []
   const globalChanged = setupGlobalMcpConfig(currentDataDir);
   if (workspaceFolders.length === 0) {
     if (globalChanged) {
-      vscode.window.showInformationMessage("jefr cursor MCP installed to global config. Restart Cursor to apply.");
+      vscode.window.showInformationMessage("jefr MCP installed to global config. Restart Cursor to apply.");
     }
     return;
   }
   const changedCount = setupMcpForFolders(workspaceFolders);
   if (changedCount > 0 || globalChanged) {
     vscode.window.showInformationMessage(
-      `jefr cursor auto-installed config to ${changedCount} workspace(s). Restart Cursor to apply.`
+      `jefr auto-installed config to ${changedCount} workspace(s). Restart Cursor to apply.`
     );
   }
 }
@@ -1566,6 +1575,11 @@ var MessengerViewProvider = class {
           resetIdleTimer();
           triggerCursorChat();
           break;
+        case "pickAttachment":
+          if (!this.checkCard())
+            return;
+          this.handlePickAttachment();
+          break;
         case "sendImage":
           if (!this.checkCard())
             return;
@@ -1577,12 +1591,22 @@ var MessengerViewProvider = class {
             return;
           this.handlePastedImage(msg.dataUrl, msg.caption);
           resetIdleTimer();
+          triggerCursorChat();
           break;
         case "sendFile":
           if (!this.checkCard())
             return;
           this.handleSendFile();
           resetIdleTimer();
+          break;
+        case "resendFile":
+          if (!this.checkCard())
+            return;
+          if (msg.path) {
+            sendFile(msg.path);
+            resetIdleTimer();
+            triggerCursorChat();
+          }
           break;
         case "submitAnswer":
           writeAnswer(msg.data);
@@ -1660,6 +1684,53 @@ var MessengerViewProvider = class {
       fs2.writeFileSync(tmpPath, buf);
       sendImage(tmpPath, caption);
     } catch {
+    }
+  }
+  async handlePickAttachment() {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectMany: true,
+      openLabel: "Attach",
+      filters: {
+        Images: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"],
+        Files: ["*"]
+      }
+    });
+    if (!uris?.length) {
+      return;
+    }
+    for (const uri of uris) {
+      const name = path.basename(uri.fsPath);
+      const isImage = /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(uri.fsPath);
+      if (isImage) {
+        let dataUrl = void 0;
+        try {
+          const buf = fs.readFileSync(uri.fsPath);
+          const ext2 = path.extname(uri.fsPath).slice(1).toLowerCase() || "png";
+          const mime = ext2 === "svg" ? "svg+xml" : ext2 === "jpg" ? "jpeg" : ext2;
+          dataUrl = `data:image/${mime};base64,${buf.toString("base64")}`;
+        } catch {
+        }
+        mainPanel?.webview.postMessage({
+          type: "attachmentAdded",
+          item: {
+            id: makeId(),
+            type: "image",
+            path: uri.fsPath,
+            name,
+            dataUrl
+          }
+        });
+      } else {
+        mainPanel?.webview.postMessage({
+          type: "attachmentAdded",
+          item: {
+            id: makeId(),
+            type: "file",
+            path: uri.fsPath,
+            name
+          }
+        });
+      }
     }
   }
   async handleSendImage(caption) {
@@ -1856,8 +1927,8 @@ var MessengerViewProvider = class {
 			var body = document.createElement('div');
 			body.className = 'tutorial-body';
 			var steps = [
-				['Install','Install jefr cursor from VSIX, then restart Cursor'],
-				['Check MCP','Cursor Settings \\u2192 Tools & MCP \\u2192 enable jefr cursor'],
+				['Install','Install jefr from VSIX, then restart Cursor'],
+				['Check MCP','Cursor Settings \\u2192 Tools & MCP \\u2192 enable jefr'],
 				['Start chat','Send a message in the bottom panel; AI replies in the loop']
 			];
 			var html='';
