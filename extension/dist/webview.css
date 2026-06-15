@@ -1020,6 +1020,23 @@ input:focus-visible {
 	opacity: 1;
 }
 
+/* ========== Reply history (no modal) ========== */
+.reply-history {
+	margin-top: 8px;
+}
+
+.reply-item {
+	cursor: default;
+}
+
+.reply-idx {
+	color: rgba(52, 211, 153, 0.65);
+}
+
+.reply-item .hi-text {
+	color: rgba(255, 255, 255, 0.82);
+}
+
 .hi-resend-btn:hover {
 	background: rgba(124,107,245,0.2);
 }

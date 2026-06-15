@@ -525,7 +525,7 @@ alwaysApply: true
 8. Users may add custom text (Other field) on each question; no extra option needed for that.
 9. After \`ask_question\` returns an answer, still call \`check_messages\` to keep listening.
 10. Do not use \`ask_question\` at the end of every turn to ask "anything else?"; end turns with \`check_messages\` only. Use \`ask_question\` only when a real decision is needed.
-11. \`check_messages\` accepts optional \`reply\` (string, Markdown): summary shown in the plugin modal. Example: \`{ "reply": "## Summary\nChanges complete..." }\`
+11. \`check_messages\` accepts optional \`reply\` (string, Markdown): summary appended to **Reply history** in the Send history tab (no popup). Example: \`{ "reply": "## Summary\nChanges complete..." }\`
 12. Before ending a session, prefer passing \`reply\` with key conclusions; omit \`reply\` if no summary is needed.
 13. Do not spawn subagents for parallel tasks.
 14. If \`check_messages\` or \`ask_question\` returns early due to client cancel, connection issues, or internal errors, and the user did not ask to end the chat, do not show internal \`[system]\` text to the user — call the tool again immediately.

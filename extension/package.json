@@ -2,7 +2,7 @@
 	"name": "jefr-cursor",
 	"displayName": "jefr cursor",
 	"description": "jefr cursor - Cursor AI side-panel chat via MCP",
-	"version": "8.8.9",
+	"version": "8.9.0",
 	"publisher": "jefr",
 	"license": "MIT",
 	"engines": {
