@@ -956,14 +956,14 @@ input:focus-visible {
 /* ========== Send history row styles ========== */
 .history-item-v2 {
 	display: flex;
-	align-items: center;
+	align-items: flex-start;
 	gap: 0;
-	padding: 4px 6px;
-	margin-bottom: 1px;
+	padding: 6px 6px;
+	margin-bottom: 4px;
 	border-radius: 3px;
 	transition: background 0.1s;
-	white-space: nowrap;
-	overflow: hidden;
+	white-space: normal;
+	overflow: visible;
 }
 
 .history-item-v2:hover {
@@ -978,18 +978,40 @@ input:focus-visible {
 	flex-shrink: 0;
 	text-align: right;
 	margin-right: 8px;
+	margin-top: 2px;
 	font-family: 'JetBrains Mono', monospace;
+}
+
+.hi-kind {
+	flex-shrink: 0;
+	font-size: 9px;
+	font-weight: 700;
+	padding: 2px 6px;
+	border-radius: 8px;
+	margin-right: 8px;
+	margin-top: 1px;
+	letter-spacing: 0.2px;
+}
+
+.hi-kind.send {
+	background: rgba(124, 107, 245, 0.12);
+	color: rgba(124, 107, 245, 0.85);
+}
+
+.hi-kind.reply {
+	background: rgba(52, 211, 153, 0.12);
+	color: rgba(52, 211, 153, 0.9);
 }
 
 .hi-text {
 	flex: 1;
 	min-width: 0;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
+	overflow: visible;
+	white-space: pre-wrap;
+	word-break: break-word;
 	font-size: 12px;
 	color: rgba(204,204,204,0.6);
-	line-height: 1.4;
+	line-height: 1.5;
 }
 
 .hi-time {
@@ -998,6 +1020,7 @@ input:focus-visible {
 	font-family: 'JetBrains Mono', monospace;
 	flex-shrink: 0;
 	margin-left: 8px;
+	margin-top: 2px;
 }
 
 .hi-resend-btn {
@@ -1020,7 +1043,57 @@ input:focus-visible {
 	opacity: 1;
 }
 
-/* ========== Reply history (no modal) ========== */
+/* ========== Reply rows in unified send history ========== */
+.reply-item-full {
+	flex-direction: column;
+	align-items: stretch;
+	padding: 8px 8px;
+	gap: 6px;
+	border-left: 2px solid rgba(52, 211, 153, 0.25);
+	margin-bottom: 6px;
+}
+
+.hi-meta-row {
+	display: flex;
+	align-items: center;
+	gap: 0;
+	width: 100%;
+}
+
+.hi-body {
+	font-size: 12px;
+	color: rgba(204, 204, 204, 0.88);
+	line-height: 1.55;
+	white-space: normal;
+	word-break: break-word;
+	padding-left: 4px;
+}
+
+.hi-body h4 {
+	font-size: 13px;
+	margin: 2px 0 4px;
+	color: rgba(255, 255, 255, 0.92);
+	font-weight: 600;
+}
+
+.hi-body h5 {
+	font-size: 12px;
+	margin: 2px 0 4px;
+	color: rgba(255, 255, 255, 0.85);
+}
+
+.hi-body code {
+	background: rgba(255, 255, 255, 0.08);
+	padding: 1px 4px;
+	border-radius: 3px;
+	font-family: 'JetBrains Mono', monospace;
+	font-size: 11px;
+}
+
+.hi-body strong {
+	color: rgba(255, 255, 255, 0.95);
+}
+
 .reply-history {
 	margin-top: 8px;
 }
