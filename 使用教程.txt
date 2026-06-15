@@ -1,0 +1,7 @@
+jefr cursor · Quick start
+
+1. Install — drag jefr-cursor.vsix into the Cursor Extensions panel
+2. Restart Cursor — so MCP config and rules take effect
+3. Confirm MCP — Cursor Settings → Tools & MCP → enable "jefr cursor"
+4. Start chat — in Cursor's native chat, send: 你好 (once, to start the loop)
+   After that, continue chatting from the jefr cursor bottom panel.
