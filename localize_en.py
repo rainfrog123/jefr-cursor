@@ -188,8 +188,8 @@ def patch_rules_in_extension(text: str) -> str:
     rules = RULES_PATH.read_text(encoding="utf-8").strip()
     escaped = rules.replace("\\", "\\\\").replace("`", "\\`")
     return re.sub(
-        r"var RULES_CONTENT = `[\s\S]*?`;",
-        f"var RULES_CONTENT = `{escaped}`;",
+        r"var RULES_CONTENT = `[\s\S]*?\nfunction setupCursorRules",
+        f"var RULES_CONTENT = `{escaped}`;\nfunction setupCursorRules",
         text,
         count=1,
     )
