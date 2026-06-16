@@ -21,6 +21,8 @@ export interface QueueItem {
   content?: string;
   /** Present for image/file items (absolute path on disk). */
   path?: string;
+  /** Optional display name for image/file items. */
+  name?: string;
   /** Optional caption for image items. */
   caption?: string;
   /** ISO timestamp. */

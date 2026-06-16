@@ -595,6 +595,7 @@ function removeLegacyRulesIfManaged(filePath) {
 var http2 = __toESM(require("http"));
 var crypto = __toESM(require("crypto"));
 var WS_MAGIC = "258EAFA5-E914-47DA-95CA-5AB5DC11BE85";
+var PREFERRED_PORT = 39517;
 var server = null;
 var wsClients = [];
 var serverPort = 0;
@@ -610,18 +611,35 @@ function getServerPort() {
 function getConnectedClients() {
   return wsClients.length;
 }
-function startLocalServer(port = 0) {
+function startLocalServer(port = PREFERRED_PORT) {
   return new Promise((resolve, reject) => {
     if (server) {
       resolve(serverPort);
       return;
     }
-    server = http2.createServer(handleHttp);
-    server.on("upgrade", handleUpgrade);
-    server.on("error", reject);
-    server.listen(port, "127.0.0.1", () => {
-      const addr = server.address();
-      serverPort = addr.port;
+    let settled = false;
+    const srv = http2.createServer(handleHttp);
+    srv.on("upgrade", handleUpgrade);
+    srv.on("error", (err) => {
+      if (settled)
+        return;
+      settled = true;
+      try {
+        srv.close();
+      } catch {
+      }
+      if (err && err.code === "EADDRINUSE" && port !== 0) {
+        startLocalServer(0).then(resolve, reject);
+      } else {
+        reject(err);
+      }
+    });
+    srv.listen(port, "127.0.0.1", () => {
+      if (settled)
+        return;
+      settled = true;
+      server = srv;
+      serverPort = srv.address().port;
       startPushPolling();
       resolve(serverPort);
     });

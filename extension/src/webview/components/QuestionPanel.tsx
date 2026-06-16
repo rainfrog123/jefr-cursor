@@ -46,8 +46,17 @@ export function QuestionPanel(props: { question: QuestionData }): JSX.Element {
 
   const cancel = () => post({ type: "cancelQuestion" });
 
+  // Enter submits (Shift+Enter makes a newline inside the textarea, which we
+  // never use here, so plain Enter anywhere in the panel submits).
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      submit();
+    }
+  };
+
   return (
-    <div className="question-panel">
+    <div className="question-panel" onKeyDown={onKeyDown}>
       <h4>AI question</h4>
       {question.questions.map((qi) => {
         const multi = !!qi.allow_multiple;

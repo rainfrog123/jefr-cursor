@@ -6,7 +6,7 @@
  * panel, then the active tab (Chat / Queue / Usage).
  */
 import React, { useCallback, useEffect, useState } from "react";
-import { post } from "./vscode";
+import { post, vscode } from "./vscode";
 import type {
   Attachment,
   HistoryItem,
@@ -24,6 +24,21 @@ import { UsageTab } from "./components/UsageTab";
 
 type TabId = "chat" | "queue" | "usage";
 
+/** Persisted webview state shape (survives reloads via getState/setState). */
+interface PersistedState {
+  history?: HistoryItem[];
+}
+
+/** Keep persisted history bounded so the state blob never grows unbounded. */
+const MAX_PERSISTED_HISTORY = 300;
+
+function loadPersistedHistory(): HistoryItem[] {
+  const saved = vscode.getState<PersistedState>();
+  const items = saved?.history ?? [];
+  // Renumber so indices stay sequential after a reload/cap.
+  return items.map((it, i) => ({ ...it, index: i + 1 }));
+}
+
 export function App(): JSX.Element {
   const [version, setVersion] = useState("");
   const [tab, setTab] = useState<TabId>("chat");
@@ -31,7 +46,7 @@ export function App(): JSX.Element {
   const [question, setQuestion] = useState<QuestionData | null>(null);
   const [reply, setReply] = useState<ReplyData | null>(null);
 
-  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [history, setHistory] = useState<HistoryItem[]>(loadPersistedHistory);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
 
   const [queue, setQueue] = useState<QueueItem[]>([]);
@@ -65,21 +80,31 @@ export function App(): JSX.Element {
         case "clearQuestion":
           setQuestion(null);
           break;
-        case "showReply":
+        case "showReply": {
           setReply(msg.data);
-          setHistory((h) => [
-            ...h,
-            {
-              id: "reply-" + msg.data.timestamp,
-              kind: "reply",
-              index: h.length + 1,
-              text: msg.data.content,
-              time: formatTime(msg.data.timestamp),
-            },
-          ]);
+          const replyId = "reply-" + msg.data.timestamp;
+          setHistory((h) =>
+            h.some((it) => it.id === replyId)
+              ? h
+              : [
+                  ...h,
+                  {
+                    id: replyId,
+                    kind: "reply",
+                    index: h.length + 1,
+                    text: msg.data.content,
+                    time: formatTime(msg.data.timestamp),
+                  },
+                ],
+          );
           break;
+        }
         case "historyAppend":
-          setHistory((h) => [...h, { ...msg.item, index: h.length + 1 }]);
+          setHistory((h) =>
+            h.some((it) => it.id === msg.item.id)
+              ? h
+              : [...h, { ...msg.item, index: h.length + 1 }],
+          );
           break;
         case "attachmentAdded":
           setAttachments((a) => [...a, msg.item]);
@@ -107,10 +132,22 @@ export function App(): JSX.Element {
     if (reply) post({ type: "ackReply", timestamp: reply.timestamp });
   }, [reply]);
 
+  /* Persist chat history so it survives webview/window reloads. */
+  useEffect(() => {
+    const prev = vscode.getState<PersistedState>() || {};
+    vscode.setState({ ...prev, history: history.slice(-MAX_PERSISTED_HISTORY) });
+  }, [history]);
+
   const switchTab = useCallback((next: TabId) => {
     setTab(next);
     if (next === "queue") post({ type: "getQueue" });
     if (next === "usage") post({ type: "fetchUsage" });
+  }, []);
+
+  /* Optimistically record a message the user just sent into the history,
+     since the extension host does not echo sends back as history items. */
+  const appendHistory = useCallback((item: Omit<HistoryItem, "index">) => {
+    setHistory((h) => [...h, { ...item, index: h.length + 1 }]);
   }, []);
 
   return (
@@ -132,7 +169,12 @@ export function App(): JSX.Element {
       </div>
 
       {tab === "chat" && (
-        <ChatTab history={history} attachments={attachments} setAttachments={setAttachments} />
+        <ChatTab
+          history={history}
+          attachments={attachments}
+          setAttachments={setAttachments}
+          appendHistory={appendHistory}
+        />
       )}
       {tab === "queue" && <QueueTab queue={queue} />}
       {tab === "usage" && (
