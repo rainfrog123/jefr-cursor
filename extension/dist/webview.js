@@ -52,3 +52,43 @@ react/cjs/react-jsx-runtime.production.min.js:
    * LICENSE file in the root directory of this source tree.
    *)
 */
+
+
+/* jefr: auto-scroll chat history to the latest message on send/receive */
+;(function () {
+  if (window.__jefrAutoScroll) return;
+  window.__jefrAutoScroll = true;
+  var lastIdx = -1, raf = 0;
+  function hist() { return document.querySelector('.history'); }
+  function toBottom(el, smooth) {
+    if (!el) return;
+    if (raf) cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(function () {
+      try { el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' }); }
+      catch (_) { el.scrollTop = el.scrollHeight; }
+    });
+  }
+  function bump(el) {
+    toBottom(el, true);
+    setTimeout(function () { toBottom(el, false); }, 160);
+    setTimeout(function () { toBottom(el, false); }, 420);
+  }
+  function check() {
+    var el = hist();
+    if (!el) { lastIdx = -1; return; }
+    var items = el.querySelectorAll('.history-item-v2');
+    if (!items.length) { lastIdx = -1; return; }
+    var idxEl = items[items.length - 1].querySelector('.hi-idx');
+    var idx = idxEl ? parseInt(idxEl.textContent, 10) : items.length;
+    if (isNaN(idx)) idx = items.length;
+    if (lastIdx === -1) { lastIdx = idx; toBottom(el, false); return; }
+    if (idx > lastIdx) { lastIdx = idx; bump(el); }
+  }
+  var obs = new MutationObserver(check);
+  function start() {
+    try { obs.observe(document.body, { childList: true, subtree: true }); } catch (_) {}
+    check();
+  }
+  if (document.body) start();
+  else document.addEventListener('DOMContentLoaded', start);
+})();
