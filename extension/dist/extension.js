@@ -594,7 +594,7 @@ function removeLegacyRulesIfManaged(filePath) {
 // src/local-server.ts
 var http2 = __toESM(require("http"));
 var crypto = __toESM(require("crypto"));
-var WS_MAGIC = "258EAFA5-E914-47DA-95CA-5AB5DC11BE85";
+var WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 var PREFERRED_PORT = 39517;
 var server = null;
 var wsClients = [];
