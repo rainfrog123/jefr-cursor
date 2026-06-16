@@ -435,6 +435,43 @@ body {
 	letter-spacing: 0.3px;
 }
 
+/* ========== Chat toolbar (clear history) ========== */
+.chat-toolbar {
+	display: flex;
+	justify-content: flex-end;
+	align-items: center;
+	order: 9;
+	flex-shrink: 0;
+	padding: 0 2px 6px;
+}
+
+.chat-clear-btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 12px;
+	font-family: var(--font-ui);
+	font-size: var(--text-xs);
+	font-weight: 600;
+	line-height: 1.4;
+	cursor: pointer;
+	border-radius: 999px;
+	background: transparent;
+	color: var(--fg-muted);
+	border: 1px solid var(--border);
+	transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.chat-clear-btn:hover {
+	background: rgba(239,68,68,0.1);
+	border-color: rgba(239,68,68,0.35);
+	color: #f08a87;
+}
+
+.chat-clear-btn:active {
+	transform: translateY(1px);
+}
+
 /* ========== Chat history - above input ========== */
 .history {
 	flex: 1;

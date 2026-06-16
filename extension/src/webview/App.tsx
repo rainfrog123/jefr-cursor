@@ -150,6 +150,9 @@ export function App(): JSX.Element {
     setHistory((h) => [...h, { ...item, index: h.length + 1 }]);
   }, []);
 
+  /* Wipe the chat history (the persist effect clears stored state too). */
+  const clearHistory = useCallback(() => setHistory([]), []);
+
   return (
     <div className="app">
       <Header version={version} onOpenConsole={() => post({ type: "openConsole" })} />
@@ -174,6 +177,7 @@ export function App(): JSX.Element {
           attachments={attachments}
           setAttachments={setAttachments}
           appendHistory={appendHistory}
+          onClearHistory={clearHistory}
         />
       )}
       {tab === "queue" && <QueueTab queue={queue} />}

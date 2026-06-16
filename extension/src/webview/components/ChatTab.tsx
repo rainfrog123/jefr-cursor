@@ -12,9 +12,21 @@ export function ChatTab(props: {
   attachments: Attachment[];
   setAttachments: React.Dispatch<React.SetStateAction<Attachment[]>>;
   appendHistory: (item: Omit<HistoryItem, "index">) => void;
+  onClearHistory: () => void;
 }): JSX.Element {
   return (
     <>
+      {props.history.length > 0 && (
+        <div className="chat-toolbar">
+          <button
+            className="chat-clear-btn"
+            title="Clear chat history"
+            onClick={props.onClearHistory}
+          >
+            Clear history
+          </button>
+        </div>
+      )}
       <History items={props.history} />
       <Composer
         attachments={props.attachments}
