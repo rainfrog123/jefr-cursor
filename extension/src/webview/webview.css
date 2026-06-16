@@ -59,7 +59,7 @@ body {
 	display: flex;
 	flex-direction: column;
 	height: calc(100vh - 0px);
-	padding: 14px;
+	padding: 8px 10px;
 	padding-bottom: 0;
 	gap: 0;
 	overflow: hidden;
@@ -477,8 +477,8 @@ body {
 	overflow-y: auto;
 	flex-shrink: 1;
 	order: 10;
-	padding: 8px 4px;
-	margin-bottom: 8px;
+	padding: 6px 4px;
+	margin-bottom: 6px;
 	scrollbar-width: thin;
 	scrollbar-color: var(--border-strong) transparent;
 	background: color-mix(in srgb, var(--input-bg) 70%, transparent);
@@ -594,7 +594,7 @@ body {
 	z-index: 10;
 	margin-left: 0;
 	margin-right: 0;
-	margin-bottom: 8px;
+	margin-bottom: 6px;
 	padding: 0;
 	box-shadow: var(--shadow-sm);
 }
@@ -900,18 +900,18 @@ input:focus-visible {
 .tab-bar {
 	display: flex;
 	gap: 4px;
-	margin-bottom: 12px;
+	margin-bottom: 8px;
 	flex-shrink: 0;
 	order: 1;
 	background: var(--input-bg);
 	border-radius: var(--radius);
-	padding: 4px;
+	padding: 3px;
 	border: 1px solid var(--border);
 }
 
 .tab-btn {
 	flex: 1;
-	padding: 10px 12px;
+	padding: 7px 12px;
 	border: none;
 	border-radius: calc(var(--radius-sm));
 	background: transparent;
@@ -2030,7 +2030,7 @@ input:focus-visible {
 /* ========== Compact header (jefr title + version) ========== */
 .header {
 	padding: 6px 12px;
-	margin-bottom: 8px;
+	margin-bottom: 6px;
 }
 
 .header h3 {
