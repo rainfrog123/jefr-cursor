@@ -1242,7 +1242,7 @@ var lastReplyContent;
 var lastRemoteQuestionId;
 var idleTimer;
 var lastActivityTime = Date.now();
-var IDLE_TIMEOUT_MS = 10 * 60 * 1e3;
+var IDLE_TIMEOUT_MS = 30 * 60 * 1e3;
 function resetIdleTimer() {
   lastActivityTime = Date.now();
 }
@@ -1253,7 +1253,7 @@ function startIdleTimer() {
     if (!isCardValid())
       return;
     if (Date.now() - lastActivityTime >= IDLE_TIMEOUT_MS) {
-      sendText("Hello. IMPORTANT: STAND BY. Take NO action of any kind right now \u2014 do not run any tools, edit files, or make any changes. Just hold, keep the connection open, and wait for my next instruction.");
+      sendText("Hello");
       triggerCursorChat();
       resetIdleTimer();
     }

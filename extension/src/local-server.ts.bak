@@ -1,0 +1,696 @@
+import * as http from "http";
+import * as crypto from "crypto";
+import type { IncomingMessage, ServerResponse, Server } from "http";
+import type { Socket } from "net";
+import {
+  readQuestion,
+  readReply,
+  getQueueCount,
+  readQueue,
+  sendText,
+  writeAnswer,
+  cancelQuestion,
+  clearReply,
+} from "./messenger";
+
+const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const PREFERRED_PORT = 39517;
+
+interface WsClient {
+  socket: Socket;
+  alive: boolean;
+}
+
+interface WorkspaceInfo {
+  name: string;
+  path: string;
+}
+
+let server: Server | null = null;
+let wsClients: WsClient[] = [];
+let serverPort = 0;
+let pollTimer: ReturnType<typeof setInterval> | null = null;
+let lastPushState = "";
+let _workspaceInfo: WorkspaceInfo = { name: "", path: "" };
+
+export function setWorkspaceInfo(name: string, wsPath: string): void {
+  _workspaceInfo = { name, path: wsPath };
+}
+
+export function getServerPort(): number {
+  return serverPort;
+}
+
+export function getConnectedClients(): number {
+  return wsClients.length;
+}
+
+export function startLocalServer(port: number = PREFERRED_PORT): Promise<number> {
+  return new Promise((resolve, reject) => {
+    if (server) {
+      resolve(serverPort);
+      return;
+    }
+    let settled = false;
+    const srv = http.createServer(handleHttp);
+    srv.on("upgrade", handleUpgrade);
+    srv.on("error", (err: NodeJS.ErrnoException) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      try {
+        srv.close();
+      } catch {
+        // ignore
+      }
+      if (err && err.code === "EADDRINUSE" && port !== 0) {
+        startLocalServer(0).then(resolve, reject);
+      } else {
+        reject(err);
+      }
+    });
+    srv.listen(port, "127.0.0.1", () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      server = srv;
+      serverPort = (srv.address() as { port: number }).port;
+      startPushPolling();
+      resolve(serverPort);
+    });
+  });
+}
+
+export function stopLocalServer(): void {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  for (const c of wsClients) {
+    try {
+      c.socket.destroy();
+    } catch {
+      // ignore
+    }
+  }
+  wsClients = [];
+  if (server) {
+    server.close();
+    server = null;
+    serverPort = 0;
+  }
+}
+
+function handleHttp(req: IncomingMessage, res: ServerResponse): void {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+  if (req.url === "/" || req.url === "/index.html") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(getControlPanelHtml());
+    return;
+  }
+  if (req.url === "/api/status" && req.method === "GET") {
+    const q = readQuestion();
+    const reply = readReply();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        cardActive: true,
+        cardCode: null,
+        cardExpiresAt: null,
+        queueCount: getQueueCount(),
+        queue: readQueue(),
+        hasQuestion: !!q,
+        hasReply: !!reply,
+        workspace: _workspaceInfo,
+        wsClients: wsClients.length,
+        port: serverPort,
+      })
+    );
+    return;
+  }
+  if (req.url === "/api/send" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body);
+        if (data.text) {
+          sendText(data.text);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true }));
+          broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: "Missing text field" }));
+        }
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "Invalid JSON" }));
+      }
+    });
+    return;
+  }
+  res.writeHead(404);
+  res.end("Not Found");
+}
+
+function handleUpgrade(req: IncomingMessage, socket: Socket): void {
+  const key = req.headers["sec-websocket-key"];
+  if (!key) {
+    socket.destroy();
+    return;
+  }
+  const accept = crypto
+    .createHash("sha1")
+    .update(key + WS_MAGIC)
+    .digest("base64");
+  socket.write(
+    `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
+  );
+  const client: WsClient = { socket, alive: true };
+  wsClients.push(client);
+  const pushState = buildPushState();
+  wsSend(socket, JSON.stringify({ type: "init", ...pushState }));
+  let buffer = Buffer.alloc(0);
+  socket.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (buffer.length >= 2) {
+      const parsed = parseFrame(buffer);
+      if (!parsed) {
+        break;
+      }
+      buffer = buffer.subarray(parsed.totalLength);
+      if (parsed.opcode === 8) {
+        removeClient(client);
+        socket.end();
+        return;
+      }
+      if (parsed.opcode === 9) {
+        wsSendRaw(socket, buildFrame(parsed.payload, 10));
+        continue;
+      }
+      if (parsed.opcode === 10) {
+        client.alive = true;
+        continue;
+      }
+      if (parsed.opcode === 1) {
+        handleWsMessage(client, parsed.payload.toString("utf-8"));
+      }
+    }
+  });
+  socket.on("close", () => removeClient(client));
+  socket.on("error", () => removeClient(client));
+}
+
+function handleWsMessage(client: WsClient, raw: string): void {
+  try {
+    const msg = JSON.parse(raw);
+    switch (msg.type) {
+      case "sendText":
+        if (msg.text) {
+          sendText(msg.text);
+          broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+        }
+        break;
+      case "submitAnswer":
+        if (msg.data) {
+          writeAnswer(msg.data);
+        }
+        break;
+      case "cancelQuestion":
+        cancelQuestion();
+        break;
+      case "ackReply":
+        clearReply();
+        break;
+      case "ping":
+        wsSend(client.socket, JSON.stringify({ type: "pong" }));
+        break;
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function removeClient(client: WsClient): void {
+  const idx = wsClients.indexOf(client);
+  if (idx !== -1) {
+    wsClients.splice(idx, 1);
+  }
+  try {
+    client.socket.destroy();
+  } catch {
+    // ignore
+  }
+}
+
+function broadcastWs(data: unknown): void {
+  const msg = JSON.stringify(data);
+  for (const c of wsClients) {
+    wsSend(c.socket, msg);
+  }
+}
+
+interface ParsedFrame {
+  opcode: number;
+  payload: Buffer;
+  totalLength: number;
+}
+
+function parseFrame(buf: Buffer): ParsedFrame | null {
+  if (buf.length < 2) {
+    return null;
+  }
+  const opcode = buf[0] & 15;
+  const masked = (buf[1] & 128) !== 0;
+  let payloadLen = buf[1] & 127;
+  let offset = 2;
+  if (payloadLen === 126) {
+    if (buf.length < 4) {
+      return null;
+    }
+    payloadLen = buf.readUInt16BE(2);
+    offset = 4;
+  } else if (payloadLen === 127) {
+    if (buf.length < 10) {
+      return null;
+    }
+    payloadLen = Number(buf.readBigUInt64BE(2));
+    offset = 10;
+  }
+  const maskLen = masked ? 4 : 0;
+  const totalLength = offset + maskLen + payloadLen;
+  if (buf.length < totalLength) {
+    return null;
+  }
+  let payload = buf.subarray(offset + maskLen, offset + maskLen + payloadLen);
+  if (masked) {
+    const mask = buf.subarray(offset, offset + 4);
+    payload = Buffer.from(payload);
+    for (let i = 0; i < payload.length; i++) {
+      payload[i] ^= mask[i % 4];
+    }
+  }
+  return { opcode, payload, totalLength };
+}
+
+function buildFrame(payload: string | Buffer, opcode = 1): Buffer {
+  const data = typeof payload === "string" ? Buffer.from(payload, "utf-8") : payload;
+  const len = data.length;
+  let header: Buffer;
+  if (len < 126) {
+    header = Buffer.alloc(2);
+    header[0] = 128 | opcode;
+    header[1] = len;
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 128 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 128 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, data]);
+}
+
+function wsSend(socket: Socket, msg: string): void {
+  try {
+    wsSendRaw(socket, buildFrame(msg));
+  } catch {
+    // ignore
+  }
+}
+
+function wsSendRaw(socket: Socket, buf: Buffer): void {
+  try {
+    socket.write(buf);
+  } catch {
+    // ignore
+  }
+}
+
+function buildPushState() {
+  return {
+    cardActive: true,
+    cardCode: null,
+    cardExpiresAt: null,
+    queueCount: getQueueCount(),
+    queue: readQueue(),
+    question: readQuestion(),
+    reply: readReply(),
+    workspace: _workspaceInfo,
+    wsClients: wsClients.length,
+    port: serverPort,
+  };
+}
+
+function startPushPolling(): void {
+  if (pollTimer) {
+    return;
+  }
+  pollTimer = setInterval(() => {
+    if (wsClients.length === 0) {
+      return;
+    }
+    const state = JSON.stringify(buildPushState());
+    if (state !== lastPushState) {
+      lastPushState = state;
+      broadcastWs({ type: "stateUpdate", ...JSON.parse(state) });
+    }
+  }, 500);
+}
+
+function getControlPanelHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>jefr - Remote Console</title>
+<style>
+:root{--bg1:#eef1f7;--bg2:#e6eaf3;--surface:#ffffff;--surface-2:#f5f7fb;--fg:#1e2330;--fg2:#5b6473;--fg3:#9aa2b1;--border:#e6e9f1;--border-strong:#d6dbe7;--accent:#6d5cf0;--accent2:#3b82f6;--accent-soft:rgba(109,92,240,0.10);--success:#16a34a;--success-soft:rgba(22,163,74,0.10);--danger:#dc2626;--danger-soft:rgba(220,38,38,0.10);--warn:#d97706;--warn-soft:rgba(217,119,6,0.12);--radius:14px;--radius-sm:10px;--shadow-sm:0 1px 2px rgba(16,24,40,0.06),0 1px 3px rgba(16,24,40,0.04);--shadow-accent:0 8px 24px rgba(109,92,240,0.16);--mono:'JetBrains Mono','SFMono-Regular',Consolas,monospace}
+*{margin:0;padding:0;box-sizing:border-box}
+html{color-scheme:light}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;background:linear-gradient(180deg,var(--bg1),var(--bg2));background-attachment:fixed;color:var(--fg);min-height:100vh;-webkit-tap-highlight-color:transparent;-webkit-font-smoothing:antialiased}
+.wrap{max-width:600px;margin:0 auto;padding:24px 16px 48px}
+.hdr{text-align:center;padding:8px 0 22px}
+.hdr h1{font-size:26px;font-weight:800;background:linear-gradient(135deg,#6d5cf0,#3b82f6);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px;letter-spacing:-0.6px}
+.hdr p{font-size:12px;color:var(--fg2);font-weight:500;letter-spacing:0.3px}
+.stat-row{display:flex;gap:10px;margin-bottom:18px}
+.stat-card{flex:1;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 10px;text-align:center;box-shadow:var(--shadow-sm)}
+.stat-val{font-size:19px;font-weight:800;font-family:var(--mono);margin-bottom:3px;color:var(--fg)}
+.stat-val.on{color:var(--success)}.stat-val.off{color:var(--danger)}.stat-val.num{color:var(--accent)}
+.stat-label{font-size:10px;color:var(--fg2);font-weight:600;text-transform:uppercase;letter-spacing:0.5px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:14px;overflow:hidden;box-shadow:var(--shadow-sm)}
+.card.highlight{border-color:rgba(109,92,240,0.40);box-shadow:var(--shadow-accent)}
+.card.warn-hl{border-color:rgba(217,119,6,0.40);box-shadow:0 8px 24px rgba(217,119,6,0.14)}
+.card-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
+.card-title{font-size:13px;font-weight:700;color:var(--fg);letter-spacing:-0.1px}
+.card-badge{font-size:10px;padding:3px 11px;border-radius:20px;font-weight:700;letter-spacing:0.2px}
+.card-badge.on{background:var(--success-soft);color:var(--success)}
+.card-badge.off{background:var(--surface-2);color:var(--fg3)}
+.card-badge.accent{background:var(--accent-soft);color:var(--accent)}
+.card-body{padding:16px}
+.compose-area{display:flex;flex-direction:column;gap:12px}
+.compose-input{width:100%;min-height:84px;max-height:200px;padding:12px 14px;background:var(--surface-2);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--fg);font-size:14px;font-family:inherit;resize:vertical;outline:none;transition:border-color .2s,box-shadow .2s;line-height:1.55}
+.compose-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.compose-input::placeholder{color:var(--fg3)}
+.compose-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.compose-hint{font-size:11px;color:var(--fg3)}
+.btn{padding:10px 24px;border:none;border-radius:var(--radius-sm);font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s;white-space:nowrap;-webkit-appearance:none}
+.btn-send{background:linear-gradient(135deg,#6d5cf0,#4f46e5);color:#fff;box-shadow:var(--shadow-accent);min-width:84px}
+.btn-send:hover{filter:brightness(1.06)}
+.btn-send:active{transform:scale(0.97)}
+.btn-send:disabled{opacity:1;cursor:not-allowed;transform:none;box-shadow:none;background:var(--border-strong);color:var(--fg3)}
+.btn-outline{background:var(--surface);border:1px solid var(--border-strong);color:var(--fg2);padding:8px 16px;font-size:12px}
+.btn-outline:hover{background:var(--surface-2);color:var(--fg)}
+.btn-warn{background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;box-shadow:0 2px 10px rgba(217,119,6,0.25)}
+.btn-danger{background:var(--danger-soft);color:var(--danger);border:1px solid rgba(220,38,38,0.25)}
+.btn-danger:hover{background:rgba(220,38,38,0.16)}
+.btn-sm{padding:7px 14px;font-size:11px;border-radius:8px}
+.sent-ok{color:var(--success);font-size:12px;font-weight:700;animation:fadeIn .3s}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+.q-block{margin-bottom:16px}
+.q-text{font-size:14px;font-weight:600;margin-bottom:10px;line-height:1.5;color:var(--fg)}
+.q-options{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+.q-opt{display:flex;align-items:center;gap:10px;padding:11px 14px;background:var(--surface-2);border:1px solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;transition:all .15s;font-size:13px;color:var(--fg);-webkit-tap-highlight-color:transparent}
+.q-opt:hover{background:var(--accent-soft);border-color:rgba(109,92,240,0.35)}
+.q-opt.selected{border-color:var(--accent);background:var(--accent-soft)}
+.q-opt .check{width:18px;height:18px;border:2px solid var(--border-strong);border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s}
+.q-opt.multi .check{border-radius:5px}
+.q-opt.selected .check{border-color:var(--accent);background:var(--accent)}
+.q-opt.selected .check::after{content:'';display:block;width:8px;height:8px;background:#fff;border-radius:50%}
+.q-opt.selected.multi .check::after{border-radius:1px;width:10px;height:6px;background:transparent;border-bottom:2px solid #fff;border-left:2px solid #fff;transform:rotate(-45deg);margin-top:-2px}
+.q-other{width:100%;padding:10px 12px;background:var(--surface-2);border:1px solid var(--border-strong);border-radius:8px;color:var(--fg);font-size:13px;outline:none;font-family:inherit}
+.q-other:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.q-other::placeholder{color:var(--fg3)}
+.q-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+.reply-content{font-size:13px;line-height:1.7;color:var(--fg);white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto;padding:4px 0}
+.reply-actions{display:flex;justify-content:flex-end;margin-top:12px}
+.info-row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;font-size:12px;border-bottom:1px solid var(--border)}
+.info-row:last-child{border-bottom:none}
+.info-k{color:var(--fg2);font-size:11px;font-weight:500}
+.info-v{color:var(--fg);font-weight:600;font-family:var(--mono);font-size:11px;text-align:right;max-width:65%;word-break:break-all}
+.info-v.accent{color:var(--accent)}
+.queue-item{padding:10px 14px;font-size:11px;color:var(--fg2);border-bottom:1px solid var(--border);white-space:pre-wrap;word-break:break-all;line-height:1.45;display:flex;align-items:flex-start;gap:8px}
+.queue-item:last-child{border-bottom:none}
+.qi-type{font-size:9px;font-weight:800;padding:3px 8px;border-radius:8px;flex-shrink:0;text-transform:uppercase;letter-spacing:0.3px}
+.qi-type.text{background:rgba(59,130,246,0.12);color:#2563eb}
+.qi-type.image{background:rgba(16,185,129,0.12);color:#059669}
+.qi-type.file{background:rgba(217,119,6,0.14);color:#b45309}
+.qi-content{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--fg)}
+.qi-time{font-size:9px;color:var(--fg3);flex-shrink:0;font-family:var(--mono)}
+.empty{text-align:center;padding:24px;color:var(--fg3);font-size:12px}
+.log-list{max-height:150px;overflow-y:auto;padding:12px 14px;background:var(--surface-2)}
+.log-item{font-size:10px;color:var(--fg2);font-family:var(--mono);padding:2px 0;display:flex;gap:8px}
+.log-time{color:var(--fg3);flex-shrink:0}
+.hidden{display:none!important}
+.section-toggle{cursor:pointer;user-select:none;-webkit-user-select:none}
+.section-toggle .chevron{transition:transform .2s;display:inline-block;font-size:16px;color:var(--fg3)}
+.section-toggle .chevron.open{transform:rotate(90deg)}
+::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:6px}::-webkit-scrollbar-thumb:hover{background:var(--fg3)}
+</style>
+</head>
+<body>
+<div class="wrap">
+	<div class="hdr"><h1>jefr</h1><p>Remote Console</p></div>
+
+	<div class="stat-row">
+		<div class="stat-card"><div id="statConn" class="stat-val off">-</div><div class="stat-label">Connection</div></div>
+		<div class="stat-card"><div id="statQueue" class="stat-val num">0</div><div class="stat-label">Queue</div></div>
+		<div class="stat-card"><div id="statWs" class="stat-val num">0</div><div class="stat-label">Clients</div></div>
+	</div>
+
+	<!-- Send message -->
+	<div class="card highlight">
+		<div class="card-head"><span class="card-title">Send message</span><span id="sendStatus"></span></div>
+		<div class="card-body">
+			<div class="compose-area">
+				<textarea id="msgInput" class="compose-input" placeholder="Type a message to send to Cursor..." rows="3"></textarea>
+				<div class="compose-row">
+					<span class="compose-hint">Ctrl+Enter to send</span>
+					<button id="sendBtn" class="btn btn-send" disabled>Send</button>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<!-- AI question (dynamic) -->
+	<div id="questionCard" class="card warn-hl hidden">
+		<div class="card-head"><span class="card-title">AI question</span><span class="card-badge accent">Awaiting answer</span></div>
+		<div id="questionBody" class="card-body"></div>
+	</div>
+
+	<!-- AI reply (dynamic) -->
+	<div id="replyCard" class="card hidden">
+		<div class="card-head"><span class="card-title">AI reply summary</span></div>
+		<div class="card-body">
+			<div id="replyContent" class="reply-content"></div>
+			<div class="reply-actions"><button id="replyAck" class="btn btn-outline btn-sm">Dismiss</button></div>
+		</div>
+	</div>
+
+	<!-- Workspace -->
+	<div class="card">
+		<div class="card-head section-toggle" onclick="toggleSection('wsBody',this)">
+			<span class="card-title">Workspace</span>
+			<span class="chevron open">\u203A</span>
+		</div>
+		<div id="wsBody" class="card-body">
+			<div class="info-row"><span class="info-k">Project</span><span id="wsName" class="info-v">-</span></div>
+			<div class="info-row"><span class="info-k">Path</span><span id="wsPath" class="info-v">-</span></div>
+			<div class="info-row"><span class="info-k">License key</span><span id="wsCard" class="info-v">-</span></div>
+			<div class="info-row"><span class="info-k">Expires</span><span id="wsExpire" class="info-v">-</span></div>
+		</div>
+	</div>
+
+	<!-- Queue -->
+	<div class="card">
+		<div class="card-head"><span class="card-title">Message queue</span><span id="queueBadge" class="card-badge off">0 items</span></div>
+		<div id="queueList"><div class="empty">Queue is empty</div></div>
+	</div>
+
+	<!-- Log -->
+	<div class="card">
+		<div class="card-head section-toggle" onclick="toggleSection('logList',this)">
+			<span class="card-title">Activity log</span>
+			<span class="chevron open">\u203A</span>
+		</div>
+		<div id="logList" class="log-list"></div>
+	</div>
+</div>
+<script>
+(function(){
+var ws,reconnT,curQuestion=null,selectedAnswers={},reconnDelay=1000,maxReconnDelay=30000,reconnAttempts=0;
+var $=function(id){return document.getElementById(id)};
+var esc=function(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')};
+function fmtTime(){var d=new Date();return [d.getHours(),d.getMinutes(),d.getSeconds()].map(function(v){return String(v).padStart(2,'0')}).join(':')}
+function log(m){var el=document.createElement('div');el.className='log-item';el.innerHTML='<span class="log-time">'+fmtTime()+'</span><span>'+esc(m)+'</span>';var L=$('logList');L.appendChild(el);L.scrollTop=L.scrollHeight;if(L.children.length>60)L.removeChild(L.firstChild)}
+
+window.toggleSection=function(id,el){
+	var body=$(id);if(!body)return;
+	var hidden=body.style.display==='none';
+	body.style.display=hidden?'':'none';
+	var chev=el.querySelector('.chevron');
+	if(chev){chev.className=hidden?'chevron open':'chevron'}
+};
+
+// Send message
+var input=$('msgInput'),sendBtn=$('sendBtn'),sendStatus=$('sendStatus');
+function updateSendBtn(){sendBtn.disabled=!input.value.trim()||!ws||ws.readyState!==1}
+input.addEventListener('input',updateSendBtn);
+input.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();doSend()}});
+sendBtn.addEventListener('click',doSend);
+function doSend(){
+	var txt=input.value.trim();if(!txt||!ws||ws.readyState!==1)return;
+	ws.send(JSON.stringify({type:'sendText',text:txt}));
+	input.value='';updateSendBtn();
+	sendStatus.innerHTML='<span class="sent-ok">Sent</span>';
+	log('Send: '+txt.substring(0,40)+(txt.length>40?'...':''));
+	setTimeout(function(){sendStatus.innerHTML=''},2000);
+	input.focus();
+}
+
+// Render AI question
+function renderQuestion(q){
+	curQuestion=q;selectedAnswers={};
+	var card=$('questionCard'),body=$('questionBody');
+	if(!q||!q.questions||!q.questions.length){card.classList.add('hidden');return}
+	card.classList.remove('hidden');
+	var h='';
+	for(var i=0;i<q.questions.length;i++){
+		var qi=q.questions[i];
+		selectedAnswers[qi.id]=[];
+		h+='<div class="q-block" data-qid="'+esc(qi.id)+'">';
+		h+='<div class="q-text">'+esc(qi.question)+'</div>';
+		h+='<div class="q-options">';
+		for(var j=0;j<qi.options.length;j++){
+			var opt=qi.options[j];
+			h+='<div class="q-opt'+(qi.allow_multiple?' multi':'')+'" data-qid="'+esc(qi.id)+'" data-oid="'+esc(opt.id)+'" onclick="toggleOpt(this)">';
+			h+='<span class="check"></span><span>'+esc(opt.label)+'</span></div>';
+		}
+		h+='</div>';
+		h+='<input class="q-other" data-qid="'+esc(qi.id)+'" placeholder="Additional notes (optional)">';
+		h+='</div>';
+	}
+	h+='<div class="q-actions"><button class="btn btn-danger btn-sm" onclick="cancelQ()">Cancel</button><button class="btn btn-warn btn-sm" onclick="submitQ()">Submit answer</button></div>';
+	body.innerHTML=h;
+	card.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+
+window.toggleOpt=function(el){
+	var qid=el.getAttribute('data-qid'),oid=el.getAttribute('data-oid');
+	if(!curQuestion)return;
+	var qi=curQuestion.questions.find(function(q){return q.id===qid});
+	if(!qi)return;
+	var arr=selectedAnswers[qid]||[];
+	var idx=arr.indexOf(oid);
+	if(qi.allow_multiple){
+		if(idx>-1)arr.splice(idx,1);else arr.push(oid);
+	}else{
+		arr=idx>-1?[]:[oid];
+		var opts=el.parentNode.querySelectorAll('.q-opt');
+		for(var k=0;k<opts.length;k++)opts[k].classList.remove('selected');
+	}
+	selectedAnswers[qid]=arr;
+	el.classList.toggle('selected',arr.indexOf(oid)>-1);
+};
+
+window.submitQ=function(){
+	if(!curQuestion||!ws||ws.readyState!==1)return;
+	var answers=[];
+	for(var i=0;i<curQuestion.questions.length;i++){
+		var qi=curQuestion.questions[i];
+		var otherInput=document.querySelector('.q-other[data-qid="'+qi.id+'"]');
+		answers.push({questionId:qi.id,selected:selectedAnswers[qi.id]||[],other:otherInput?otherInput.value.trim():''});
+	}
+	ws.send(JSON.stringify({type:'submitAnswer',data:{id:curQuestion.id,answers:answers}}));
+	$('questionCard').classList.add('hidden');
+	curQuestion=null;
+	log('Answer submitted');
+};
+
+window.cancelQ=function(){
+	if(!ws||ws.readyState!==1)return;
+	ws.send(JSON.stringify({type:'cancelQuestion'}));
+	$('questionCard').classList.add('hidden');
+	curQuestion=null;
+	log('Answer cancelled');
+};
+
+// Render AI reply
+function renderReply(reply){
+	var card=$('replyCard'),content=$('replyContent');
+	if(!reply||!reply.content){card.classList.add('hidden');return}
+	card.classList.remove('hidden');
+	content.textContent=reply.content;
+	card.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+$('replyAck').addEventListener('click',function(){
+	if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'ackReply'}));
+	$('replyCard').classList.add('hidden');
+	log('Reply acknowledged');
+});
+
+// Render queue
+function renderQueue(items){
+	var L=$('queueList');
+	if(!items||!items.length){L.innerHTML='<div class="empty">Queue is empty</div>';$('queueBadge').textContent='0 items';$('queueBadge').className='card-badge off';return}
+	$('queueBadge').textContent=items.length+' items';$('queueBadge').className='card-badge on';
+	var h='';
+	for(var i=0;i<items.length;i++){
+		var it=items[i],tp=it.type||'text',preview=tp==='text'?(it.content||''):(tp==='image'?'[Image]':'[File] '+(it.path||'').split(/[\\/\\\\]/).pop());
+		var time=it.timestamp?new Date(it.timestamp).toLocaleTimeString():'';
+		h+='<div class="queue-item"><span class="qi-type '+tp+'">'+({text:'Text',image:'Image',file:'File'}[tp]||tp)+'</span><span class="qi-content">'+esc(preview.substring(0,120))+'</span><span class="qi-time">'+time+'</span></div>';
+	}
+	L.innerHTML=h;
+}
+
+function updateDashboard(d){
+	$('statConn').textContent=d.cardActive?'Online':'Offline';$('statConn').className='stat-val '+(d.cardActive?'on':'off');
+	$('statQueue').textContent=d.queueCount||0;
+	$('statWs').textContent=d.wsClients||0;
+	if(d.workspace){$('wsName').textContent=d.workspace.name||'-';$('wsPath').textContent=d.workspace.path||'-'}
+	$('wsCard').textContent=d.cardCode||'-';
+	$('wsExpire').textContent=d.cardExpiresAt?new Date(d.cardExpiresAt).toLocaleString():'-';
+	renderQueue(d.queue||[]);
+	if(d.question)renderQuestion(d.question);
+	if(d.reply)renderReply(d.reply);
+}
+
+function connect(){
+	if(ws)return;ws=new WebSocket('ws://'+location.host);
+	ws.onopen=function(){reconnDelay=1000;reconnAttempts=0;log('Connected');updateSendBtn();$('statConn').textContent='Online';$('statConn').className='stat-val on'};
+	ws.onclose=function(){ws=null;updateSendBtn();reconnAttempts++;var delay=Math.min(reconnDelay*Math.pow(1.5,reconnAttempts-1),maxReconnDelay);var sec=Math.round(delay/1000);if(reconnAttempts<=3){log('Disconnected, reconnecting in '+sec+'s')}else if(reconnAttempts%5===0){log('Still reconnecting... (attempt '+reconnAttempts+')')};$('statConn').textContent='Offline';$('statConn').className='stat-val off';reconnT=setTimeout(connect,delay)};
+	ws.onerror=function(){if(reconnAttempts<=2)log('Connection error')};
+	ws.onmessage=function(e){
+		try{
+			var m=JSON.parse(e.data);
+			if(m.type==='init'||m.type==='stateUpdate'){updateDashboard(m);updateSendBtn()}
+			else if(m.type==='queueUpdate'){$('statQueue').textContent=m.count||0}
+			else if(m.type==='pong'){}
+		}catch(err){log('Parse error')}
+	};
+}
+
+fetch('/api/status').then(function(r){return r.json()}).then(updateDashboard).catch(function(){});
+connect();
+})();
+</script>
+</body>
+</html>`;
+}
