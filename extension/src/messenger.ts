@@ -46,6 +46,8 @@ export interface AnswerPayload {
 export interface ReplyPayload {
   content: string;
   timestamp?: string;
+  /** Optional 0–100 progress percent (set by send_progress) for a progress bar. */
+  percent?: number;
 }
 
 export interface CardState {
@@ -61,6 +63,22 @@ export interface HistoryItem {
   content?: string;
   path?: string;
   caption?: string;
+  name?: string;
+  timestamp: string;
+  /** Optional inline image data (data: URL) so the panel can show a thumbnail
+   *  for externally-originated image sends (e.g. pasted in the Obsidian plugin). */
+  dataUrl?: string;
+}
+
+/** One entry in the shared chat history (sends from any front-end + AI replies). */
+export interface SharedHistoryItem {
+  id: string;
+  kind: "text" | "image" | "file" | "reply";
+  text?: string;
+  caption?: string;
+  name?: string;
+  dataUrl?: string;
+  path?: string;
   timestamp: string;
 }
 
@@ -96,6 +114,7 @@ let ANSWER_FILE = path.join(dataDir, "answer.json");
 let REPLY_FILE = path.join(dataDir, "reply.json");
 let CARD_FILE = path.join(dataDir, "card.json");
 let INJECTED_TOKEN_FILE = path.join(dataDir, "injected-token.json");
+let HISTORY_FILE = path.join(dataDir, "history.json");
 
 const RULES_FILE_NAME = "mcp-messenger.mdc";
 const LEGACY_RULES_FILE_NAME = "system.mdc";
@@ -108,6 +127,46 @@ export function setDataDir(dir: string): void {
   REPLY_FILE = path.join(dir, "reply.json");
   CARD_FILE = path.join(dir, "card.json");
   INJECTED_TOKEN_FILE = path.join(dir, "injected-token.json");
+  HISTORY_FILE = path.join(dir, "history.json");
+}
+
+// ── Shared chat history (sends from any front-end; rendered by all) ──────────
+
+const HISTORY_CAP = 150;
+
+export function readSharedHistory(): SharedHistoryItem[] {
+  ensureDir();
+  if (!fs.existsSync(HISTORY_FILE)) {
+    return [];
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf-8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+export function appendSharedHistory(item: SharedHistoryItem): void {
+  try {
+    const hist = readSharedHistory();
+    hist.push(item);
+    if (hist.length > HISTORY_CAP) {
+      hist.splice(0, hist.length - HISTORY_CAP);
+    }
+    ensureDir();
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(hist, null, 2), "utf-8");
+  } catch {
+    // history is best-effort
+  }
+}
+
+export function clearSharedHistory(): void {
+  try {
+    fs.writeFileSync(HISTORY_FILE, "[]", "utf-8");
+  } catch {
+    // ignore
+  }
 }
 
 export function migrateFromRootDir(): void {
@@ -171,27 +230,32 @@ export function pushHistoryItem(item: HistoryItem): void {
   historySink?.(item);
 }
 
-export function sendText(text: string): void {
-  const queue = readQueue();
-  queue.push({
+export function sendText(text: string): QueueItem {
+  const item: QueueItem = {
     id: makeId(),
     type: "text",
     content: text,
     timestamp: new Date().toISOString(),
-  });
+  };
+  const queue = readQueue();
+  queue.push(item);
   writeQueue(queue);
+  appendSharedHistory({ id: item.id, kind: "text", text, timestamp: item.timestamp });
+  return item;
 }
 
-export function sendImage(filePath: string, caption?: string): void {
-  const queue = readQueue();
-  queue.push({
+export function sendImage(filePath: string, caption?: string): QueueItem {
+  const item: QueueItem = {
     id: makeId(),
     type: "image",
     path: filePath,
     caption,
     timestamp: new Date().toISOString(),
-  });
+  };
+  const queue = readQueue();
+  queue.push(item);
   writeQueue(queue);
+  return item;
 }
 
 export function sendFile(filePath: string): void {

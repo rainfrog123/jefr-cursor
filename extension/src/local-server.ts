@@ -1,5 +1,8 @@
 import * as http from "http";
 import * as crypto from "crypto";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import type { IncomingMessage, ServerResponse, Server } from "http";
 import type { Socket } from "net";
 import {
@@ -8,10 +11,44 @@ import {
   getQueueCount,
   readQueue,
   sendText,
+  sendImage,
+  pushHistoryItem,
+  readSharedHistory,
+  appendSharedHistory,
   writeAnswer,
   cancelQuestion,
   clearReply,
 } from "./messenger";
+
+/** Decode a `data:` URL into a temp file and queue it as an image message.
+ *  Returns true if it was handled. Used for images pasted in the Obsidian plugin. */
+function handlePastedImage(dataUrl: string, caption?: string): boolean {
+  const match = /^data:image\/([\w.+-]+);base64,(.+)$/.exec(dataUrl || "");
+  if (!match) return false;
+  try {
+    const extRaw = match[1].toLowerCase();
+    const ext = extRaw === "jpeg" ? "jpg" : extRaw === "svg+xml" ? "svg" : extRaw;
+    const buf = Buffer.from(match[2], "base64");
+    const tmpPath = path.join(os.tmpdir(), `jefr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`);
+    fs.writeFileSync(tmpPath, buf);
+    const item = sendImage(tmpPath, caption);
+    // Echo into the panel history with the inline data so it shows a thumbnail.
+    pushHistoryItem({ ...item, dataUrl });
+    // Record in the shared history so all front-ends can render it.
+    appendSharedHistory({
+      id: item.id,
+      kind: "image",
+      dataUrl,
+      caption,
+      name: path.basename(tmpPath),
+      path: tmpPath,
+      timestamp: item.timestamp,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PREFERRED_PORT = 39517;
@@ -146,10 +183,11 @@ function handleHttp(req: IncomingMessage, res: ServerResponse): void {
       try {
         const data = JSON.parse(body);
         if (data.text) {
-          sendText(data.text);
+          pushHistoryItem(sendText(data.text));
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true }));
           broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+          broadcastStateNow();
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: false, error: "Missing text field" }));
@@ -219,8 +257,15 @@ function handleWsMessage(client: WsClient, raw: string): void {
     switch (msg.type) {
       case "sendText":
         if (msg.text) {
-          sendText(msg.text);
+          pushHistoryItem(sendText(msg.text));
           broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+          broadcastStateNow();
+        }
+        break;
+      case "sendImage":
+        if (msg.dataUrl && handlePastedImage(msg.dataUrl, msg.caption)) {
+          broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+          broadcastStateNow();
         }
         break;
       case "submitAnswer":
@@ -352,10 +397,44 @@ function buildPushState() {
     queue: readQueue(),
     question: readQuestion(),
     reply: readReply(),
+    history: readSharedHistory(),
     workspace: _workspaceInfo,
     wsClients: wsClients.length,
     port: serverPort,
   };
+}
+
+/** Push the full current state to all clients immediately (used right after a
+ *  send so shared history updates feel instant rather than waiting for the poll). */
+function broadcastStateNow(): void {
+  if (wsClients.length === 0) return;
+  const state = JSON.stringify(buildPushState());
+  lastPushState = state;
+  broadcastWs({ type: "stateUpdate", ...JSON.parse(state) });
+}
+
+let lastSyncedReplyTs = "";
+
+/** Mirror a new final reply (no percent) into the shared history. The extension
+ *  is the SINGLE writer of history.json, so doing this here (rather than in the
+ *  separate MCP server process) avoids lost-write races that dropped messages. */
+function syncReplyToHistory(): void {
+  try {
+    const reply = readReply();
+    if (!reply || !reply.content) return;
+    const ts = reply.timestamp || "";
+    if (ts === lastSyncedReplyTs) return;
+    lastSyncedReplyTs = ts;
+    if (typeof (reply as { percent?: number }).percent === "number") return; // progress, not a reply bubble
+    appendSharedHistory({
+      id: "r-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+      kind: "reply",
+      text: reply.content,
+      timestamp: ts || new Date().toISOString(),
+    });
+  } catch {
+    // best-effort
+  }
 }
 
 function startPushPolling(): void {
@@ -363,6 +442,7 @@ function startPushPolling(): void {
     return;
   }
   pollTimer = setInterval(() => {
+    syncReplyToHistory(); // always, even with no ws clients
     if (wsClients.length === 0) {
       return;
     }
@@ -409,6 +489,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;
 .compose-input{width:100%;min-height:84px;max-height:200px;padding:12px 14px;background:var(--surface-2);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--fg);font-size:14px;font-family:inherit;resize:vertical;outline:none;transition:border-color .2s,box-shadow .2s;line-height:1.55}
 .compose-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .compose-input::placeholder{color:var(--fg3)}
+.compose-area.drop-hl .compose-input{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.thumbs{display:flex;flex-wrap:wrap;gap:8px}
+.thumbs:empty{display:none}
+.thumb-chip{position:relative;width:56px;height:56px;border-radius:8px;overflow:hidden;border:1px solid var(--border-strong);background:var(--surface-2)}
+.thumb-chip img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb-rm{position:absolute;top:2px;right:2px;width:18px;height:18px;padding:0;border:none;border-radius:50%;background:rgba(0,0,0,0.6);color:#fff;font-size:13px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.thumb-rm:hover{background:rgba(0,0,0,0.8)}
 .compose-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .compose-hint{font-size:11px;color:var(--fg3)}
 .btn{padding:10px 24px;border:none;border-radius:var(--radius-sm);font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s;white-space:nowrap;-webkit-appearance:none}
@@ -455,6 +542,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;
 .qi-content{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--fg)}
 .qi-time{font-size:9px;color:var(--fg3);flex-shrink:0;font-family:var(--mono)}
 .empty{text-align:center;padding:24px;color:var(--fg3);font-size:12px}
+.msgs{max-height:320px;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.msg-row{display:flex;flex-direction:column;align-items:flex-end;margin-left:auto;max-width:88%}
+.msg-row.msg-ai{align-items:flex-start;margin-left:0;margin-right:auto}
+.msg-text{background:linear-gradient(135deg,#6d5cf0,#4f46e5);color:#fff;padding:8px 12px;border-radius:14px;border-bottom-right-radius:4px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.msg-reply{background:var(--surface-2);color:var(--fg);border:1px solid var(--border);padding:8px 12px;border-radius:14px;border-bottom-left-radius:4px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.msg-img{max-width:100%;max-height:220px;border-radius:12px;display:block}
+.msg-cap{background:linear-gradient(135deg,#6d5cf0,#4f46e5);color:#fff;padding:6px 11px;border-radius:12px;border-bottom-right-radius:4px;font-size:12px;margin-top:4px}
 .log-list{max-height:150px;overflow-y:auto;padding:12px 14px;background:var(--surface-2)}
 .log-item{font-size:10px;color:var(--fg2);font-family:var(--mono);padding:2px 0;display:flex;gap:8px}
 .log-time{color:var(--fg3);flex-shrink:0}
@@ -480,9 +574,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;
 		<div class="card-head"><span class="card-title">Send message</span><span id="sendStatus"></span></div>
 		<div class="card-body">
 			<div class="compose-area">
-				<textarea id="msgInput" class="compose-input" placeholder="Type a message to send to Cursor..." rows="3"></textarea>
+				<div id="thumbs" class="thumbs"></div>
+				<textarea id="msgInput" class="compose-input" placeholder="Type a message, or paste / drop an image..." rows="3"></textarea>
 				<div class="compose-row">
-					<span class="compose-hint">Ctrl+Enter to send</span>
+					<span class="compose-hint">Ctrl+Enter to send &middot; paste an image</span>
 					<button id="sendBtn" class="btn btn-send" disabled>Send</button>
 				</div>
 			</div>
@@ -502,6 +597,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;
 			<div id="replyContent" class="reply-content"></div>
 			<div class="reply-actions"><button id="replyAck" class="btn btn-outline btn-sm">Dismiss</button></div>
 		</div>
+	</div>
+
+	<!-- Conversation (shared history) -->
+	<div class="card">
+		<div class="card-head"><span class="card-title">Conversation</span></div>
+		<div id="msgs" class="msgs"><div class="empty">No messages yet</div></div>
 	</div>
 
 	<!-- Workspace -->
@@ -550,17 +651,58 @@ window.toggleSection=function(id,el){
 };
 
 // Send message
-var input=$('msgInput'),sendBtn=$('sendBtn'),sendStatus=$('sendStatus');
-function updateSendBtn(){sendBtn.disabled=!input.value.trim()||!ws||ws.readyState!==1}
+var input=$('msgInput'),sendBtn=$('sendBtn'),sendStatus=$('sendStatus'),thumbs=$('thumbs');
+var pendingImages=[];
+function canSend(){return (!!input.value.trim()||pendingImages.length>0)&&ws&&ws.readyState===1}
+function updateSendBtn(){sendBtn.disabled=!canSend()}
+function renderThumbs(){
+	if(!thumbs)return;
+	thumbs.innerHTML='';
+	for(var i=0;i<pendingImages.length;i++){
+		(function(img){
+			var chip=document.createElement('div');chip.className='thumb-chip';
+			var im=document.createElement('img');im.src=img.dataUrl;chip.appendChild(im);
+			var rm=document.createElement('button');rm.className='thumb-rm';rm.textContent='\\u00D7';
+			rm.onclick=function(){pendingImages=pendingImages.filter(function(x){return x.id!==img.id});renderThumbs();updateSendBtn()};
+			chip.appendChild(rm);thumbs.appendChild(chip);
+		})(pendingImages[i]);
+	}
+}
+function stageImage(dataUrl){
+	if(!dataUrl)return;
+	pendingImages.push({id:Date.now()+'-'+Math.random().toString(36).slice(2,7),dataUrl:dataUrl});
+	renderThumbs();updateSendBtn();
+}
+function ingestFiles(files){
+	for(var i=0;i<files.length;i++){
+		var f=files[i];
+		if(f.type&&f.type.indexOf('image/')===0){
+			(function(){var r=new FileReader();r.onload=function(ev){stageImage(String(ev.target.result||''))};r.readAsDataURL(f)})();
+		}
+	}
+}
 input.addEventListener('input',updateSendBtn);
 input.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();doSend()}});
+input.addEventListener('paste',function(e){
+	var dt=e.clipboardData;if(!dt)return;
+	var files=[];
+	if(dt.files&&dt.files.length){for(var i=0;i<dt.files.length;i++)files.push(dt.files[i]);}
+	else if(dt.items){for(var j=0;j<dt.items.length;j++){var it=dt.items[j];if(it.kind==='file'){var f=it.getAsFile();if(f)files.push(f);}}}
+	var imgs=files.filter(function(f){return f.type&&f.type.indexOf('image/')===0});
+	if(imgs.length){e.preventDefault();ingestFiles(imgs);}
+});
+var dropZone=input.parentNode;
+dropZone.addEventListener('dragover',function(e){e.preventDefault();dropZone.classList.add('drop-hl')});
+dropZone.addEventListener('dragleave',function(){dropZone.classList.remove('drop-hl')});
+dropZone.addEventListener('drop',function(e){e.preventDefault();dropZone.classList.remove('drop-hl');var files=e.dataTransfer&&e.dataTransfer.files;if(files&&files.length)ingestFiles(Array.prototype.slice.call(files));});
 sendBtn.addEventListener('click',doSend);
 function doSend(){
-	var txt=input.value.trim();if(!txt||!ws||ws.readyState!==1)return;
-	ws.send(JSON.stringify({type:'sendText',text:txt}));
-	input.value='';updateSendBtn();
+	if(!canSend())return;
+	var txt=input.value.trim();
+	if(txt){ws.send(JSON.stringify({type:'sendText',text:txt}));log('Send: '+txt.substring(0,40)+(txt.length>40?'...':''));}
+	for(var i=0;i<pendingImages.length;i++){ws.send(JSON.stringify({type:'sendImage',dataUrl:pendingImages[i].dataUrl,caption:''}));log('Send: [image]');}
+	input.value='';pendingImages=[];renderThumbs();updateSendBtn();
 	sendStatus.innerHTML='<span class="sent-ok">Sent</span>';
-	log('Send: '+txt.substring(0,40)+(txt.length>40?'...':''));
 	setTimeout(function(){sendStatus.innerHTML=''},2000);
 	input.focus();
 }
@@ -660,6 +802,24 @@ function renderQueue(items){
 	L.innerHTML=h;
 }
 
+var msgIds={};
+function renderMessages(history){
+	if(!history)return;
+	var M=$('msgs');if(!M)return;
+	if(history.length&&M.querySelector('.empty'))M.innerHTML='';
+	for(var i=0;i<history.length;i++){
+		var it=history[i];if(!it||!it.id||msgIds[it.id])continue;msgIds[it.id]=1;
+		var row=document.createElement('div');row.className='msg-row'+(it.kind==='reply'?' msg-ai':'');
+		if(it.kind==='image'&&it.dataUrl){
+			var im=document.createElement('img');im.className='msg-img';im.src=it.dataUrl;row.appendChild(im);
+			if(it.caption){var c=document.createElement('div');c.className='msg-cap';c.textContent=it.caption;row.appendChild(c);}
+		}else{
+			var t=document.createElement('div');t.className=it.kind==='reply'?'msg-reply':'msg-text';t.textContent=it.kind==='file'?('[File] '+(it.name||'')):(it.caption||it.text||'');row.appendChild(t);
+		}
+		M.appendChild(row);
+	}
+	M.scrollTop=M.scrollHeight;
+}
 function updateDashboard(d){
 	$('statConn').textContent=d.cardActive?'Online':'Offline';$('statConn').className='stat-val '+(d.cardActive?'on':'off');
 	$('statQueue').textContent=d.queueCount||0;
@@ -668,6 +828,7 @@ function updateDashboard(d){
 	$('wsCard').textContent=d.cardCode||'-';
 	$('wsExpire').textContent=d.cardExpiresAt?new Date(d.cardExpiresAt).toLocaleString():'-';
 	renderQueue(d.queue||[]);
+	renderMessages(d.history||[]);
 	if(d.question)renderQuestion(d.question);
 	if(d.reply)renderReply(d.reply);
 }

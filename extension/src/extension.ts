@@ -16,6 +16,7 @@ import {
   sendText,
   sendImage,
   sendFile,
+  appendSharedHistory,
   makeId,
   readQuestion,
   writeAnswer,
@@ -69,7 +70,7 @@ let idleTimer: ReturnType<typeof setInterval> | undefined;
 let lastActivityTime = Date.now();
 
 // Idle keep-alive: after this long with no activity, re-prime the chat loop.
-const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 function resetIdleTimer(): void {
   lastActivityTime = Date.now();
@@ -113,7 +114,22 @@ export function activate(context: vscode.ExtensionContext): void {
   migrateFromRootDir();
 
   setHistorySink((item) => {
-    mainPanel?.webview.postMessage({ type: "historyAppend", item });
+    // Map the messenger's queue-shaped item into the webview's HistoryItem
+    // shape so externally-originated sends (e.g. from the Obsidian plugin or
+    // the remote console) render as proper chat bubbles in the panel.
+    mainPanel?.webview.postMessage({
+      type: "historyAppend",
+      item: {
+        id: item.id,
+        kind: item.type,
+        text: item.content,
+        caption: item.caption,
+        path: item.path,
+        name: item.path ? path.basename(item.path) : undefined,
+        dataUrl: item.dataUrl,
+        time: new Date(item.timestamp || Date.now()).toLocaleTimeString(),
+      },
+    });
   });
 
   const provider = new MessengerViewProvider(context.extensionUri);
@@ -595,7 +611,16 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
       const buf = Buffer.from(match[2], "base64");
       const tmpPath = path.join(os.tmpdir(), "mcp_" + Date.now() + "." + ext);
       fs.writeFileSync(tmpPath, buf);
-      sendImage(tmpPath, caption);
+      const item = sendImage(tmpPath, caption);
+      appendSharedHistory({
+        id: item.id,
+        kind: "image",
+        dataUrl,
+        caption,
+        name: path.basename(tmpPath),
+        path: tmpPath,
+        timestamp: item.timestamp,
+      });
     } catch {
       // ignore
     }

@@ -1,0 +1,10 @@
+{
+  "id": "jefr-chat",
+  "name": "jefr",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "A full port of the jefr Cursor side-panel chat inside Obsidian. Send prompts to your Cursor AI agent, read replies, and answer questions — synced live with the jefr VS Code extension.",
+  "author": "jefr",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}

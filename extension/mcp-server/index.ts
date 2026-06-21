@@ -273,6 +273,8 @@ server.tool(
     await appendServerLog("info", "check_messages started");
 
     // 1) If the agent included a reply, surface it in the panel immediately.
+    //    (The extension is the single writer of history.json — it mirrors this
+    //    reply into the shared conversation history to avoid cross-process races.)
     if (reply) {
       await fs.writeFile(
         REPLY_FILE,
@@ -348,20 +350,30 @@ server.tool(
 
 server.tool(
   "send_progress",
-  "Push current work progress to the remote console. During multi-step tasks, call this tool after each step. Returns immediately without waiting for messages.",
+  "Push current work progress to the remote console. During multi-step tasks, call this tool after each step. Optionally pass percent (0-100) to drive a progress bar in the panel. Returns immediately without waiting for messages.",
   {
     progress: z
       .string()
       .describe("Progress summary (Markdown supported), pushed to the plugin panel and remote console"),
+    percent: z
+      .number()
+      .min(0)
+      .max(100)
+      .optional()
+      .describe("Completion percentage (0-100) for the panel's progress bar, e.g. completed steps / total steps"),
   },
-  async ({ progress }) => {
+  async ({ progress, percent }) => {
     await ensureDataDir();
-    await fs.writeFile(
-      REPLY_FILE,
-      JSON.stringify({ content: progress, timestamp: new Date().toISOString() }, null, 2),
-      "utf-8",
+    const payload: Record<string, unknown> = {
+      content: progress,
+      timestamp: new Date().toISOString(),
+    };
+    if (typeof percent === "number") payload.percent = Math.max(0, Math.min(100, Math.round(percent)));
+    await fs.writeFile(REPLY_FILE, JSON.stringify(payload, null, 2), "utf-8");
+    await appendServerLog(
+      "info",
+      `send_progress${typeof percent === "number" ? ` (${payload.percent}%)` : ""}: ${progress.slice(0, 100)}`,
     );
-    await appendServerLog("info", `send_progress: ${progress.slice(0, 100)}`);
     return {
       content: [
         { type: "text", text: "[system] Progress pushed. Continue the task; no need to wait for a user reply." },

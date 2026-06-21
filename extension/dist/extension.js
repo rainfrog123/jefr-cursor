@@ -1,4 +1,3 @@
-"use strict";
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -35,17 +34,15 @@ __export(extension_exports, {
 });
 module.exports = __toCommonJS(extension_exports);
 var vscode = __toESM(require("vscode"));
-var path2 = __toESM(require("path"));
-var fs2 = __toESM(require("fs"));
-var os2 = __toESM(require("os"));
+var path3 = __toESM(require("path"));
+var fs3 = __toESM(require("fs"));
+var os3 = __toESM(require("os"));
 var crypto2 = __toESM(require("crypto"));
 
 // src/messenger.ts
 var fs = __toESM(require("fs"));
 var path = __toESM(require("path"));
 var os = __toESM(require("os"));
-var https = __toESM(require("https"));
-var http = __toESM(require("http"));
 var ROOT_DATA_DIR = path.join(os.homedir(), ".moyu-message");
 var dataDir = process.env.MESSENGER_DATA_DIR || ROOT_DATA_DIR;
 var QUEUE_FILE = path.join(dataDir, "queue.json");
@@ -54,6 +51,7 @@ var ANSWER_FILE = path.join(dataDir, "answer.json");
 var REPLY_FILE = path.join(dataDir, "reply.json");
 var CARD_FILE = path.join(dataDir, "card.json");
 var INJECTED_TOKEN_FILE = path.join(dataDir, "injected-token.json");
+var HISTORY_FILE = path.join(dataDir, "history.json");
 var RULES_FILE_NAME = "mcp-messenger.mdc";
 var LEGACY_RULES_FILE_NAME = "system.mdc";
 function setDataDir(dir) {
@@ -64,17 +62,43 @@ function setDataDir(dir) {
   REPLY_FILE = path.join(dir, "reply.json");
   CARD_FILE = path.join(dir, "card.json");
   INJECTED_TOKEN_FILE = path.join(dir, "injected-token.json");
+  HISTORY_FILE = path.join(dir, "history.json");
+}
+var HISTORY_CAP = 150;
+function readSharedHistory() {
+  ensureDir();
+  if (!fs.existsSync(HISTORY_FILE)) {
+    return [];
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf-8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+function appendSharedHistory(item) {
+  try {
+    const hist = readSharedHistory();
+    hist.push(item);
+    if (hist.length > HISTORY_CAP) {
+      hist.splice(0, hist.length - HISTORY_CAP);
+    }
+    ensureDir();
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(hist, null, 2), "utf-8");
+  } catch {
+  }
 }
 function migrateFromRootDir() {
-  if (dataDir === ROOT_DATA_DIR)
+  if (dataDir === ROOT_DATA_DIR) {
     return;
+  }
   const rootCardFile = path.join(ROOT_DATA_DIR, "card.json");
   if (fs.existsSync(rootCardFile) && !fs.existsSync(CARD_FILE)) {
     ensureDir();
     fs.copyFileSync(rootCardFile, CARD_FILE);
   }
 }
-var API_BASE = "";
 var REMOTE_API_ENABLED = false;
 function ensureDir() {
   if (!fs.existsSync(dataDir)) {
@@ -86,8 +110,9 @@ function makeId() {
 }
 function readQueue() {
   ensureDir();
-  if (!fs.existsSync(QUEUE_FILE))
+  if (!fs.existsSync(QUEUE_FILE)) {
     return [];
+  }
   try {
     const data = JSON.parse(fs.readFileSync(QUEUE_FILE, "utf-8"));
     return Array.isArray(data) ? data : [];
@@ -99,32 +124,38 @@ function writeQueue(items) {
   ensureDir();
   fs.writeFileSync(QUEUE_FILE, JSON.stringify(items, null, 2), "utf-8");
 }
-function formatHistoryTime(date = new Date()) {
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
+var historySink = null;
+function setHistorySink(fn) {
+  historySink = fn;
 }
 function pushHistoryItem(item) {
-  mainPanel?.webview.postMessage({ type: "historyAppend", item });
+  historySink?.(item);
 }
 function sendText(text) {
-  const queue = readQueue();
-  queue.push({
+  const item = {
     id: makeId(),
     type: "text",
     content: text,
     timestamp: (/* @__PURE__ */ new Date()).toISOString()
-  });
+  };
+  const queue = readQueue();
+  queue.push(item);
   writeQueue(queue);
+  appendSharedHistory({ id: item.id, kind: "text", text, timestamp: item.timestamp });
+  return item;
 }
 function sendImage(filePath, caption) {
-  const queue = readQueue();
-  queue.push({
+  const item = {
     id: makeId(),
     type: "image",
     path: filePath,
     caption,
     timestamp: (/* @__PURE__ */ new Date()).toISOString()
-  });
+  };
+  const queue = readQueue();
+  queue.push(item);
   writeQueue(queue);
+  return item;
 }
 function sendFile(filePath) {
   const queue = readQueue();
@@ -149,16 +180,18 @@ function clearQueue() {
 function updateQueueItem(id, updates) {
   const queue = readQueue();
   const idx = queue.findIndex((item) => item.id === id);
-  if (idx === -1)
+  if (idx === -1) {
     return;
+  }
   if (updates.content !== void 0 && queue[idx].type === "text") {
     queue[idx].content = updates.content;
   }
   writeQueue(queue);
 }
 function readQuestion() {
-  if (!fs.existsSync(QUESTION_FILE))
+  if (!fs.existsSync(QUESTION_FILE)) {
     return null;
+  }
   try {
     const data = JSON.parse(fs.readFileSync(QUESTION_FILE, "utf-8"));
     return data && data.id && data.questions ? data : null;
@@ -172,8 +205,9 @@ function writeAnswer(answer) {
 }
 function cancelQuestion() {
   const q = readQuestion();
-  if (!q)
+  if (!q) {
     return;
+  }
   const answers = q.questions.map((qi, i) => ({
     questionId: qi.id,
     selected: [],
@@ -182,8 +216,9 @@ function cancelQuestion() {
   writeAnswer({ id: q.id, answers });
 }
 function readReply() {
-  if (!fs.existsSync(REPLY_FILE))
+  if (!fs.existsSync(REPLY_FILE)) {
     return null;
+  }
   try {
     const data = JSON.parse(fs.readFileSync(REPLY_FILE, "utf-8"));
     return data && data.content ? data : null;
@@ -199,8 +234,9 @@ function clearReply() {
 }
 function readCardState() {
   ensureDir();
-  if (!fs.existsSync(CARD_FILE))
+  if (!fs.existsSync(CARD_FILE)) {
     return null;
+  }
   try {
     const data = JSON.parse(fs.readFileSync(CARD_FILE, "utf-8"));
     return data && data.code ? data : null;
@@ -208,30 +244,38 @@ function readCardState() {
     return null;
   }
 }
-function writeCardState(state) {
-  ensureDir();
-  fs.writeFileSync(CARD_FILE, JSON.stringify(state, null, 2), "utf-8");
-}
 function clearCardState() {
   try {
     fs.unlinkSync(CARD_FILE);
   } catch {
   }
 }
-function apiRequest(endpoint, body) {
+function apiRequest(_endpoint, _body) {
   return Promise.resolve({ success: false, error: "remote API disabled" });
 }
-async function activateCard(code, machineId) {
-  return { success: true, data: { code: "", expires_at: "", activated_at: (/* @__PURE__ */ new Date()).toISOString(), duration_hours: 0 } };
+async function activateCard(_code, _machineId) {
+  return {
+    success: true,
+    data: {
+      code: "",
+      expires_at: "",
+      activated_at: (/* @__PURE__ */ new Date()).toISOString(),
+      duration_hours: 0
+    }
+  };
 }
 function isCardValid() {
   return true;
 }
 async function pollRemoteMessages(cardCode, workspace2) {
   try {
-    const resp = await apiRequest("/mcp-cards/remote-poll", { code: cardCode, workspace: workspace2 || "" });
-    if (resp.success && Array.isArray(resp.data))
+    const resp = await apiRequest("/mcp-cards/remote-poll", {
+      code: cardCode,
+      workspace: workspace2 || ""
+    });
+    if (resp.success && Array.isArray(resp.data)) {
       return resp.data;
+    }
     return [];
   } catch {
     return [];
@@ -239,7 +283,11 @@ async function pollRemoteMessages(cardCode, workspace2) {
 }
 async function pushRemoteReply(cardCode, content, workspace2) {
   try {
-    const resp = await apiRequest("/mcp-cards/remote-reply", { code: cardCode, content, workspace: workspace2 || null });
+    const resp = await apiRequest("/mcp-cards/remote-reply", {
+      code: cardCode,
+      content,
+      workspace: workspace2 || null
+    });
     return !!resp.success;
   } catch {
     return false;
@@ -281,12 +329,13 @@ async function cancelRemoteQuestion(cardCode, questionId) {
 }
 async function pollRemoteAnswer(cardCode, questionId) {
   try {
-    const resp = await apiRequest("/mcp-cards/remote-poll-answer", {
-      code: cardCode,
-      question_id: questionId
-    });
-    if (resp.success && resp.data)
+    const resp = await apiRequest(
+      "/mcp-cards/remote-poll-answer",
+      { code: cardCode, question_id: questionId }
+    );
+    if (resp.success && resp.data) {
       return resp.data;
+    }
     return null;
   } catch {
     return null;
@@ -295,7 +344,10 @@ async function pollRemoteAnswer(cardCode, questionId) {
 function getCursorConfigDir() {
   switch (process.platform) {
     case "win32":
-      return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Cursor");
+      return path.join(
+        process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
+        "Cursor"
+      );
     case "darwin":
       return path.join(os.homedir(), "Library", "Application Support", "Cursor");
     default:
@@ -309,8 +361,9 @@ function readVscdbViaSqlite(dbPath) {
     const tokenRow = db.prepare("SELECT value FROM ItemTable WHERE key = ?").get("cursorAuth/accessToken");
     const emailRow = db.prepare("SELECT value FROM ItemTable WHERE key = ?").get("cursorAuth/cachedEmail");
     db.close();
-    if (tokenRow?.value)
+    if (tokenRow?.value) {
       return { token: tokenRow.value, email: emailRow?.value || "" };
+    }
   } catch {
   }
   try {
@@ -323,8 +376,9 @@ function readVscdbViaSqlite(dbPath) {
       windowsHide: true
     }).trim();
     const parsed = JSON.parse(out);
-    if (parsed.t)
+    if (parsed.t) {
       return { token: parsed.t, email: parsed.e || "" };
+    }
   } catch {
   }
   return null;
@@ -334,16 +388,18 @@ function readCursorAuth() {
   const dbPath = path.join(gsDir, "state.vscdb");
   if (fs.existsSync(dbPath)) {
     const result = readVscdbViaSqlite(dbPath);
-    if (result)
+    if (result) {
       return result;
+    }
   }
   const jsonPath = path.join(gsDir, "storage.json");
   if (fs.existsSync(jsonPath)) {
     try {
       const data = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
       const token = data["cursorAuth/accessToken"];
-      if (token)
+      if (token) {
         return { token, email: data["cursorAuth/cachedEmail"] || "" };
+      }
     } catch {
     }
   }
@@ -351,8 +407,9 @@ function readCursorAuth() {
   if (fs.existsSync(authPath)) {
     try {
       const data = JSON.parse(fs.readFileSync(authPath, "utf-8"));
-      if (data.token)
+      if (data.token) {
         return { token: data.token, email: data.email || "" };
+      }
     } catch {
     }
   }
@@ -360,8 +417,9 @@ function readCursorAuth() {
 }
 function readInjectedToken() {
   ensureDir();
-  if (!fs.existsSync(INJECTED_TOKEN_FILE))
+  if (!fs.existsSync(INJECTED_TOKEN_FILE)) {
     return null;
+  }
   try {
     const data = JSON.parse(fs.readFileSync(INJECTED_TOKEN_FILE, "utf-8"));
     return data && data.token ? data : null;
@@ -381,8 +439,9 @@ function clearInjectedToken() {
 }
 function getEffectiveAuth() {
   const injected = readInjectedToken();
-  if (injected)
+  if (injected) {
     return { token: injected.token, email: "" };
+  }
   return readCursorAuth();
 }
 async function fetchCursorUsage() {
@@ -391,21 +450,21 @@ async function fetchCursorUsage() {
     return { success: false, error: "Cursor login not detected" };
   }
   return {
-      success: true,
-      email: auth.email || "",
-      membershipType: "local",
-      isUnlimited: true,
-      usagePct: null,
-      planUsed: 0,
-      planLimit: void 0,
-      onDemandUsed: 0,
-      billingCycleStart: "",
-      billingCycleEnd: "",
-      displayMessage: "",
-      totalCost: 0,
-      eventsCount: 0,
-      models: []
-    };
+    success: true,
+    email: auth.email || "",
+    membershipType: "local",
+    isUnlimited: true,
+    usagePct: null,
+    planUsed: 0,
+    planLimit: void 0,
+    onDemandUsed: 0,
+    billingCycleStart: "",
+    billingCycleEnd: "",
+    displayMessage: "",
+    totalCost: 0,
+    eventsCount: 0,
+    models: []
+  };
 }
 function getMcpServerPath() {
   const extDir = path.dirname(path.dirname(__filename));
@@ -415,17 +474,12 @@ function getGlobalMcpJsonPath() {
   return path.join(os.homedir(), ".cursor", "mcp.json");
 }
 function applyMcpServerEntry(config, messengerDataDir) {
-  if (!config.mcpServers)
+  if (!config.mcpServers) {
     config.mcpServers = {};
-  if (config.mcpServers["moyu-message"]) {
-    delete config.mcpServers["moyu-message"];
   }
-  if (config.mcpServers["jefr cursor"]) {
-    delete config.mcpServers["jefr cursor"];
-  }
-  if (config.mcpServers["jefr"]) {
-    delete config.mcpServers["jefr"];
-  }
+  delete config.mcpServers["moyu-message"];
+  delete config.mcpServers["jefr cursor"];
+  delete config.mcpServers["jefr"];
   const mcpServerConfig = {
     command: "node",
     args: [getMcpServerPath()]
@@ -472,8 +526,9 @@ function setupMcpConfig(workspaceFolder, messengerDataDir) {
     } catch {
     }
   }
-  if (!config.mcpServers)
+  if (!config.mcpServers) {
     config.mcpServers = {};
+  }
   applyMcpServerEntry(config, messengerDataDir);
   const nextContent = JSON.stringify(config, null, 2);
   let changed = false;
@@ -492,8 +547,9 @@ function removeMcpConfig(workspaceFolder) {
   if (fs.existsSync(mcpJsonPath)) {
     try {
       const config = JSON.parse(fs.readFileSync(mcpJsonPath, "utf-8"));
-      if (!config.mcpServers)
+      if (!config.mcpServers) {
         config.mcpServers = {};
+      }
       const keys = ["jefr", "jefr cursor", "moyu-message"];
       for (const key of keys) {
         if (config.mcpServers[key]) {
@@ -502,11 +558,7 @@ function removeMcpConfig(workspaceFolder) {
         }
       }
       if (removed) {
-        fs.writeFileSync(
-          mcpJsonPath,
-          JSON.stringify(config, null, 2),
-          "utf-8"
-        );
+        fs.writeFileSync(mcpJsonPath, JSON.stringify(config, null, 2), "utf-8");
       }
     } catch {
     }
@@ -525,20 +577,22 @@ alwaysApply: true
 # MCP tool usage rules
 
 1. After each conversation turn is **fully output**, the last step must call \`check_messages\`. Applies to Agent/Plan/Debug/Ask modes with no exceptions.
-2. \`check_messages\` blocks until the user sends a new message; process it, reply, then call \`check_messages\` again — perpetual loop: reply → check_messages → receive message → reply → check_messages.
+2. \`check_messages\` blocks until the user sends a new message; process it, reply, then call \`check_messages\` again \u2014 perpetual loop: reply \u2192 check_messages \u2192 receive message \u2192 reply \u2192 check_messages.
 3. Never call \`check_messages\` at the start of a turn or before the reply is complete. Only exception: the user explicitly asks to end the conversation.
-4. After writing a plan (Plan), finishing analysis (Debug), or answering a question (Ask), do not end the turn — call \`check_messages\` and wait for user feedback.
+4. After writing a plan (Plan), finishing analysis (Debug), or answering a question (Ask), do not end the turn \u2014 call \`check_messages\` and wait for user feedback.
 5. When the user must choose or confirm (pick a plan, framework, approve an action, etc.), call \`ask_question\`. Do not use Cursor's built-in ask_user_question.
 6. \`ask_question\` format: \`{ "questions": [{ "question": "Question text", "options": [{ "id": "a", "label": "Option A" }, { "id": "b", "label": "Option B" }], "allow_multiple": false }] }\`
 7. Single-select: \`allow_multiple: false\`; multi-select: \`allow_multiple: true\`; one \`questions\` array may mix both.
 8. Users may add custom text (Other field) on each question; no extra option needed for that.
 9. After \`ask_question\` returns an answer, still call \`check_messages\` to keep listening.
 10. Do not use \`ask_question\` at the end of every turn to ask "anything else?"; end turns with \`check_messages\` only. Use \`ask_question\` only when a real decision is needed.
-11. \`check_messages\` accepts optional \`reply\` (string, Markdown): summary shown in the plugin modal. Example: \`{ "reply": "## Summary\nChanges complete..." }\`
+11. \`check_messages\` accepts optional \`reply\` (string, Markdown): summary shown in the plugin modal. Example: \`{ "reply": "## Summary
+Changes complete..." }\`
 12. Before ending a session, prefer passing \`reply\` with key conclusions; omit \`reply\` if no summary is needed.
 13. Do not spawn subagents for parallel tasks.
-14. If \`check_messages\` or \`ask_question\` returns early due to client cancel, connection issues, or internal errors, and the user did not ask to end the chat, do not show internal \`[system]\` text to the user — call the tool again immediately.
-15. During multi-step work, after each key step call \`send_progress\` with a summary. Example: \`{ "progress": "## Step 1 complete\nUpdated xxx file..." }\`. \`send_progress\` returns immediately; continue to the next step.
+14. If \`check_messages\` or \`ask_question\` returns early due to client cancel, connection issues, or internal errors, and the user did not ask to end the chat, do not show internal \`[system]\` text to the user \u2014 call the tool again immediately.
+15. During multi-step work, after each key step call \`send_progress\` with a summary. Example: \`{ "progress": "## Step 1 complete
+Updated xxx file..." }\`. \`send_progress\` returns immediately; continue to the next step.
 16. \`progress\` should include: what was done, current approach, next step. Use concise Markdown.
 
 ---
@@ -592,8 +646,37 @@ function removeLegacyRulesIfManaged(filePath) {
 }
 
 // src/local-server.ts
-var http2 = __toESM(require("http"));
+var http = __toESM(require("http"));
 var crypto = __toESM(require("crypto"));
+var fs2 = __toESM(require("fs"));
+var os2 = __toESM(require("os"));
+var path2 = __toESM(require("path"));
+function handlePastedImage(dataUrl, caption) {
+  const match = /^data:image\/([\w.+-]+);base64,(.+)$/.exec(dataUrl || "");
+  if (!match)
+    return false;
+  try {
+    const extRaw = match[1].toLowerCase();
+    const ext = extRaw === "jpeg" ? "jpg" : extRaw === "svg+xml" ? "svg" : extRaw;
+    const buf = Buffer.from(match[2], "base64");
+    const tmpPath = path2.join(os2.tmpdir(), `jefr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`);
+    fs2.writeFileSync(tmpPath, buf);
+    const item = sendImage(tmpPath, caption);
+    pushHistoryItem({ ...item, dataUrl });
+    appendSharedHistory({
+      id: item.id,
+      kind: "image",
+      dataUrl,
+      caption,
+      name: path2.basename(tmpPath),
+      path: tmpPath,
+      timestamp: item.timestamp
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 var WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 var PREFERRED_PORT = 39517;
 var server = null;
@@ -618,11 +701,12 @@ function startLocalServer(port = PREFERRED_PORT) {
       return;
     }
     let settled = false;
-    const srv = http2.createServer(handleHttp);
+    const srv = http.createServer(handleHttp);
     srv.on("upgrade", handleUpgrade);
     srv.on("error", (err) => {
-      if (settled)
+      if (settled) {
         return;
+      }
       settled = true;
       try {
         srv.close();
@@ -635,8 +719,9 @@ function startLocalServer(port = PREFERRED_PORT) {
       }
     });
     srv.listen(port, "127.0.0.1", () => {
-      if (settled)
+      if (settled) {
         return;
+      }
       settled = true;
       server = srv;
       serverPort = srv.address().port;
@@ -681,18 +766,20 @@ function handleHttp(req, res) {
     const q = readQuestion();
     const reply = readReply();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      cardActive: true,
-      cardCode: null,
-      cardExpiresAt: null,
-      queueCount: getQueueCount(),
-      queue: readQueue(),
-      hasQuestion: !!q,
-      hasReply: !!reply,
-      workspace: _workspaceInfo,
-      wsClients: wsClients.length,
-      port: serverPort
-    }));
+    res.end(
+      JSON.stringify({
+        cardActive: true,
+        cardCode: null,
+        cardExpiresAt: null,
+        queueCount: getQueueCount(),
+        queue: readQueue(),
+        hasQuestion: !!q,
+        hasReply: !!reply,
+        workspace: _workspaceInfo,
+        wsClients: wsClients.length,
+        port: serverPort
+      })
+    );
     return;
   }
   if (req.url === "/api/send" && req.method === "POST") {
@@ -704,10 +791,11 @@ function handleHttp(req, res) {
       try {
         const data = JSON.parse(body);
         if (data.text) {
-          sendText(data.text);
+          pushHistoryItem(sendText(data.text));
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true }));
           broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+          broadcastStateNow();
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: false, error: "Missing text field" }));
@@ -746,8 +834,9 @@ Sec-WebSocket-Accept: ${accept}\r
     buffer = Buffer.concat([buffer, chunk]);
     while (buffer.length >= 2) {
       const parsed = parseFrame(buffer);
-      if (!parsed)
+      if (!parsed) {
         break;
+      }
       buffer = buffer.subarray(parsed.totalLength);
       if (parsed.opcode === 8) {
         removeClient(client);
@@ -776,8 +865,15 @@ function handleWsMessage(client, raw) {
     switch (msg.type) {
       case "sendText":
         if (msg.text) {
-          sendText(msg.text);
+          pushHistoryItem(sendText(msg.text));
           broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+          broadcastStateNow();
+        }
+        break;
+      case "sendImage":
+        if (msg.dataUrl && handlePastedImage(msg.dataUrl, msg.caption)) {
+          broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+          broadcastStateNow();
         }
         break;
       case "submitAnswer":
@@ -800,8 +896,9 @@ function handleWsMessage(client, raw) {
 }
 function removeClient(client) {
   const idx = wsClients.indexOf(client);
-  if (idx !== -1)
+  if (idx !== -1) {
     wsClients.splice(idx, 1);
+  }
   try {
     client.socket.destroy();
   } catch {
@@ -814,27 +911,31 @@ function broadcastWs(data) {
   }
 }
 function parseFrame(buf) {
-  if (buf.length < 2)
+  if (buf.length < 2) {
     return null;
+  }
   const opcode = buf[0] & 15;
   const masked = (buf[1] & 128) !== 0;
   let payloadLen = buf[1] & 127;
   let offset = 2;
   if (payloadLen === 126) {
-    if (buf.length < 4)
+    if (buf.length < 4) {
       return null;
+    }
     payloadLen = buf.readUInt16BE(2);
     offset = 4;
   } else if (payloadLen === 127) {
-    if (buf.length < 10)
+    if (buf.length < 10) {
       return null;
+    }
     payloadLen = Number(buf.readBigUInt64BE(2));
     offset = 10;
   }
   const maskLen = masked ? 4 : 0;
   const totalLength = offset + maskLen + payloadLen;
-  if (buf.length < totalLength)
+  if (buf.length < totalLength) {
     return null;
+  }
   let payload = buf.subarray(offset + maskLen, offset + maskLen + payloadLen);
   if (masked) {
     const mask = buf.subarray(offset, offset + 4);
@@ -887,17 +988,49 @@ function buildPushState() {
     queue: readQueue(),
     question: readQuestion(),
     reply: readReply(),
+    history: readSharedHistory(),
     workspace: _workspaceInfo,
     wsClients: wsClients.length,
     port: serverPort
   };
 }
-function startPushPolling() {
-  if (pollTimer)
+function broadcastStateNow() {
+  if (wsClients.length === 0)
     return;
-  pollTimer = setInterval(() => {
-    if (wsClients.length === 0)
+  const state = JSON.stringify(buildPushState());
+  lastPushState = state;
+  broadcastWs({ type: "stateUpdate", ...JSON.parse(state) });
+}
+var lastSyncedReplyTs = "";
+function syncReplyToHistory() {
+  try {
+    const reply = readReply();
+    if (!reply || !reply.content)
       return;
+    const ts = reply.timestamp || "";
+    if (ts === lastSyncedReplyTs)
+      return;
+    lastSyncedReplyTs = ts;
+    if (typeof reply.percent === "number")
+      return;
+    appendSharedHistory({
+      id: "r-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+      kind: "reply",
+      text: reply.content,
+      timestamp: ts || (/* @__PURE__ */ new Date()).toISOString()
+    });
+  } catch {
+  }
+}
+function startPushPolling() {
+  if (pollTimer) {
+    return;
+  }
+  pollTimer = setInterval(() => {
+    syncReplyToHistory();
+    if (wsClients.length === 0) {
+      return;
+    }
     const state = JSON.stringify(buildPushState());
     if (state !== lastPushState) {
       lastPushState = state;
@@ -940,6 +1073,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;
 .compose-input{width:100%;min-height:84px;max-height:200px;padding:12px 14px;background:var(--surface-2);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--fg);font-size:14px;font-family:inherit;resize:vertical;outline:none;transition:border-color .2s,box-shadow .2s;line-height:1.55}
 .compose-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .compose-input::placeholder{color:var(--fg3)}
+.compose-area.drop-hl .compose-input{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.thumbs{display:flex;flex-wrap:wrap;gap:8px}
+.thumbs:empty{display:none}
+.thumb-chip{position:relative;width:56px;height:56px;border-radius:8px;overflow:hidden;border:1px solid var(--border-strong);background:var(--surface-2)}
+.thumb-chip img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb-rm{position:absolute;top:2px;right:2px;width:18px;height:18px;padding:0;border:none;border-radius:50%;background:rgba(0,0,0,0.6);color:#fff;font-size:13px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.thumb-rm:hover{background:rgba(0,0,0,0.8)}
 .compose-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .compose-hint{font-size:11px;color:var(--fg3)}
 .btn{padding:10px 24px;border:none;border-radius:var(--radius-sm);font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;transition:all .15s;white-space:nowrap;-webkit-appearance:none}
@@ -986,6 +1126,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;
 .qi-content{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--fg)}
 .qi-time{font-size:9px;color:var(--fg3);flex-shrink:0;font-family:var(--mono)}
 .empty{text-align:center;padding:24px;color:var(--fg3);font-size:12px}
+.msgs{max-height:320px;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.msg-row{display:flex;flex-direction:column;align-items:flex-end;margin-left:auto;max-width:88%}
+.msg-row.msg-ai{align-items:flex-start;margin-left:0;margin-right:auto}
+.msg-text{background:linear-gradient(135deg,#6d5cf0,#4f46e5);color:#fff;padding:8px 12px;border-radius:14px;border-bottom-right-radius:4px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.msg-reply{background:var(--surface-2);color:var(--fg);border:1px solid var(--border);padding:8px 12px;border-radius:14px;border-bottom-left-radius:4px;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.msg-img{max-width:100%;max-height:220px;border-radius:12px;display:block}
+.msg-cap{background:linear-gradient(135deg,#6d5cf0,#4f46e5);color:#fff;padding:6px 11px;border-radius:12px;border-bottom-right-radius:4px;font-size:12px;margin-top:4px}
 .log-list{max-height:150px;overflow-y:auto;padding:12px 14px;background:var(--surface-2)}
 .log-item{font-size:10px;color:var(--fg2);font-family:var(--mono);padding:2px 0;display:flex;gap:8px}
 .log-time{color:var(--fg3);flex-shrink:0}
@@ -1011,9 +1158,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;
 		<div class="card-head"><span class="card-title">Send message</span><span id="sendStatus"></span></div>
 		<div class="card-body">
 			<div class="compose-area">
-				<textarea id="msgInput" class="compose-input" placeholder="Type a message to send to Cursor..." rows="3"></textarea>
+				<div id="thumbs" class="thumbs"></div>
+				<textarea id="msgInput" class="compose-input" placeholder="Type a message, or paste / drop an image..." rows="3"></textarea>
 				<div class="compose-row">
-					<span class="compose-hint">Ctrl+Enter to send</span>
+					<span class="compose-hint">Ctrl+Enter to send &middot; paste an image</span>
 					<button id="sendBtn" class="btn btn-send" disabled>Send</button>
 				</div>
 			</div>
@@ -1033,6 +1181,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;
 			<div id="replyContent" class="reply-content"></div>
 			<div class="reply-actions"><button id="replyAck" class="btn btn-outline btn-sm">Dismiss</button></div>
 		</div>
+	</div>
+
+	<!-- Conversation (shared history) -->
+	<div class="card">
+		<div class="card-head"><span class="card-title">Conversation</span></div>
+		<div id="msgs" class="msgs"><div class="empty">No messages yet</div></div>
 	</div>
 
 	<!-- Workspace -->
@@ -1081,17 +1235,58 @@ window.toggleSection=function(id,el){
 };
 
 // Send message
-var input=$('msgInput'),sendBtn=$('sendBtn'),sendStatus=$('sendStatus');
-function updateSendBtn(){sendBtn.disabled=!input.value.trim()||!ws||ws.readyState!==1}
+var input=$('msgInput'),sendBtn=$('sendBtn'),sendStatus=$('sendStatus'),thumbs=$('thumbs');
+var pendingImages=[];
+function canSend(){return (!!input.value.trim()||pendingImages.length>0)&&ws&&ws.readyState===1}
+function updateSendBtn(){sendBtn.disabled=!canSend()}
+function renderThumbs(){
+	if(!thumbs)return;
+	thumbs.innerHTML='';
+	for(var i=0;i<pendingImages.length;i++){
+		(function(img){
+			var chip=document.createElement('div');chip.className='thumb-chip';
+			var im=document.createElement('img');im.src=img.dataUrl;chip.appendChild(im);
+			var rm=document.createElement('button');rm.className='thumb-rm';rm.textContent='\\u00D7';
+			rm.onclick=function(){pendingImages=pendingImages.filter(function(x){return x.id!==img.id});renderThumbs();updateSendBtn()};
+			chip.appendChild(rm);thumbs.appendChild(chip);
+		})(pendingImages[i]);
+	}
+}
+function stageImage(dataUrl){
+	if(!dataUrl)return;
+	pendingImages.push({id:Date.now()+'-'+Math.random().toString(36).slice(2,7),dataUrl:dataUrl});
+	renderThumbs();updateSendBtn();
+}
+function ingestFiles(files){
+	for(var i=0;i<files.length;i++){
+		var f=files[i];
+		if(f.type&&f.type.indexOf('image/')===0){
+			(function(){var r=new FileReader();r.onload=function(ev){stageImage(String(ev.target.result||''))};r.readAsDataURL(f)})();
+		}
+	}
+}
 input.addEventListener('input',updateSendBtn);
 input.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();doSend()}});
+input.addEventListener('paste',function(e){
+	var dt=e.clipboardData;if(!dt)return;
+	var files=[];
+	if(dt.files&&dt.files.length){for(var i=0;i<dt.files.length;i++)files.push(dt.files[i]);}
+	else if(dt.items){for(var j=0;j<dt.items.length;j++){var it=dt.items[j];if(it.kind==='file'){var f=it.getAsFile();if(f)files.push(f);}}}
+	var imgs=files.filter(function(f){return f.type&&f.type.indexOf('image/')===0});
+	if(imgs.length){e.preventDefault();ingestFiles(imgs);}
+});
+var dropZone=input.parentNode;
+dropZone.addEventListener('dragover',function(e){e.preventDefault();dropZone.classList.add('drop-hl')});
+dropZone.addEventListener('dragleave',function(){dropZone.classList.remove('drop-hl')});
+dropZone.addEventListener('drop',function(e){e.preventDefault();dropZone.classList.remove('drop-hl');var files=e.dataTransfer&&e.dataTransfer.files;if(files&&files.length)ingestFiles(Array.prototype.slice.call(files));});
 sendBtn.addEventListener('click',doSend);
 function doSend(){
-	var txt=input.value.trim();if(!txt||!ws||ws.readyState!==1)return;
-	ws.send(JSON.stringify({type:'sendText',text:txt}));
-	input.value='';updateSendBtn();
+	if(!canSend())return;
+	var txt=input.value.trim();
+	if(txt){ws.send(JSON.stringify({type:'sendText',text:txt}));log('Send: '+txt.substring(0,40)+(txt.length>40?'...':''));}
+	for(var i=0;i<pendingImages.length;i++){ws.send(JSON.stringify({type:'sendImage',dataUrl:pendingImages[i].dataUrl,caption:''}));log('Send: [image]');}
+	input.value='';pendingImages=[];renderThumbs();updateSendBtn();
 	sendStatus.innerHTML='<span class="sent-ok">Sent</span>';
-	log('Send: '+txt.substring(0,40)+(txt.length>40?'...':''));
 	setTimeout(function(){sendStatus.innerHTML=''},2000);
 	input.focus();
 }
@@ -1191,6 +1386,24 @@ function renderQueue(items){
 	L.innerHTML=h;
 }
 
+var msgIds={};
+function renderMessages(history){
+	if(!history)return;
+	var M=$('msgs');if(!M)return;
+	if(history.length&&M.querySelector('.empty'))M.innerHTML='';
+	for(var i=0;i<history.length;i++){
+		var it=history[i];if(!it||!it.id||msgIds[it.id])continue;msgIds[it.id]=1;
+		var row=document.createElement('div');row.className='msg-row'+(it.kind==='reply'?' msg-ai':'');
+		if(it.kind==='image'&&it.dataUrl){
+			var im=document.createElement('img');im.className='msg-img';im.src=it.dataUrl;row.appendChild(im);
+			if(it.caption){var c=document.createElement('div');c.className='msg-cap';c.textContent=it.caption;row.appendChild(c);}
+		}else{
+			var t=document.createElement('div');t.className=it.kind==='reply'?'msg-reply':'msg-text';t.textContent=it.kind==='file'?('[File] '+(it.name||'')):(it.caption||it.text||'');row.appendChild(t);
+		}
+		M.appendChild(row);
+	}
+	M.scrollTop=M.scrollHeight;
+}
 function updateDashboard(d){
 	$('statConn').textContent=d.cardActive?'Online':'Offline';$('statConn').className='stat-val '+(d.cardActive?'on':'off');
 	$('statQueue').textContent=d.queueCount||0;
@@ -1199,6 +1412,7 @@ function updateDashboard(d){
 	$('wsCard').textContent=d.cardCode||'-';
 	$('wsExpire').textContent=d.cardExpiresAt?new Date(d.cardExpiresAt).toLocaleString():'-';
 	renderQueue(d.queue||[]);
+	renderMessages(d.history||[]);
 	if(d.question)renderQuestion(d.question);
 	if(d.reply)renderReply(d.reply);
 }
@@ -1242,30 +1456,35 @@ var lastReplyContent;
 var lastRemoteQuestionId;
 var idleTimer;
 var lastActivityTime = Date.now();
-var IDLE_TIMEOUT_MS = 10 * 60 * 1e3;
+var IDLE_TIMEOUT_MS = 5 * 60 * 1e3;
 function resetIdleTimer() {
   lastActivityTime = Date.now();
 }
 function startIdleTimer() {
-  if (idleTimer)
+  if (idleTimer) {
     clearInterval(idleTimer);
+  }
   idleTimer = setInterval(() => {
-    if (!isCardValid())
+    if (!isCardValid()) {
       return;
+    }
     if (Date.now() - lastActivityTime >= IDLE_TIMEOUT_MS) {
-      sendText("Hello. IMPORTANT: STAND BY. Take NO action of any kind right now \u2014 do not run any tools, edit files, or make any changes. Just hold, keep the connection open, and wait for my next instruction.");
+      sendText(
+        "Hello. IMPORTANT: STAND BY. Take NO action of any kind right now \u2014 do not run any tools, edit files, or make any changes. Just hold, keep the connection open, and wait for my next instruction."
+      );
       triggerCursorChat();
       resetIdleTimer();
     }
   }, 6e4);
 }
 function computeDataDir(workspaceFolders) {
-  const rootDir = path2.join(os2.homedir(), ".moyu-message");
-  if (workspaceFolders.length === 0)
+  const rootDir = path3.join(os3.homedir(), ".moyu-message");
+  if (workspaceFolders.length === 0) {
     return rootDir;
+  }
   const primary = workspaceFolders[0].uri.fsPath;
   const hash = crypto2.createHash("md5").update(primary).digest("hex").slice(0, 12);
-  return path2.join(rootDir, hash);
+  return path3.join(rootDir, hash);
 }
 function activate(context) {
   extensionVersion = context.extension.packageJSON?.version || "0.0.0";
@@ -1273,12 +1492,24 @@ function activate(context) {
   currentDataDir = computeDataDir(workspaceFolders);
   setDataDir(currentDataDir);
   migrateFromRootDir();
+  setHistorySink((item) => {
+    mainPanel?.webview.postMessage({
+      type: "historyAppend",
+      item: {
+        id: item.id,
+        kind: item.type,
+        text: item.content,
+        caption: item.caption,
+        path: item.path,
+        name: item.path ? path3.basename(item.path) : void 0,
+        dataUrl: item.dataUrl,
+        time: new Date(item.timestamp || Date.now()).toLocaleTimeString()
+      }
+    });
+  });
   const provider = new MessengerViewProvider(context.extensionUri);
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(
-      "mcpMessenger.mainView",
-      provider
-    )
+    vscode.window.registerWebviewViewProvider("mcpMessenger.mainView", provider)
   );
   context.subscriptions.push(
     vscode.commands.registerCommand("mcpMessenger.setupMcp", () => {
@@ -1298,8 +1529,9 @@ function activate(context) {
   context.subscriptions.push(
     vscode.commands.registerCommand("mcpMessenger.removeMcp", () => {
       const workspaceFolders2 = vscode.workspace.workspaceFolders;
-      if (!workspaceFolders2?.length)
+      if (!workspaceFolders2?.length) {
         return;
+      }
       let removedCount = 0;
       for (const folder of workspaceFolders2) {
         if (removeMcpConfig(folder.uri.fsPath)) {
@@ -1312,17 +1544,12 @@ function activate(context) {
     })
   );
   context.subscriptions.push(
-    vscode.commands.registerCommand(
-      "mcpMessenger.sendFile",
-      (uri) => {
-        if (uri) {
-          sendFile(uri.fsPath);
-          vscode.window.showInformationMessage(
-            "File added to message queue"
-          );
-        }
+    vscode.commands.registerCommand("mcpMessenger.sendFile", (uri) => {
+      if (uri) {
+        sendFile(uri.fsPath);
+        vscode.window.showInformationMessage("File added to message queue");
       }
-    )
+    })
   );
   startPolling();
   startRemotePolling();
@@ -1355,33 +1582,36 @@ function activate(context) {
   );
   context.subscriptions.push({
     dispose: () => {
-      if (pollTimer2)
+      if (pollTimer2) {
         clearInterval(pollTimer2);
+      }
     }
   });
 }
 function deactivate() {
-  if (pollTimer2)
+  if (pollTimer2) {
     clearInterval(pollTimer2);
-  if (remotePollTimer)
+  }
+  if (remotePollTimer) {
     clearInterval(remotePollTimer);
-  if (heartbeatTimer)
+  }
+  if (heartbeatTimer) {
     clearInterval(heartbeatTimer);
-  if (idleTimer)
+  }
+  if (idleTimer) {
     clearInterval(idleTimer);
+  }
   stopLocalServer();
 }
 function startPolling() {
   const poll = () => {
-    if (!mainPanel)
+    if (!mainPanel) {
       return;
+    }
     const question = readQuestion();
     if (question) {
       if (question.id !== lastQuestionId) {
-        mainPanel.webview.postMessage({
-          type: "showQuestion",
-          data: question
-        });
+        mainPanel.webview.postMessage({ type: "showQuestion", data: question });
         lastQuestionId = question.id;
         pushQuestionToRemoteNow(question);
       }
@@ -1391,32 +1621,20 @@ function startPolling() {
     }
     const reply = readReply();
     if (reply && reply.timestamp !== lastReplyTimestamp) {
-      mainPanel.webview.postMessage({
-        type: "showReply",
-        data: reply
-      });
+      mainPanel.webview.postMessage({ type: "showReply", data: reply });
       lastReplyTimestamp = reply.timestamp;
     } else if (!reply) {
       lastReplyTimestamp = void 0;
     }
     const cardValid = isCardValid();
     if (cardValid !== lastCardValid) {
-      mainPanel.webview.postMessage({
-        type: "cardState",
-        data: { active: true }
-      });
+      mainPanel.webview.postMessage({ type: "cardState", data: { active: true } });
       lastCardValid = cardValid;
     }
     const count = getQueueCount();
     if (count !== lastQueueCount) {
-      mainPanel.webview.postMessage({
-        type: "queueCount",
-        count
-      });
-      mainPanel.webview.postMessage({
-        type: "queueData",
-        data: readQueue()
-      });
+      mainPanel.webview.postMessage({ type: "queueCount", count });
+      mainPanel.webview.postMessage({ type: "queueData", data: readQueue() });
       lastQueueCount = count;
     }
   };
@@ -1438,40 +1656,46 @@ function getWorkspacePath() {
   return void 0;
 }
 function pushQuestionToRemoteNow(question) {
-  if (!REMOTE_API_ENABLED)
+  if (!REMOTE_API_ENABLED) {
     return;
+  }
   const card = readCardState();
-  if (!card || !isCardValid())
+  if (!card || !isCardValid()) {
     return;
+  }
   const wsName = getWorkspaceName();
-  if (question.id === lastRemoteQuestionId)
+  if (question.id === lastRemoteQuestionId) {
     return;
+  }
   lastRemoteQuestionId = question.id;
   pushRemoteQuestion(card.code, question.id, question.questions, wsName).catch(() => {
   });
 }
 function startRemotePolling() {
   return;
-  if (remotePollTimer)
+  if (remotePollTimer) {
     return;
+  }
   const wsName = getWorkspaceName();
   const remotePoll = async () => {
     const card = readCardState();
-    if (!card || !isCardValid())
+    if (!card || !isCardValid()) {
       return;
+    }
     try {
       const messages = await pollRemoteMessages(card.code, wsName);
       for (const msg of messages) {
         sendText(msg.content);
         resetIdleTimer();
-        if (!chatTriggered)
+        if (!chatTriggered) {
           triggerCursorChat();
+        }
       }
     } catch {
     }
     const reply = readReply();
     if (reply && reply.content) {
-      const replyKey = reply.timestamp + reply.content.slice(0, 50);
+      const replyKey = (reply.timestamp || "") + reply.content.slice(0, 50);
       if (replyKey !== lastReplyContent) {
         lastReplyContent = replyKey;
         resetIdleTimer();
@@ -1511,12 +1735,14 @@ function startRemotePolling() {
 }
 function startHeartbeat() {
   return;
-  if (heartbeatTimer)
+  if (heartbeatTimer) {
     return;
+  }
   const beat = async () => {
     const card = readCardState();
-    if (!card || !isCardValid())
+    if (!card || !isCardValid()) {
       return;
+    }
     await sendWorkspaceHeartbeat(card.code, getWorkspaceName(), getWorkspacePath());
   };
   beat();
@@ -1526,7 +1752,9 @@ function autoSetupMcp(workspaceFolders = vscode.workspace.workspaceFolders || []
   const globalChanged = setupGlobalMcpConfig(currentDataDir);
   if (workspaceFolders.length === 0) {
     if (globalChanged) {
-      vscode.window.showInformationMessage("jefr MCP installed to global config. Restart Cursor to apply.");
+      vscode.window.showInformationMessage(
+        "jefr MCP installed to global config. Restart Cursor to apply."
+      );
     }
     return;
   }
@@ -1538,23 +1766,7 @@ function autoSetupMcp(workspaceFolders = vscode.workspace.workspaceFolders || []
   }
 }
 async function triggerCursorChat() {
-  // Disabled for now: do not auto-open/focus the Cursor chat.
   return;
-  // if (chatTriggered)
-  //   return;
-  // chatTriggered = true;
-  // try {
-  //   await vscode.commands.executeCommand("workbench.action.chat.newChat");
-  //   await new Promise((r) => setTimeout(r, 500));
-  //   await vscode.commands.executeCommand("workbench.action.chat.open", {
-  //     query: "Hello, please handle my message"
-  //   });
-  // } catch {
-  //   try {
-  //     await vscode.commands.executeCommand("workbench.action.chat.open");
-  //   } catch {
-  //   }
-  // }
 }
 function setupMcpForFolders(workspaceFolders) {
   let changedCount = 0;
@@ -1588,43 +1800,52 @@ var MessengerViewProvider = class {
           this.pushCurrentState();
           this.pushCardState();
           mainPanel?.webview.postMessage({ type: "version", version: extensionVersion });
-          mainPanel?.webview.postMessage({ type: "injectedTokenState", injected: !!readInjectedToken() });
+          mainPanel?.webview.postMessage({
+            type: "injectedTokenState",
+            injected: !!readInjectedToken()
+          });
           this.pushQueueData();
           break;
         case "sendText":
-          if (!this.checkCard())
+          if (!this.checkCard()) {
             return;
+          }
           sendText(msg.text);
           resetIdleTimer();
           triggerCursorChat();
           break;
         case "pickAttachment":
-          if (!this.checkCard())
+          if (!this.checkCard()) {
             return;
+          }
           this.handlePickAttachment();
           break;
         case "sendImage":
-          if (!this.checkCard())
+          if (!this.checkCard()) {
             return;
+          }
           this.handleSendImage(msg.caption);
           resetIdleTimer();
           break;
         case "sendPastedImage":
-          if (!this.checkCard())
+          if (!this.checkCard()) {
             return;
+          }
           this.handlePastedImage(msg.dataUrl, msg.caption);
           resetIdleTimer();
           triggerCursorChat();
           break;
         case "sendFile":
-          if (!this.checkCard())
+          if (!this.checkCard()) {
             return;
+          }
           this.handleSendFile();
           resetIdleTimer();
           break;
         case "resendFile":
-          if (!this.checkCard())
+          if (!this.checkCard()) {
             return;
+          }
           if (msg.path) {
             sendFile(msg.path);
             resetIdleTimer();
@@ -1693,19 +1914,24 @@ var MessengerViewProvider = class {
   }
   handlePastedImage(dataUrl, caption) {
     try {
-      const match = dataUrl.match(
-        /^data:image\/(\w+);base64,(.+)$/
-      );
-      if (!match)
+      const match = dataUrl.match(/^data:image\/(\w+);base64,(.+)$/);
+      if (!match) {
         return;
+      }
       const ext = match[1] === "jpeg" ? "jpg" : match[1];
       const buf = Buffer.from(match[2], "base64");
-      const tmpPath = path2.join(
-        os2.tmpdir(),
-        "mcp_" + Date.now() + "." + ext
-      );
-      fs2.writeFileSync(tmpPath, buf);
-      sendImage(tmpPath, caption);
+      const tmpPath = path3.join(os3.tmpdir(), "mcp_" + Date.now() + "." + ext);
+      fs3.writeFileSync(tmpPath, buf);
+      const item = sendImage(tmpPath, caption);
+      appendSharedHistory({
+        id: item.id,
+        kind: "image",
+        dataUrl,
+        caption,
+        name: path3.basename(tmpPath),
+        path: tmpPath,
+        timestamp: item.timestamp
+      });
     } catch {
     }
   }
@@ -1722,36 +1948,25 @@ var MessengerViewProvider = class {
       return;
     }
     for (const uri of uris) {
-      const name = path.basename(uri.fsPath);
+      const name = path3.basename(uri.fsPath);
       const isImage = /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(uri.fsPath);
       if (isImage) {
         let dataUrl = void 0;
         try {
-          const buf = fs.readFileSync(uri.fsPath);
-          const ext2 = path.extname(uri.fsPath).slice(1).toLowerCase() || "png";
-          const mime = ext2 === "svg" ? "svg+xml" : ext2 === "jpg" ? "jpeg" : ext2;
+          const buf = fs3.readFileSync(uri.fsPath);
+          const ext = path3.extname(uri.fsPath).slice(1).toLowerCase() || "png";
+          const mime = ext === "svg" ? "svg+xml" : ext === "jpg" ? "jpeg" : ext;
           dataUrl = `data:image/${mime};base64,${buf.toString("base64")}`;
         } catch {
         }
         mainPanel?.webview.postMessage({
           type: "attachmentAdded",
-          item: {
-            id: makeId(),
-            type: "image",
-            path: uri.fsPath,
-            name,
-            dataUrl
-          }
+          item: { id: makeId(), type: "image", path: uri.fsPath, name, dataUrl }
         });
       } else {
         mainPanel?.webview.postMessage({
           type: "attachmentAdded",
-          item: {
-            id: makeId(),
-            type: "file",
-            path: uri.fsPath,
-            name
-          }
+          item: { id: makeId(), type: "file", path: uri.fsPath, name }
         });
       }
     }
@@ -1759,31 +1974,25 @@ var MessengerViewProvider = class {
   async handleSendImage(caption) {
     const uris = await vscode.window.showOpenDialog({
       canSelectMany: false,
-      filters: {
-        Images: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"]
-      }
+      filters: { Images: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"] }
     });
     if (uris?.[0]) {
       sendImage(uris[0].fsPath, caption);
     }
   }
   async handleSendFile() {
-    const uris = await vscode.window.showOpenDialog({
-      canSelectMany: false
-    });
+    const uris = await vscode.window.showOpenDialog({ canSelectMany: false });
     if (uris?.[0]) {
       sendFile(uris[0].fsPath);
     }
   }
   pushCurrentState() {
-    if (!mainPanel)
+    if (!mainPanel) {
       return;
+    }
     const question = readQuestion();
     if (question) {
-      mainPanel.webview.postMessage({
-        type: "showQuestion",
-        data: question
-      });
+      mainPanel.webview.postMessage({ type: "showQuestion", data: question });
       lastQuestionId = question.id;
     } else {
       mainPanel.webview.postMessage({ type: "clearQuestion" });
@@ -1791,70 +2000,81 @@ var MessengerViewProvider = class {
     }
     const reply = readReply();
     if (reply) {
-      mainPanel.webview.postMessage({
-        type: "showReply",
-        data: reply
-      });
+      mainPanel.webview.postMessage({ type: "showReply", data: reply });
       lastReplyTimestamp = reply.timestamp;
     } else {
       lastReplyTimestamp = void 0;
     }
     const count = getQueueCount();
-    mainPanel.webview.postMessage({
-      type: "queueCount",
-      count
-    });
+    mainPanel.webview.postMessage({ type: "queueCount", count });
     lastQueueCount = count;
   }
   checkCard() {
     return true;
   }
   pushQueueData() {
-    if (!mainPanel)
+    if (!mainPanel) {
       return;
+    }
     mainPanel.webview.postMessage({ type: "queueData", data: readQueue() });
   }
   pushCardState() {
-    if (!mainPanel)
+    if (!mainPanel) {
       return;
+    }
     mainPanel.webview.postMessage({ type: "cardState", data: { active: true } });
   }
   async handleActivateCard(code) {
-    if (!mainPanel || !code)
+    if (!mainPanel || !code) {
       return;
+    }
     try {
       const result = await activateCard(code);
       if (result.success) {
         mainPanel.webview.postMessage({ type: "cardActivated", data: result.data });
-        vscode.window.showInformationMessage(`License activated successfully. Valid for ${result.data.duration_hours} hours`);
+        vscode.window.showInformationMessage(
+          `License activated successfully. Valid for ${result.data?.duration_hours} hours`
+        );
       } else {
-        mainPanel.webview.postMessage({ type: "cardError", error: result.error || "Activation failed" });
+        mainPanel.webview.postMessage({
+          type: "cardError",
+          error: result.error || "Activation failed"
+        });
       }
     } catch (e) {
-      mainPanel.webview.postMessage({ type: "cardError", error: e.message || "Network error" });
+      mainPanel.webview.postMessage({
+        type: "cardError",
+        error: e.message || "Network error"
+      });
     }
   }
   async handleFetchUsage() {
-    if (!mainPanel)
+    if (!mainPanel) {
       return;
+    }
     mainPanel.webview.postMessage({ type: "usageLoading" });
     try {
       const result = await fetchCursorUsage();
       mainPanel.webview.postMessage({ type: "usageData", data: result });
     } catch (e) {
-      mainPanel.webview.postMessage({ type: "usageData", data: { success: false, error: e.message || "Query failed" } });
+      mainPanel.webview.postMessage({
+        type: "usageData",
+        data: { success: false, error: e.message || "Query failed" }
+      });
     }
   }
   async handleInjectToken(token) {
-    if (!mainPanel || !token)
+    if (!mainPanel || !token) {
       return;
+    }
     writeInjectedToken(token.trim());
     mainPanel.webview.postMessage({ type: "injectedTokenState", injected: true });
     this.handleFetchUsage();
   }
   handleClearInjectedToken() {
-    if (!mainPanel)
+    if (!mainPanel) {
       return;
+    }
     clearInjectedToken();
     mainPanel.webview.postMessage({ type: "injectedTokenState", injected: false });
     this.handleFetchUsage();
@@ -1869,7 +2089,7 @@ var MessengerViewProvider = class {
       if (REMOTE_API_ENABLED) {
         const card = readCardState();
         if (card && isCardValid() && reply.content) {
-          const replyKey = reply.timestamp + reply.content.slice(0, 50);
+          const replyKey = (reply.timestamp || "") + reply.content.slice(0, 50);
           if (replyKey !== lastReplyContent) {
             lastReplyContent = replyKey;
             try {
