@@ -1669,7 +1669,12 @@ function runWorkflow(opts) {
     return;
   }
   const args = [script];
-  if (opts.autoPrompt && opts.autoPrompt.trim()) {
+  if (opts.reconnect) {
+    args.push("--reconnect");
+    if (typeof opts.tile === "number" && Number.isInteger(opts.tile)) {
+      args.push("--tile", String(opts.tile));
+    }
+  } else if (opts.autoPrompt && opts.autoPrompt.trim()) {
     args.push(opts.autoPrompt);
   }
   if (opts.opusPrompt && opts.opusPrompt.trim()) {
@@ -2201,6 +2206,15 @@ var MessengerViewProvider = class {
         case "runWorkflow":
           runWorkflow({
             autoPrompt: msg.autoPrompt,
+            opusPrompt: msg.opusPrompt,
+            maxSecs: msg.maxSecs,
+            enterInterval: msg.enterInterval
+          });
+          break;
+        case "reconnectWorkflow":
+          runWorkflow({
+            reconnect: true,
+            tile: typeof msg.tile === "number" && Number.isInteger(msg.tile) ? msg.tile : void 0,
             opusPrompt: msg.opusPrompt,
             maxSecs: msg.maxSecs,
             enterInterval: msg.enterInterval

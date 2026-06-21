@@ -36,6 +36,7 @@ export function GeneralTab(props: {
   const [autoPrompt, setAutoPrompt] = useState("");
   const [opusPrompt, setOpusPrompt] = useState("");
   const [maxSecs, setMaxSecs] = useState("");
+  const [tile, setTile] = useState("");
   const outRef = useRef<HTMLPreElement | null>(null);
 
   // Keep the log scrolled to the newest line.
@@ -50,6 +51,19 @@ export function GeneralTab(props: {
     post({
       type: "runWorkflow",
       autoPrompt: autoPrompt.trim() || undefined,
+      opusPrompt: opusPrompt.trim() || undefined,
+      maxSecs:
+        maxSecsNum != null && isFinite(maxSecsNum) ? maxSecsNum : undefined,
+    });
+  };
+
+  const reconnectWorkflow = () => {
+    const maxSecsNum = maxSecs.trim() ? Number(maxSecs.trim()) : undefined;
+    const tileNum = tile.trim() ? Number(tile.trim()) : undefined;
+    post({
+      type: "reconnectWorkflow",
+      tile:
+        tileNum != null && Number.isInteger(tileNum) ? tileNum : undefined,
       opusPrompt: opusPrompt.trim() || undefined,
       maxSecs:
         maxSecsNum != null && isFinite(maxSecsNum) ? maxSecsNum : undefined,
@@ -74,8 +88,10 @@ export function GeneralTab(props: {
         <p className="workflow-desc">
           Spawns a fresh Cursor agent tile over CDP, sends a stand-by prompt,
           switches to Opus, types the invoke-mcp prompt, then holds Enter past
-          “Planning next moves”. Requires Cursor launched with{" "}
-          <code>--remote-debugging-port=9222</code>.
+          “Planning next moves”. <strong>Reconnect</strong> instead re-primes a
+          dropped (“Worked”) tile in place — auto-detecting it, or use the tile
+          index — to rebuild the MCP loop on that same tile. Requires Cursor
+          launched with <code>--remote-debugging-port=9222</code>.
         </p>
 
         <textarea
@@ -105,6 +121,16 @@ export function GeneralTab(props: {
             disabled={workflowRunning}
             onChange={(e) => setMaxSecs(e.target.value)}
           />
+          <input
+            className="card-input workflow-secs"
+            type="number"
+            min={0}
+            placeholder="Tile # (auto)"
+            value={tile}
+            disabled={workflowRunning}
+            onChange={(e) => setTile(e.target.value)}
+            title="Tile index to reconnect (leave blank to auto-detect the dropped tile)"
+          />
           {workflowRunning ? (
             <button
               className="btn btn-danger btn-small"
@@ -113,9 +139,21 @@ export function GeneralTab(props: {
               Stop
             </button>
           ) : (
-            <button className="btn btn-primary btn-small" onClick={runWorkflow}>
-              Run workflow
-            </button>
+            <>
+              <button
+                className="btn btn-primary btn-small"
+                onClick={runWorkflow}
+              >
+                Run workflow
+              </button>
+              <button
+                className="btn btn-secondary btn-small"
+                onClick={reconnectWorkflow}
+                title="Re-prime a dropped tile in place to rebuild the MCP loop"
+              >
+                Reconnect
+              </button>
+            </>
           )}
         </div>
 

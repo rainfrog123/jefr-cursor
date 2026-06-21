@@ -128,6 +128,10 @@ interface WorkflowOptions {
   maxSecs?: number;
   enterInterval?: number;
   scriptPath?: string;
+  /** Reconnect mode: re-prime a dropped ("worked") tile in place. */
+  reconnect?: boolean;
+  /** Target tile index for reconnect (omit to auto-detect the dropped tile). */
+  tile?: number;
 }
 
 /** Spawn the CDP workflow and stream its output back to the webview. */
@@ -164,7 +168,12 @@ function runWorkflow(opts: WorkflowOptions): void {
   }
 
   const args: string[] = [script];
-  if (opts.autoPrompt && opts.autoPrompt.trim()) {
+  if (opts.reconnect) {
+    args.push("--reconnect");
+    if (typeof opts.tile === "number" && Number.isInteger(opts.tile)) {
+      args.push("--tile", String(opts.tile));
+    }
+  } else if (opts.autoPrompt && opts.autoPrompt.trim()) {
     args.push(opts.autoPrompt);
   }
   if (opts.opusPrompt && opts.opusPrompt.trim()) {
@@ -780,6 +789,18 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
         case "runWorkflow":
           runWorkflow({
             autoPrompt: msg.autoPrompt,
+            opusPrompt: msg.opusPrompt,
+            maxSecs: msg.maxSecs,
+            enterInterval: msg.enterInterval,
+          });
+          break;
+        case "reconnectWorkflow":
+          runWorkflow({
+            reconnect: true,
+            tile:
+              typeof msg.tile === "number" && Number.isInteger(msg.tile)
+                ? msg.tile
+                : undefined,
             opusPrompt: msg.opusPrompt,
             maxSecs: msg.maxSecs,
             enterInterval: msg.enterInterval,
