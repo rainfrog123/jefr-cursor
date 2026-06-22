@@ -88,6 +88,23 @@ export interface Attachment {
   dataUrl?: string;
 }
 
+/** An agent in the manager roster (connected or recently dropped). */
+export interface LiveAgentInfo {
+  /** The agent's stable id (its Cursor agentId / chat UUID). */
+  id: string;
+  /** Fresh heartbeat within the stale window. */
+  connected: boolean;
+  state: "waiting" | "working" | "idle";
+  /** Pending messages currently queued for this agent. */
+  queueCount: number;
+  /** Times it came online (first connect + each reconnect). */
+  connectCount: number;
+  /** Times the extension triggered a reconnect for it. */
+  reconnectCount: number;
+  /** Epoch ms the current connection began (0 when disconnected). */
+  connectedSince: number;
+}
+
 /** Cursor usage info returned by `fetchUsage`. */
 export interface UsageData {
   success: boolean;
@@ -123,7 +140,14 @@ export type InboundMessage =
   | { type: "serverInfo"; data: { port: number; clients: number } }
   | { type: "workflowState"; running: boolean }
   | { type: "workflowOutput"; stream: "stdout" | "stderr"; line: string }
-  | { type: "workflowExit"; code: number | null };
+  | { type: "workflowExit"; code: number | null }
+  | {
+      type: "agentList";
+      agents: LiveAgentInfo[];
+      selected: string | null;
+      autoReconnect: boolean;
+    }
+  | { type: "agentSelected"; agentId: string | null };
 
 /* ------------------------------------------------------------------ */
 /* Messages: webview -> extension host                                 */
@@ -159,4 +183,7 @@ export type OutboundMessage =
       enterInterval?: number;
     }
   | { type: "stopWorkflow" }
-  | { type: "getWorkflowState" };
+  | { type: "getWorkflowState" }
+  | { type: "selectAgent"; agentId?: string }
+  | { type: "setAutoReconnect"; enabled: boolean }
+  | { type: "reconnectAgent"; agentId: string };

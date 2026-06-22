@@ -495,6 +495,336 @@ export function clearReply(): void {
   }
 }
 
+// ── Multi-agent: per-agent partitioned state ────────────────────────────────
+// A single MCP server process serves every agent tile in the window, so to
+// address one agent we namespace its state under <dataDir>/agents/<agentId>/.
+// These helpers mirror the root-scoped functions above but operate on a chosen
+// agent's directory (a blank id falls back to the shared root, i.e. legacy).
+
+const AGENTS_SUBDIR = "agents";
+
+function sanitizeAgentId(agentId?: string): string {
+  if (!agentId || typeof agentId !== "string") {
+    return "";
+  }
+  return agentId.trim().replace(/[^A-Za-z0-9._-]/g, "").slice(0, 64);
+}
+
+/** Directory holding a given agent's files (or the shared root when blank). */
+export function agentDirFor(agentId?: string): string {
+  const id = sanitizeAgentId(agentId);
+  return id ? path.join(dataDir, AGENTS_SUBDIR, id) : dataDir;
+}
+
+function ensureDirAt(dir: string): void {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+function acquireLockIn(lockDir: string, timeoutMs = 2000): boolean {
+  const start = Date.now();
+  for (;;) {
+    try {
+      fs.mkdirSync(lockDir);
+      return true;
+    } catch {
+      try {
+        const st = fs.statSync(lockDir);
+        if (Date.now() - st.mtimeMs > 5000) {
+          try {
+            fs.rmdirSync(lockDir);
+          } catch {
+            // reclaimed elsewhere
+          }
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() - start > timeoutMs) {
+        return false;
+      }
+      sleepSync(8);
+    }
+  }
+}
+
+function withLockIn<T>(dir: string, fn: () => T): T {
+  ensureDirAt(dir);
+  const lockDir = path.join(dir, "queue.lock");
+  const locked = acquireLockIn(lockDir);
+  try {
+    return fn();
+  } finally {
+    if (locked) {
+      try {
+        fs.rmdirSync(lockDir);
+      } catch {
+        // already released
+      }
+    }
+  }
+}
+
+function readJsonArrayAt(file: string): QueueItem[] {
+  if (!fs.existsSync(file)) {
+    return [];
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+export function readQueueFor(agentId?: string): QueueItem[] {
+  const dir = agentDirFor(agentId);
+  ensureDirAt(dir);
+  return readJsonArrayAt(path.join(dir, "queue.json"));
+}
+
+function writeQueueFor(items: QueueItem[], agentId?: string): void {
+  const dir = agentDirFor(agentId);
+  ensureDirAt(dir);
+  robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(items, null, 2));
+}
+
+export function getQueueCountFor(agentId?: string): number {
+  return readQueueFor(agentId).length;
+}
+
+/** Queue a text send to a specific agent (or the shared root). Mirrored into
+ *  the shared history so the panel still renders the bubble. */
+export function sendTextTo(agentId: string | undefined, text: string): QueueItem {
+  const item: QueueItem = {
+    id: makeId(),
+    type: "text",
+    content: text,
+    timestamp: new Date().toISOString(),
+  };
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => {
+    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    queue.push(item);
+    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+  });
+  appendSharedHistory({ id: item.id, kind: "text", text, timestamp: item.timestamp });
+  return item;
+}
+
+export function sendImageTo(
+  agentId: string | undefined,
+  filePath: string,
+  caption?: string
+): QueueItem {
+  const item: QueueItem = {
+    id: makeId(),
+    type: "image",
+    path: filePath,
+    caption,
+    timestamp: new Date().toISOString(),
+  };
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => {
+    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    queue.push(item);
+    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+  });
+  return item;
+}
+
+export function sendFileTo(agentId: string | undefined, filePath: string): void {
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => {
+    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    queue.push({
+      id: makeId(),
+      type: "file",
+      path: filePath,
+      timestamp: new Date().toISOString(),
+    });
+    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+  });
+}
+
+export function deleteQueueItemFor(id: string, agentId?: string): void {
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => {
+    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    robustWriteFile(
+      path.join(dir, "queue.json"),
+      JSON.stringify(queue.filter((it) => it.id !== id), null, 2)
+    );
+  });
+}
+
+export function clearQueueFor(agentId?: string): void {
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => writeQueueFor([], agentId));
+}
+
+export function updateQueueItemFor(
+  id: string,
+  updates: { content?: string },
+  agentId?: string
+): void {
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => {
+    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    const idx = queue.findIndex((it) => it.id === id);
+    if (idx === -1) {
+      return;
+    }
+    if (updates.content !== undefined && queue[idx].type === "text") {
+      queue[idx].content = updates.content;
+    }
+    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+  });
+}
+
+export function readReplyFor(agentId?: string): ReplyPayload | null {
+  const file = path.join(agentDirFor(agentId), "reply.json");
+  if (!fs.existsSync(file)) {
+    return null;
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    return data && data.content ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearReplyFor(agentId?: string): void {
+  try {
+    fs.unlinkSync(path.join(agentDirFor(agentId), "reply.json"));
+  } catch {
+    // ignore
+  }
+}
+
+export function readQuestionFor(agentId?: string): QuestionPayload | null {
+  const file = path.join(agentDirFor(agentId), "question.json");
+  if (!fs.existsSync(file)) {
+    return null;
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    return data && data.id && data.questions ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeAnswerFor(answer: AnswerPayload, agentId?: string): void {
+  const dir = agentDirFor(agentId);
+  ensureDirAt(dir);
+  fs.writeFileSync(path.join(dir, "answer.json"), JSON.stringify(answer, null, 2), "utf-8");
+}
+
+export function cancelQuestionFor(agentId?: string): void {
+  const q = readQuestionFor(agentId);
+  if (!q) {
+    return;
+  }
+  const answers: AnswerItem[] = q.questions.map((qi, i) => ({
+    questionId: qi.id,
+    selected: [],
+    other: i === 0 ? "User cancelled the answer" : "",
+  }));
+  writeAnswerFor({ id: q.id, answers }, agentId);
+}
+
+export interface LiveAgent {
+  id: string;
+  state: AgentLivenessState;
+  ts: number;
+  queueCount: number;
+}
+
+/** Scan <dataDir>/agents/* for agents whose heartbeat is fresh. This is how the
+ *  panel discovers which agents are currently looping and addressable. */
+export function listLiveAgents(maxAgeMs = AGENT_STALE_MS): LiveAgent[] {
+  const root = path.join(dataDir, AGENTS_SUBDIR);
+  let ids: string[] = [];
+  try {
+    ids = fs.readdirSync(root);
+  } catch {
+    return [];
+  }
+  const out: LiveAgent[] = [];
+  for (const id of ids) {
+    const beat = path.join(root, id, "agent-alive.json");
+    try {
+      const data = JSON.parse(fs.readFileSync(beat, "utf-8"));
+      const ts = typeof data.ts === "number" ? data.ts : 0;
+      if (Date.now() - ts > maxAgeMs) {
+        continue;
+      }
+      const state: AgentLivenessState = data.state === "working" ? "working" : "waiting";
+      out.push({ id, state, ts, queueCount: getQueueCountFor(id) });
+    } catch {
+      // skip unreadable/partial heartbeat
+    }
+  }
+  out.sort((a, b) => b.ts - a.ts);
+  return out;
+}
+
+export interface AgentRosterEntry {
+  id: string;
+  /** Fresh heartbeat within the stale window. */
+  connected: boolean;
+  state: AgentLivenessState;
+  ts: number;
+  queueCount: number;
+}
+
+/** Scan every agents/<id>/ directory — including ones whose heartbeat has gone
+ *  stale (dropped) — so the manager can show connected AND disconnected agents
+ *  and drive auto-reconnect. */
+export function scanAllAgents(maxAgeMs = AGENT_STALE_MS): AgentRosterEntry[] {
+  const root = path.join(dataDir, AGENTS_SUBDIR);
+  let ids: string[] = [];
+  try {
+    ids = fs.readdirSync(root);
+  } catch {
+    return [];
+  }
+  const out: AgentRosterEntry[] = [];
+  for (const id of ids) {
+    const dir = path.join(root, id);
+    try {
+      if (!fs.statSync(dir).isDirectory()) {
+        continue;
+      }
+    } catch {
+      continue;
+    }
+    let ts = 0;
+    let beatState: AgentLivenessState = "idle";
+    try {
+      const data = JSON.parse(fs.readFileSync(path.join(dir, "agent-alive.json"), "utf-8"));
+      ts = typeof data.ts === "number" ? data.ts : 0;
+      beatState = data.state === "working" ? "working" : "waiting";
+    } catch {
+      // no/partial heartbeat — treat as disconnected
+    }
+    const connected = ts > 0 && Date.now() - ts <= maxAgeMs;
+    out.push({
+      id,
+      connected,
+      state: connected ? beatState : "idle",
+      ts,
+      queueCount: getQueueCountFor(id),
+    });
+  }
+  out.sort((a, b) => b.ts - a.ts);
+  return out;
+}
+
 // ── License card state (local build: always valid) ──────────────────────────
 
 export function readCardState(): CardState | null {

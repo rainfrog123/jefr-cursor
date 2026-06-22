@@ -30962,25 +30962,47 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 var DATA_DIR = process.env.MESSENGER_DATA_DIR || path.join(os.homedir(), ".moyu-message");
-var QUEUE_FILE = path.join(DATA_DIR, "queue.json");
-var QUESTION_FILE = path.join(DATA_DIR, "question.json");
-var ANSWER_FILE = path.join(DATA_DIR, "answer.json");
-var REPLY_FILE = path.join(DATA_DIR, "reply.json");
-var HEARTBEAT_FILE = path.join(DATA_DIR, "agent-alive.json");
-var QUEUE_LOCK_DIR = path.join(DATA_DIR, "queue.lock");
+var AGENTS_ROOT = path.join(DATA_DIR, "agents");
 var LOG_FILE = path.join(DATA_DIR, "server.log");
+function dirFor(agentId) {
+  const id = sanitizeAgentId(agentId);
+  return id ? path.join(AGENTS_ROOT, id) : DATA_DIR;
+}
+function sanitizeAgentId(agentId) {
+  if (!agentId || typeof agentId !== "string")
+    return "";
+  const clean = agentId.trim().replace(/[^A-Za-z0-9._-]/g, "");
+  return clean.slice(0, 64);
+}
+var queueFile = (dir) => path.join(dir, "queue.json");
+var questionFile = (dir) => path.join(dir, "question.json");
+var answerFile = (dir) => path.join(dir, "answer.json");
+var replyFile = (dir) => path.join(dir, "reply.json");
+var heartbeatFile = (dir) => path.join(dir, "agent-alive.json");
+var queueLockDir = (dir) => path.join(dir, "queue.lock");
 var POLL_INTERVAL = 100;
+var AGENT_BEAT_INTERVAL = 2500;
 var HEARTBEAT_INTERVAL = Number(process.env.MESSENGER_HEARTBEAT_INTERVAL_MS) || 8e3;
 var MAX_WAIT_MS = Number(process.env.MESSENGER_MAX_WAIT_MS) || 12e4;
-var SYSTEM_SUFFIX = "\n\n---\n[system] The message above was sent by the user via the plugin. After replying, call the jefr MCP check_messages tool to keep listening for new messages.";
-async function ensureDataDir() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+function systemSuffix(agentId) {
+  const id = sanitizeAgentId(agentId);
+  const idNote = id ? ` You are jefr agent ${id}; pass agent_id:'${id}' to every jefr tool call (check_messages / send_progress / ask_question).` : "";
+  return "\n\n---\n[system] The message above was sent by the user via the plugin. After replying, call the jefr MCP check_messages tool to keep listening for new messages." + idNote;
 }
-async function touchAgentAlive(state) {
+async function ensureDir(dir) {
+  await fs.mkdir(dir, { recursive: true });
+}
+async function touchAgentAlive(dir, state, agentId) {
   try {
+    await ensureDir(dir);
     await fs.writeFile(
-      HEARTBEAT_FILE,
-      JSON.stringify({ ts: Date.now(), pid: process.pid, state }),
+      heartbeatFile(dir),
+      JSON.stringify({
+        ts: Date.now(),
+        pid: process.pid,
+        state,
+        agentId: sanitizeAgentId(agentId) || void 0
+      }),
       "utf-8"
     );
   } catch {
@@ -30991,15 +31013,15 @@ var lastInteractionTs = Date.now();
 var BUSY_WINDOW_MS = Number(process.env.MESSENGER_BUSY_WINDOW_MS) || 18e4;
 var livenessTicker = setInterval(() => {
   if (activeWaits > 0) {
-    void touchAgentAlive("waiting");
+    void touchAgentAlive(DATA_DIR, "waiting");
   } else if (Date.now() - lastInteractionTs < BUSY_WINDOW_MS) {
-    void touchAgentAlive("working");
+    void touchAgentAlive(DATA_DIR, "working");
   }
 }, 2500);
 livenessTicker.unref?.();
-async function readQueue() {
+async function readQueue(dir) {
   try {
-    const raw = await fs.readFile(QUEUE_FILE, "utf-8");
+    const raw = await fs.readFile(queueFile(dir), "utf-8");
     const data = JSON.parse(raw);
     return Array.isArray(data) ? data : [];
   } catch {
@@ -31007,17 +31029,18 @@ async function readQueue() {
   }
 }
 var delay = (ms) => new Promise((r) => setTimeout(r, ms));
-async function acquireQueueLock(timeoutMs = 2e3) {
+async function acquireQueueLock(dir, timeoutMs = 2e3) {
+  const lock = queueLockDir(dir);
   const start = Date.now();
   for (; ; ) {
     try {
-      await fs.mkdir(QUEUE_LOCK_DIR);
+      await fs.mkdir(lock, { recursive: true });
       return true;
     } catch {
       try {
-        const st = await fs.stat(QUEUE_LOCK_DIR);
+        const st = await fs.stat(lock);
         if (Date.now() - st.mtimeMs > 5e3) {
-          await fs.rmdir(QUEUE_LOCK_DIR).catch(() => {
+          await fs.rmdir(lock).catch(() => {
           });
           continue;
         }
@@ -31031,8 +31054,8 @@ async function acquireQueueLock(timeoutMs = 2e3) {
     }
   }
 }
-async function releaseQueueLock() {
-  await fs.rmdir(QUEUE_LOCK_DIR).catch(() => {
+async function releaseQueueLock(dir) {
+  await fs.rmdir(queueLockDir(dir)).catch(() => {
   });
 }
 async function robustWriteFile(file2, data) {
@@ -31054,21 +31077,21 @@ async function robustWriteFile(file2, data) {
     throw lastErr;
   }
 }
-async function drainQueue() {
-  const peek = await readQueue();
+async function drainQueue(dir) {
+  const peek = await readQueue(dir);
   if (peek.length === 0) {
     return [];
   }
-  const locked = await acquireQueueLock();
+  const locked = await acquireQueueLock(dir);
   try {
-    const queue = await readQueue();
+    const queue = await readQueue(dir);
     if (queue.length > 0) {
-      await robustWriteFile(QUEUE_FILE, "[]");
+      await robustWriteFile(queueFile(dir), "[]");
     }
     return queue;
   } finally {
     if (locked) {
-      await releaseQueueLock();
+      await releaseQueueLock(dir);
     }
   }
 }
@@ -31193,12 +31216,12 @@ async function processMessage(msg) {
   }
 }
 var server = new McpServer(
-  { name: "jefr", version: "1.0.0" },
+  { name: "jefr", version: "1.1.0" },
   { capabilities: { logging: {} } }
 );
 async function appendServerLog(level, message) {
   try {
-    await ensureDataDir();
+    await ensureDir(DATA_DIR);
     await fs.appendFile(
       LOG_FILE,
       `[${(/* @__PURE__ */ new Date()).toISOString()}] [${level}] ${message}
@@ -31241,31 +31264,43 @@ process.on("uncaughtException", (error51) => {
 process.on("unhandledRejection", (reason) => {
   void appendServerLog("error", `unhandledRejection: ${formatError2(reason)}`);
 });
+var AGENT_ID_ARG = {
+  agent_id: external_exports.string().optional().describe(
+    "This agent's stable id (its Cursor agentId / chat UUID). Pass it on every call so the panel can route messages to THIS agent only. Omit for the shared single-listener queue."
+  )
+};
 server.tool(
   "check_messages",
-  "Check and return pending user messages. You must call this tool after every reply. Optionally pass reply to push a summary to the plugin panel.",
+  "Check and return pending user messages. You must call this tool after every reply. Optionally pass reply to push a summary to the plugin panel, and agent_id to scope to this agent.",
   {
     reply: external_exports.string().optional().describe(
       "Summary of this reply (Markdown supported), pushed to the plugin panel for the user"
-    )
+    ),
+    ...AGENT_ID_ARG
   },
-  async ({ reply }, extra) => {
-    await ensureDataDir();
-    await appendServerLog("info", "check_messages started");
+  async ({ reply, agent_id }, extra) => {
+    const dir = dirFor(agent_id);
+    await ensureDir(dir);
+    await appendServerLog("info", `check_messages started${agent_id ? ` (agent ${sanitizeAgentId(agent_id)})` : ""}`);
     if (reply) {
       await fs.writeFile(
-        REPLY_FILE,
+        replyFile(dir),
         JSON.stringify({ content: reply, timestamp: (/* @__PURE__ */ new Date()).toISOString() }, null, 2),
         "utf-8"
       );
     }
     activeWaits++;
-    await touchAgentAlive("waiting");
+    await touchAgentAlive(dir, "waiting", agent_id);
     try {
       const waitStart = Date.now();
       let nextHeartbeatAt = Date.now() + HEARTBEAT_INTERVAL;
+      let nextAgentBeatAt = Date.now() + AGENT_BEAT_INTERVAL;
       while (!extra.signal.aborted) {
-        const queue = await drainQueue();
+        if (Date.now() >= nextAgentBeatAt) {
+          await touchAgentAlive(dir, "waiting", agent_id);
+          nextAgentBeatAt = Date.now() + AGENT_BEAT_INTERVAL;
+        }
+        const queue = await drainQueue(dir);
         if (queue.length > 0) {
           const results = [];
           for (const msg of queue) {
@@ -31275,11 +31310,12 @@ server.tool(
             else
               results.push(processed);
           }
+          const suffix = systemSuffix(agent_id);
           const last = results[results.length - 1];
           if (results.length > 0 && last.type === "text") {
-            last.text += SYSTEM_SUFFIX;
+            last.text += suffix;
           } else {
-            results.push({ type: "text", text: SYSTEM_SUFFIX });
+            results.push({ type: "text", text: suffix });
           }
           await appendServerLog("info", `check_messages delivered ${queue.length} queued item(s)`);
           lastInteractionTs = Date.now();
@@ -31298,6 +31334,7 @@ server.tool(
         }
         if (Date.now() >= nextHeartbeatAt) {
           await emitHeartbeat(extra, "jefr is still waiting for the next user message.");
+          await touchAgentAlive(dir, "waiting", agent_id);
           nextHeartbeatAt = Date.now() + HEARTBEAT_INTERVAL;
         }
         const keepWaiting = await sleepWithAbort(extra.signal, POLL_INTERVAL);
@@ -31322,22 +31359,24 @@ server.tool(
 );
 server.tool(
   "send_progress",
-  "Push current work progress to the remote console. During multi-step tasks, call this tool after each step. Optionally pass percent (0-100) to drive a progress bar in the panel. Returns immediately without waiting for messages.",
+  "Push current work progress to the remote console. During multi-step tasks, call this tool after each step. Optionally pass percent (0-100) and agent_id. Returns immediately without waiting for messages.",
   {
     progress: external_exports.string().describe("Progress summary (Markdown supported), pushed to the plugin panel and remote console"),
-    percent: external_exports.number().min(0).max(100).optional().describe("Completion percentage (0-100) for the panel's progress bar, e.g. completed steps / total steps")
+    percent: external_exports.number().min(0).max(100).optional().describe("Completion percentage (0-100) for the panel's progress bar, e.g. completed steps / total steps"),
+    ...AGENT_ID_ARG
   },
-  async ({ progress, percent }) => {
-    await ensureDataDir();
+  async ({ progress, percent, agent_id }) => {
+    const dir = dirFor(agent_id);
+    await ensureDir(dir);
     lastInteractionTs = Date.now();
-    await touchAgentAlive("working");
+    await touchAgentAlive(dir, "working", agent_id);
     const payload = {
       content: progress,
       timestamp: (/* @__PURE__ */ new Date()).toISOString()
     };
     if (typeof percent === "number")
       payload.percent = Math.max(0, Math.min(100, Math.round(percent)));
-    await fs.writeFile(REPLY_FILE, JSON.stringify(payload, null, 2), "utf-8");
+    await fs.writeFile(replyFile(dir), JSON.stringify(payload, null, 2), "utf-8");
     await appendServerLog(
       "info",
       `send_progress${typeof percent === "number" ? ` (${payload.percent}%)` : ""}: ${progress.slice(0, 100)}`
@@ -31351,7 +31390,7 @@ server.tool(
 );
 server.tool(
   "ask_question",
-  "Ask the user one or more questions and wait for answers. Supports single/multi-select and custom input. Blocks until the user responds.",
+  "Ask the user one or more questions and wait for answers. Supports single/multi-select and custom input. Optionally pass agent_id to scope to this agent. Blocks until the user responds.",
   {
     questions: external_exports.array(
       external_exports.object({
@@ -31364,11 +31403,13 @@ server.tool(
         ).describe("Options"),
         allow_multiple: external_exports.boolean().default(false).describe("Allow multiple selections")
       })
-    ).describe("List of questions; multiple questions can be asked at once")
+    ).describe("List of questions; multiple questions can be asked at once"),
+    ...AGENT_ID_ARG
   },
-  async ({ questions }, extra) => {
-    await ensureDataDir();
-    await appendServerLog("info", "ask_question started");
+  async ({ questions, agent_id }, extra) => {
+    const dir = dirFor(agent_id);
+    await ensureDir(dir);
+    await appendServerLog("info", `ask_question started${agent_id ? ` (agent ${sanitizeAgentId(agent_id)})` : ""}`);
     const questionItems = questions.map((q, i) => ({
       id: "q" + i,
       question: q.question,
@@ -31380,26 +31421,31 @@ server.tool(
       questions: questionItems,
       timestamp: (/* @__PURE__ */ new Date()).toISOString()
     };
-    await fs.writeFile(QUESTION_FILE, JSON.stringify(questionData, null, 2), "utf-8");
+    await fs.writeFile(questionFile(dir), JSON.stringify(questionData, null, 2), "utf-8");
     try {
-      await fs.unlink(ANSWER_FILE);
+      await fs.unlink(answerFile(dir));
     } catch {
     }
     activeWaits++;
-    await touchAgentAlive("waiting");
+    await touchAgentAlive(dir, "waiting", agent_id);
     try {
       const waitStart = Date.now();
       let nextHeartbeatAt = Date.now() + HEARTBEAT_INTERVAL;
+      let nextAgentBeatAt = Date.now() + AGENT_BEAT_INTERVAL;
       while (!extra.signal.aborted) {
+        if (Date.now() >= nextAgentBeatAt) {
+          await touchAgentAlive(dir, "waiting", agent_id);
+          nextAgentBeatAt = Date.now() + AGENT_BEAT_INTERVAL;
+        }
         try {
-          const raw = await fs.readFile(ANSWER_FILE, "utf-8");
+          const raw = await fs.readFile(answerFile(dir), "utf-8");
           const answerData = JSON.parse(raw);
           try {
-            await fs.unlink(QUESTION_FILE);
+            await fs.unlink(questionFile(dir));
           } catch {
           }
           try {
-            await fs.unlink(ANSWER_FILE);
+            await fs.unlink(answerFile(dir));
           } catch {
           }
           const answers = answerData.answers || [];
@@ -31445,6 +31491,7 @@ server.tool(
         }
         if (Date.now() >= nextHeartbeatAt) {
           await emitHeartbeat(extra, "jefr is still waiting for the user's answer.");
+          await touchAgentAlive(dir, "waiting", agent_id);
           nextHeartbeatAt = Date.now() + HEARTBEAT_INTERVAL;
         }
         const keepWaiting = await sleepWithAbort(extra.signal, POLL_INTERVAL);

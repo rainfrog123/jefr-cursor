@@ -278,19 +278,6 @@ function deleteQueueItem(id) {
 function clearQueue() {
   withQueueLock(() => writeQueue([]));
 }
-function updateQueueItem(id, updates) {
-  withQueueLock(() => {
-    const queue = readQueue();
-    const idx = queue.findIndex((item) => item.id === id);
-    if (idx === -1) {
-      return;
-    }
-    if (updates.content !== void 0 && queue[idx].type === "text") {
-      queue[idx].content = updates.content;
-    }
-    writeQueue(queue);
-  });
-}
 function readQuestion() {
   if (!fs.existsSync(QUESTION_FILE)) {
     return null;
@@ -334,6 +321,245 @@ function clearReply() {
     fs.unlinkSync(REPLY_FILE);
   } catch {
   }
+}
+var AGENTS_SUBDIR = "agents";
+function sanitizeAgentId(agentId) {
+  if (!agentId || typeof agentId !== "string") {
+    return "";
+  }
+  return agentId.trim().replace(/[^A-Za-z0-9._-]/g, "").slice(0, 64);
+}
+function agentDirFor(agentId) {
+  const id = sanitizeAgentId(agentId);
+  return id ? path.join(dataDir, AGENTS_SUBDIR, id) : dataDir;
+}
+function ensureDirAt(dir) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+function acquireLockIn(lockDir, timeoutMs = 2e3) {
+  const start = Date.now();
+  for (; ; ) {
+    try {
+      fs.mkdirSync(lockDir);
+      return true;
+    } catch {
+      try {
+        const st = fs.statSync(lockDir);
+        if (Date.now() - st.mtimeMs > 5e3) {
+          try {
+            fs.rmdirSync(lockDir);
+          } catch {
+          }
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() - start > timeoutMs) {
+        return false;
+      }
+      sleepSync(8);
+    }
+  }
+}
+function withLockIn(dir, fn) {
+  ensureDirAt(dir);
+  const lockDir = path.join(dir, "queue.lock");
+  const locked = acquireLockIn(lockDir);
+  try {
+    return fn();
+  } finally {
+    if (locked) {
+      try {
+        fs.rmdirSync(lockDir);
+      } catch {
+      }
+    }
+  }
+}
+function readJsonArrayAt(file) {
+  if (!fs.existsSync(file)) {
+    return [];
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+function readQueueFor(agentId) {
+  const dir = agentDirFor(agentId);
+  ensureDirAt(dir);
+  return readJsonArrayAt(path.join(dir, "queue.json"));
+}
+function writeQueueFor(items, agentId) {
+  const dir = agentDirFor(agentId);
+  ensureDirAt(dir);
+  robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(items, null, 2));
+}
+function getQueueCountFor(agentId) {
+  return readQueueFor(agentId).length;
+}
+function sendTextTo(agentId, text) {
+  const item = {
+    id: makeId(),
+    type: "text",
+    content: text,
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => {
+    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    queue.push(item);
+    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+  });
+  appendSharedHistory({ id: item.id, kind: "text", text, timestamp: item.timestamp });
+  return item;
+}
+function sendImageTo(agentId, filePath, caption) {
+  const item = {
+    id: makeId(),
+    type: "image",
+    path: filePath,
+    caption,
+    timestamp: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => {
+    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    queue.push(item);
+    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+  });
+  return item;
+}
+function sendFileTo(agentId, filePath) {
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => {
+    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    queue.push({
+      id: makeId(),
+      type: "file",
+      path: filePath,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString()
+    });
+    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+  });
+}
+function deleteQueueItemFor(id, agentId) {
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => {
+    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    robustWriteFile(
+      path.join(dir, "queue.json"),
+      JSON.stringify(queue.filter((it) => it.id !== id), null, 2)
+    );
+  });
+}
+function clearQueueFor(agentId) {
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => writeQueueFor([], agentId));
+}
+function updateQueueItemFor(id, updates, agentId) {
+  const dir = agentDirFor(agentId);
+  withLockIn(dir, () => {
+    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    const idx = queue.findIndex((it) => it.id === id);
+    if (idx === -1) {
+      return;
+    }
+    if (updates.content !== void 0 && queue[idx].type === "text") {
+      queue[idx].content = updates.content;
+    }
+    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+  });
+}
+function readReplyFor(agentId) {
+  const file = path.join(agentDirFor(agentId), "reply.json");
+  if (!fs.existsSync(file)) {
+    return null;
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    return data && data.content ? data : null;
+  } catch {
+    return null;
+  }
+}
+function clearReplyFor(agentId) {
+  try {
+    fs.unlinkSync(path.join(agentDirFor(agentId), "reply.json"));
+  } catch {
+  }
+}
+function readQuestionFor(agentId) {
+  const file = path.join(agentDirFor(agentId), "question.json");
+  if (!fs.existsSync(file)) {
+    return null;
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    return data && data.id && data.questions ? data : null;
+  } catch {
+    return null;
+  }
+}
+function writeAnswerFor(answer, agentId) {
+  const dir = agentDirFor(agentId);
+  ensureDirAt(dir);
+  fs.writeFileSync(path.join(dir, "answer.json"), JSON.stringify(answer, null, 2), "utf-8");
+}
+function cancelQuestionFor(agentId) {
+  const q = readQuestionFor(agentId);
+  if (!q) {
+    return;
+  }
+  const answers = q.questions.map((qi, i) => ({
+    questionId: qi.id,
+    selected: [],
+    other: i === 0 ? "User cancelled the answer" : ""
+  }));
+  writeAnswerFor({ id: q.id, answers }, agentId);
+}
+function scanAllAgents(maxAgeMs = AGENT_STALE_MS) {
+  const root = path.join(dataDir, AGENTS_SUBDIR);
+  let ids = [];
+  try {
+    ids = fs.readdirSync(root);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const id of ids) {
+    const dir = path.join(root, id);
+    try {
+      if (!fs.statSync(dir).isDirectory()) {
+        continue;
+      }
+    } catch {
+      continue;
+    }
+    let ts = 0;
+    let beatState = "idle";
+    try {
+      const data = JSON.parse(fs.readFileSync(path.join(dir, "agent-alive.json"), "utf-8"));
+      ts = typeof data.ts === "number" ? data.ts : 0;
+      beatState = data.state === "working" ? "working" : "waiting";
+    } catch {
+    }
+    const connected = ts > 0 && Date.now() - ts <= maxAgeMs;
+    out.push({
+      id,
+      connected,
+      state: connected ? beatState : "idle",
+      ts,
+      queueCount: getQueueCountFor(id)
+    });
+  }
+  out.sort((a, b) => b.ts - a.ts);
+  return out;
 }
 function readCardState() {
   ensureDir();
@@ -1587,6 +1813,63 @@ connect();
 </html>`;
 }
 
+// src/agentStats.ts
+function newStat() {
+  return {
+    connectCount: 0,
+    reconnectCount: 0,
+    connected: false,
+    connectedSince: 0,
+    lastSeen: 0,
+    lastReconnectAt: 0
+  };
+}
+function reconcile(roster, stats, now) {
+  for (const r of roster) {
+    let s = stats.get(r.id);
+    if (!s) {
+      s = newStat();
+      stats.set(r.id, s);
+    }
+    if (r.connected) {
+      if (!s.connected) {
+        s.connected = true;
+        s.connectCount++;
+        s.connectedSince = now;
+      }
+      s.lastSeen = now;
+    } else if (s.connected) {
+      s.connected = false;
+      s.connectedSince = 0;
+    }
+  }
+  const dropped = roster.filter((r) => !r.connected && (stats.get(r.id)?.connectCount ?? 0) > 0).map((r) => r.id);
+  const views = roster.map((r) => {
+    const s = stats.get(r.id);
+    return {
+      id: r.id,
+      connected: r.connected,
+      state: r.state,
+      queueCount: r.queueCount,
+      connectCount: s.connectCount,
+      reconnectCount: s.reconnectCount,
+      connectedSince: r.connected ? s.connectedSince : 0
+    };
+  });
+  return { views, dropped };
+}
+function pickReconnect(dropped, stats, now, debounceMs) {
+  for (const id of dropped) {
+    const s = stats.get(id);
+    if (!s)
+      continue;
+    if (s.lastReconnectAt === 0 || now - s.lastReconnectAt >= debounceMs) {
+      return id;
+    }
+  }
+  return null;
+}
+
 // src/extension.ts
 var mainPanel;
 var pollTimer2;
@@ -1603,6 +1886,11 @@ var lastReplyContent;
 var lastRemoteQuestionId;
 var idleTimer;
 var lastActivityTime = Date.now();
+var selectedAgentId;
+var lastAgentListJson;
+var autoReconnect = true;
+var RECONNECT_DEBOUNCE_MS = 45e3;
+var agentStats = /* @__PURE__ */ new Map();
 var WORKFLOW_SCRIPT = path3.join(
   os3.homedir(),
   "blue",
@@ -1673,6 +1961,9 @@ function runWorkflow(opts) {
     args.push("--reconnect");
     if (typeof opts.tile === "number" && Number.isInteger(opts.tile)) {
       args.push("--tile", String(opts.tile));
+    }
+    if (opts.agentId && opts.agentId.trim()) {
+      args.push("--agent-id", opts.agentId.trim());
     }
   } else if (opts.autoPrompt && opts.autoPrompt.trim()) {
     args.push(opts.autoPrompt);
@@ -1910,7 +2201,8 @@ function startPolling() {
     if (!mainPanel) {
       return;
     }
-    const question = readQuestion();
+    pushAgentList();
+    const question = readQuestionFor(selectedAgentId);
     if (question) {
       if (question.id !== lastQuestionId) {
         mainPanel.webview.postMessage({ type: "showQuestion", data: question });
@@ -1921,7 +2213,7 @@ function startPolling() {
       mainPanel.webview.postMessage({ type: "clearQuestion" });
       lastQuestionId = void 0;
     }
-    const reply = readReply();
+    const reply = readReplyFor(selectedAgentId);
     if (reply && reply.timestamp !== lastReplyTimestamp) {
       mainPanel.webview.postMessage({ type: "showReply", data: reply });
       lastReplyTimestamp = reply.timestamp;
@@ -1933,15 +2225,69 @@ function startPolling() {
       mainPanel.webview.postMessage({ type: "cardState", data: { active: true } });
       lastCardValid = cardValid;
     }
-    const count = getQueueCount();
+    const count = getQueueCountFor(selectedAgentId);
     if (count !== lastQueueCount) {
       mainPanel.webview.postMessage({ type: "queueCount", count });
-      mainPanel.webview.postMessage({ type: "queueData", data: readQueue() });
+      mainPanel.webview.postMessage({ type: "queueData", data: readQueueFor(selectedAgentId) });
       lastQueueCount = count;
     }
   };
   poll();
   pollTimer2 = setInterval(poll, 500);
+}
+function pushAgentList() {
+  if (!mainPanel) {
+    return;
+  }
+  const now = Date.now();
+  const roster = scanAllAgents();
+  const { views: agents, dropped } = reconcile(roster, agentStats, now);
+  if (autoReconnect && !workflowProc) {
+    const target = pickReconnect(dropped, agentStats, now, RECONNECT_DEBOUNCE_MS);
+    if (target) {
+      const s = agentStats.get(target);
+      if (s) {
+        s.reconnectCount++;
+        s.lastReconnectAt = now;
+      }
+      postWorkflow({
+        type: "workflowOutput",
+        stream: "stdout",
+        line: `[jefr] auto-reconnect: agent ${target.slice(0, 8)} dropped \u2014 re-priming its tile`
+      });
+      runWorkflow({ reconnect: true, agentId: target });
+    }
+  }
+  const payload = { agents, selected: selectedAgentId || null, autoReconnect };
+  const json = JSON.stringify(payload);
+  if (json !== lastAgentListJson) {
+    lastAgentListJson = json;
+    mainPanel.webview.postMessage({ type: "agentList", ...payload });
+  }
+}
+function selectAgent(agentId) {
+  selectedAgentId = agentId && agentId.trim() ? agentId.trim() : void 0;
+  lastQuestionId = void 0;
+  lastReplyTimestamp = void 0;
+  lastQueueCount = void 0;
+  lastAgentListJson = void 0;
+  mainPanel?.webview.postMessage({
+    type: "agentSelected",
+    agentId: selectedAgentId || null
+  });
+  const reply = readReplyFor(selectedAgentId);
+  if (reply) {
+    mainPanel?.webview.postMessage({ type: "showReply", data: reply });
+    lastReplyTimestamp = reply.timestamp;
+  }
+  const question = readQuestionFor(selectedAgentId);
+  mainPanel?.webview.postMessage(
+    question ? { type: "showQuestion", data: question } : { type: "clearQuestion" }
+  );
+  lastQuestionId = question?.id;
+  mainPanel?.webview.postMessage({ type: "queueData", data: readQueueFor(selectedAgentId) });
+  mainPanel?.webview.postMessage({ type: "queueCount", count: getQueueCountFor(selectedAgentId) });
+  pushAgentList();
 }
 function getWorkspaceName() {
   const folders = vscode.workspace.workspaceFolders;
@@ -2107,12 +2453,33 @@ var MessengerViewProvider = class {
             injected: !!readInjectedToken()
           });
           this.pushQueueData();
+          pushAgentList();
           break;
+        case "selectAgent":
+          selectAgent(msg.agentId);
+          break;
+        case "setAutoReconnect":
+          autoReconnect = !!msg.enabled;
+          lastAgentListJson = void 0;
+          pushAgentList();
+          break;
+        case "reconnectAgent": {
+          const aid = typeof msg.agentId === "string" ? msg.agentId : void 0;
+          if (aid) {
+            const s = agentStats.get(aid);
+            if (s) {
+              s.reconnectCount++;
+              s.lastReconnectAt = Date.now();
+            }
+            runWorkflow({ reconnect: true, agentId: aid });
+          }
+          break;
+        }
         case "sendText":
           if (!this.checkCard()) {
             return;
           }
-          sendText(msg.text);
+          sendTextTo(selectedAgentId, msg.text);
           resetIdleTimer();
           triggerCursorChat();
           break;
@@ -2149,16 +2516,16 @@ var MessengerViewProvider = class {
             return;
           }
           if (msg.path) {
-            sendFile(msg.path);
+            sendFileTo(selectedAgentId, msg.path);
             resetIdleTimer();
             triggerCursorChat();
           }
           break;
         case "submitAnswer":
-          writeAnswer(msg.data);
+          writeAnswerFor(msg.data, selectedAgentId);
           break;
         case "cancelQuestion":
-          cancelQuestion();
+          cancelQuestionFor(selectedAgentId);
           break;
         case "ackReply":
           this.ackReply(msg.timestamp);
@@ -2174,15 +2541,15 @@ var MessengerViewProvider = class {
           this.pushQueueData();
           break;
         case "deleteQueueItem":
-          deleteQueueItem(msg.id);
+          deleteQueueItemFor(msg.id, selectedAgentId);
           this.pushQueueData();
           break;
         case "clearQueue":
-          clearQueue();
+          clearQueueFor(selectedAgentId);
           this.pushQueueData();
           break;
         case "updateQueueItem":
-          updateQueueItem(msg.id, { content: msg.content });
+          updateQueueItemFor(msg.id, { content: msg.content }, selectedAgentId);
           this.pushQueueData();
           break;
         case "fetchUsage":
@@ -2247,7 +2614,7 @@ var MessengerViewProvider = class {
       const buf = Buffer.from(match[2], "base64");
       const tmpPath = path3.join(os3.tmpdir(), "mcp_" + Date.now() + "." + ext);
       fs3.writeFileSync(tmpPath, buf);
-      const item = sendImage(tmpPath, caption);
+      const item = sendImageTo(selectedAgentId, tmpPath, caption);
       appendSharedHistory({
         id: item.id,
         kind: "image",
@@ -2302,20 +2669,20 @@ var MessengerViewProvider = class {
       filters: { Images: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"] }
     });
     if (uris?.[0]) {
-      sendImage(uris[0].fsPath, caption);
+      sendImageTo(selectedAgentId, uris[0].fsPath, caption);
     }
   }
   async handleSendFile() {
     const uris = await vscode.window.showOpenDialog({ canSelectMany: false });
     if (uris?.[0]) {
-      sendFile(uris[0].fsPath);
+      sendFileTo(selectedAgentId, uris[0].fsPath);
     }
   }
   pushCurrentState() {
     if (!mainPanel) {
       return;
     }
-    const question = readQuestion();
+    const question = readQuestionFor(selectedAgentId);
     if (question) {
       mainPanel.webview.postMessage({ type: "showQuestion", data: question });
       lastQuestionId = question.id;
@@ -2323,14 +2690,14 @@ var MessengerViewProvider = class {
       mainPanel.webview.postMessage({ type: "clearQuestion" });
       lastQuestionId = void 0;
     }
-    const reply = readReply();
+    const reply = readReplyFor(selectedAgentId);
     if (reply) {
       mainPanel.webview.postMessage({ type: "showReply", data: reply });
       lastReplyTimestamp = reply.timestamp;
     } else {
       lastReplyTimestamp = void 0;
     }
-    const count = getQueueCount();
+    const count = getQueueCountFor(selectedAgentId);
     mainPanel.webview.postMessage({ type: "queueCount", count });
     lastQueueCount = count;
   }
@@ -2341,7 +2708,7 @@ var MessengerViewProvider = class {
     if (!mainPanel) {
       return;
     }
-    mainPanel.webview.postMessage({ type: "queueData", data: readQueue() });
+    mainPanel.webview.postMessage({ type: "queueData", data: readQueueFor(selectedAgentId) });
   }
   pushCardState() {
     if (!mainPanel) {
@@ -2405,7 +2772,7 @@ var MessengerViewProvider = class {
     this.handleFetchUsage();
   }
   async ackReply(timestamp) {
-    const reply = readReply();
+    const reply = readReplyFor(selectedAgentId);
     if (!reply) {
       lastReplyTimestamp = void 0;
       return;
@@ -2424,7 +2791,7 @@ var MessengerViewProvider = class {
           }
         }
       }
-      clearReply();
+      clearReplyFor(selectedAgentId);
       lastReplyTimestamp = void 0;
     }
   }

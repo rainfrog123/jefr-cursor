@@ -11,6 +11,7 @@ import type {
   Attachment,
   HistoryItem,
   InboundMessage,
+  LiveAgentInfo,
   QuestionData,
   QueueItem,
   ReplyData,
@@ -21,8 +22,9 @@ import { QuestionPanel } from "./components/QuestionPanel";
 import { ChatTab } from "./components/ChatTab";
 import { QueueTab } from "./components/QueueTab";
 import { GeneralTab, type WorkflowLine } from "./components/GeneralTab";
+import { AgentsTab } from "./components/AgentsTab";
 
-type TabId = "chat" | "queue" | "general";
+type TabId = "chat" | "queue" | "agents" | "general";
 
 /** Keep the workflow log bounded so it never grows without limit. */
 const MAX_WORKFLOW_LINES = 600;
@@ -61,6 +63,10 @@ export function App(): JSX.Element {
 
   const [workflowRunning, setWorkflowRunning] = useState(false);
   const [workflowOutput, setWorkflowOutput] = useState<WorkflowLine[]>([]);
+
+  const [agents, setAgents] = useState<LiveAgentInfo[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [autoReconnect, setAutoReconnect] = useState(true);
 
   /* Route messages coming from the extension host. */
   useEffect(() => {
@@ -136,6 +142,14 @@ export function App(): JSX.Element {
         case "workflowExit":
           setWorkflowRunning(false);
           break;
+        case "agentList":
+          setAgents(msg.agents);
+          setSelectedAgentId(msg.selected);
+          setAutoReconnect(msg.autoReconnect);
+          break;
+        case "agentSelected":
+          setSelectedAgentId(msg.agentId);
+          break;
         // cardState / cardActivated / cardError / serverInfo are accepted but
         // the local build keeps licensing disabled (checkCard() === true).
         default:
@@ -176,6 +190,17 @@ export function App(): JSX.Element {
   /* Wipe the chat history (the persist effect clears stored state too). */
   const clearHistory = useCallback(() => setHistory([]), []);
 
+  /* Switch the target agent. Clearing history keeps each agent's view clean,
+     since replies/questions are scoped to the selected agent by the host. */
+  const onSelectAgent = useCallback(
+    (id: string | null) => {
+      setSelectedAgentId(id);
+      setHistory([]);
+      post({ type: "selectAgent", agentId: id ?? undefined });
+    },
+    []
+  );
+
   return (
     <div className="app">
       <Header version={version} onOpenConsole={() => post({ type: "openConsole" })} />
@@ -191,8 +216,17 @@ export function App(): JSX.Element {
           label="Queue"
           badge={queueCount}
         />
+        <TabButton
+          id="agents"
+          current={tab}
+          onClick={switchTab}
+          label="Agents"
+          badge={agents.length}
+        />
         <TabButton id="general" current={tab} onClick={switchTab} label="General" />
       </div>
+
+      <AgentPicker agents={agents} selected={selectedAgentId} onSelect={onSelectAgent} />
 
       {tab === "chat" && (
         <ChatTab
@@ -204,6 +238,14 @@ export function App(): JSX.Element {
         />
       )}
       {tab === "queue" && <QueueTab queue={queue} />}
+      {tab === "agents" && (
+        <AgentsTab
+          agents={agents}
+          selectedAgentId={selectedAgentId}
+          autoReconnect={autoReconnect}
+          onSelectAgent={onSelectAgent}
+        />
+      )}
       {tab === "general" && (
         <GeneralTab
           usage={usage}
@@ -234,6 +276,46 @@ function TabButton(props: {
       {props.label}
       {props.badge ? <span className="tab-badge">{props.badge}</span> : null}
     </button>
+  );
+}
+
+/** Top strip that lists live agents and lets the user pick which one to talk
+ *  to. "All (shared)" routes to the legacy shared queue. */
+function AgentPicker(props: {
+  agents: LiveAgentInfo[];
+  selected: string | null;
+  onSelect: (id: string | null) => void;
+}): JSX.Element | null {
+  const { agents, selected, onSelect } = props;
+
+  // Hide entirely until at least one addressable agent shows up, so the legacy
+  // single-listener setup looks unchanged.
+  if (agents.length === 0 && !selected) {
+    return null;
+  }
+
+  const shortId = (id: string) => id.slice(0, 8);
+
+  return (
+    <div className="agent-picker">
+      <span className="agent-picker-label">Agent</span>
+      <select
+        className="agent-picker-select"
+        value={selected ?? ""}
+        onChange={(e) => onSelect(e.target.value || null)}
+      >
+        <option value="">All (shared)</option>
+        {agents.map((a) => (
+          <option key={a.id} value={a.id}>
+            {shortId(a.id)} · {a.state}
+            {a.queueCount ? ` · ${a.queueCount} queued` : ""}
+          </option>
+        ))}
+      </select>
+      <span className="agent-picker-count">
+        {agents.length} live
+      </span>
+    </div>
   );
 }
 

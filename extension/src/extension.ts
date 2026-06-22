@@ -24,6 +24,21 @@ import {
   cancelQuestion,
   readReply,
   clearReply,
+  listLiveAgents,
+  scanAllAgents,
+  readQueueFor,
+  getQueueCountFor,
+  sendTextTo,
+  sendImageTo,
+  sendFileTo,
+  deleteQueueItemFor,
+  clearQueueFor,
+  updateQueueItemFor,
+  readReplyFor,
+  clearReplyFor,
+  readQuestionFor,
+  writeAnswerFor,
+  cancelQuestionFor,
   readCardState,
   clearCardState,
   isCardValid,
@@ -51,6 +66,11 @@ import {
   getServerPort,
   getConnectedClients,
 } from "./local-server";
+import {
+  reconcile,
+  pickReconnect,
+  type AgentStat,
+} from "./agentStats";
 
 // ── Module state ────────────────────────────────────────────────────────────
 
@@ -69,6 +89,20 @@ let lastReplyContent: string | undefined;
 let lastRemoteQuestionId: string | undefined;
 let idleTimer: ReturnType<typeof setInterval> | undefined;
 let lastActivityTime = Date.now();
+
+// ── Multi-agent routing ─────────────────────────────────────────────────────
+// The panel can target a specific agent tile (by its Cursor agentId). When set,
+// sends, replies, questions, and the queue are scoped to that agent's own dir.
+// undefined = the shared root queue (legacy single-listener behavior).
+let selectedAgentId: string | undefined;
+let lastAgentListJson: string | undefined;
+
+// Auto-reconnect: when a previously-connected agent's heartbeat goes stale, the
+// extension re-primes its tile via the CDP workflow. On by default; togglable.
+let autoReconnect = true;
+const RECONNECT_DEBOUNCE_MS = 45_000;
+
+const agentStats = new Map<string, AgentStat>();
 
 // ── Agent workflow automation (CDP) ─────────────────────────────────────────
 // The extension can invoke the Python CDP workflow that spawns a fresh Cursor
@@ -132,6 +166,8 @@ interface WorkflowOptions {
   reconnect?: boolean;
   /** Target tile index for reconnect (omit to auto-detect the dropped tile). */
   tile?: number;
+  /** Target agent id for reconnect (the workflow maps it to the right tile). */
+  agentId?: string;
 }
 
 /** Spawn the CDP workflow and stream its output back to the webview. */
@@ -172,6 +208,9 @@ function runWorkflow(opts: WorkflowOptions): void {
     args.push("--reconnect");
     if (typeof opts.tile === "number" && Number.isInteger(opts.tile)) {
       args.push("--tile", String(opts.tile));
+    }
+    if (opts.agentId && opts.agentId.trim()) {
+      args.push("--agent-id", opts.agentId.trim());
     }
   } else if (opts.autoPrompt && opts.autoPrompt.trim()) {
     args.push(opts.autoPrompt);
@@ -448,7 +487,11 @@ function startPolling(): void {
     if (!mainPanel) {
       return;
     }
-    const question = readQuestion();
+
+    // Broadcast the live-agent list so the panel's picker stays current.
+    pushAgentList();
+
+    const question = readQuestionFor(selectedAgentId);
     if (question) {
       if (question.id !== lastQuestionId) {
         mainPanel.webview.postMessage({ type: "showQuestion", data: question });
@@ -460,7 +503,7 @@ function startPolling(): void {
       lastQuestionId = undefined;
     }
 
-    const reply = readReply();
+    const reply = readReplyFor(selectedAgentId);
     if (reply && reply.timestamp !== lastReplyTimestamp) {
       mainPanel.webview.postMessage({ type: "showReply", data: reply });
       lastReplyTimestamp = reply.timestamp;
@@ -474,15 +517,82 @@ function startPolling(): void {
       lastCardValid = cardValid;
     }
 
-    const count = getQueueCount();
+    const count = getQueueCountFor(selectedAgentId);
     if (count !== lastQueueCount) {
       mainPanel.webview.postMessage({ type: "queueCount", count });
-      mainPanel.webview.postMessage({ type: "queueData", data: readQueue() });
+      mainPanel.webview.postMessage({ type: "queueData", data: readQueueFor(selectedAgentId) });
       lastQueueCount = count;
     }
   };
   poll();
   pollTimer2 = setInterval(poll, 500);
+}
+
+/** Scan the agent roster, update connect/reconnect stats, drive auto-reconnect,
+ *  and push the merged list to the panel (deduped on stable fields). */
+function pushAgentList(): void {
+  if (!mainPanel) {
+    return;
+  }
+  const now = Date.now();
+  const roster = scanAllAgents();
+  const { views: agents, dropped } = reconcile(roster, agentStats, now);
+
+  // Auto-reconnect: re-prime one dropped agent at a time (serialized by the
+  // workflowProc guard + the debounce inside pickReconnect).
+  if (autoReconnect && !workflowProc) {
+    const target = pickReconnect(dropped, agentStats, now, RECONNECT_DEBOUNCE_MS);
+    if (target) {
+      const s = agentStats.get(target);
+      if (s) {
+        s.reconnectCount++;
+        s.lastReconnectAt = now;
+      }
+      postWorkflow({
+        type: "workflowOutput",
+        stream: "stdout",
+        line: `[jefr] auto-reconnect: agent ${target.slice(0, 8)} dropped — re-priming its tile`,
+      });
+      runWorkflow({ reconnect: true, agentId: target });
+    }
+  }
+
+  // Dedupe on stable fields only (connectedSince changes solely on reconnect),
+  // so a live uptime counter in the panel won't spam re-renders.
+  const payload = { agents, selected: selectedAgentId || null, autoReconnect };
+  const json = JSON.stringify(payload);
+  if (json !== lastAgentListJson) {
+    lastAgentListJson = json;
+    mainPanel.webview.postMessage({ type: "agentList", ...payload });
+  }
+}
+
+/** Switch the panel's target agent and immediately re-push that agent's state. */
+function selectAgent(agentId?: string): void {
+  selectedAgentId = agentId && agentId.trim() ? agentId.trim() : undefined;
+  // Force the next poll to re-emit question/reply/queue for the new target.
+  lastQuestionId = undefined;
+  lastReplyTimestamp = undefined;
+  lastQueueCount = undefined;
+  lastAgentListJson = undefined;
+  mainPanel?.webview.postMessage({
+    type: "agentSelected",
+    agentId: selectedAgentId || null,
+  });
+  // Push the freshly-selected agent's current state right away.
+  const reply = readReplyFor(selectedAgentId);
+  if (reply) {
+    mainPanel?.webview.postMessage({ type: "showReply", data: reply });
+    lastReplyTimestamp = reply.timestamp;
+  }
+  const question = readQuestionFor(selectedAgentId);
+  mainPanel?.webview.postMessage(
+    question ? { type: "showQuestion", data: question } : { type: "clearQuestion" }
+  );
+  lastQuestionId = question?.id;
+  mainPanel?.webview.postMessage({ type: "queueData", data: readQueueFor(selectedAgentId) });
+  mainPanel?.webview.postMessage({ type: "queueCount", count: getQueueCountFor(selectedAgentId) });
+  pushAgentList();
 }
 
 function getWorkspaceName(): string {
@@ -690,12 +800,33 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
             injected: !!readInjectedToken(),
           });
           this.pushQueueData();
+          pushAgentList();
           break;
+        case "selectAgent":
+          selectAgent(msg.agentId);
+          break;
+        case "setAutoReconnect":
+          autoReconnect = !!msg.enabled;
+          lastAgentListJson = undefined; // force a re-push with the new flag
+          pushAgentList();
+          break;
+        case "reconnectAgent": {
+          const aid = typeof msg.agentId === "string" ? msg.agentId : undefined;
+          if (aid) {
+            const s = agentStats.get(aid);
+            if (s) {
+              s.reconnectCount++;
+              s.lastReconnectAt = Date.now();
+            }
+            runWorkflow({ reconnect: true, agentId: aid });
+          }
+          break;
+        }
         case "sendText":
           if (!this.checkCard()) {
             return;
           }
-          sendText(msg.text);
+          sendTextTo(selectedAgentId, msg.text);
           resetIdleTimer();
           triggerCursorChat();
           break;
@@ -732,16 +863,16 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
             return;
           }
           if (msg.path) {
-            sendFile(msg.path);
+            sendFileTo(selectedAgentId, msg.path);
             resetIdleTimer();
             triggerCursorChat();
           }
           break;
         case "submitAnswer":
-          writeAnswer(msg.data);
+          writeAnswerFor(msg.data, selectedAgentId);
           break;
         case "cancelQuestion":
-          cancelQuestion();
+          cancelQuestionFor(selectedAgentId);
           break;
         case "ackReply":
           this.ackReply(msg.timestamp);
@@ -757,15 +888,15 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
           this.pushQueueData();
           break;
         case "deleteQueueItem":
-          deleteQueueItem(msg.id);
+          deleteQueueItemFor(msg.id, selectedAgentId);
           this.pushQueueData();
           break;
         case "clearQueue":
-          clearQueue();
+          clearQueueFor(selectedAgentId);
           this.pushQueueData();
           break;
         case "updateQueueItem":
-          updateQueueItem(msg.id, { content: msg.content });
+          updateQueueItemFor(msg.id, { content: msg.content }, selectedAgentId);
           this.pushQueueData();
           break;
         case "fetchUsage":
@@ -834,7 +965,7 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
       const buf = Buffer.from(match[2], "base64");
       const tmpPath = path.join(os.tmpdir(), "mcp_" + Date.now() + "." + ext);
       fs.writeFileSync(tmpPath, buf);
-      const item = sendImage(tmpPath, caption);
+      const item = sendImageTo(selectedAgentId, tmpPath, caption);
       appendSharedHistory({
         id: item.id,
         kind: "image",
@@ -893,14 +1024,14 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
       filters: { Images: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"] },
     });
     if (uris?.[0]) {
-      sendImage(uris[0].fsPath, caption);
+      sendImageTo(selectedAgentId, uris[0].fsPath, caption);
     }
   }
 
   private async handleSendFile(): Promise<void> {
     const uris = await vscode.window.showOpenDialog({ canSelectMany: false });
     if (uris?.[0]) {
-      sendFile(uris[0].fsPath);
+      sendFileTo(selectedAgentId, uris[0].fsPath);
     }
   }
 
@@ -908,7 +1039,7 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
     if (!mainPanel) {
       return;
     }
-    const question = readQuestion();
+    const question = readQuestionFor(selectedAgentId);
     if (question) {
       mainPanel.webview.postMessage({ type: "showQuestion", data: question });
       lastQuestionId = question.id;
@@ -916,14 +1047,14 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
       mainPanel.webview.postMessage({ type: "clearQuestion" });
       lastQuestionId = undefined;
     }
-    const reply = readReply();
+    const reply = readReplyFor(selectedAgentId);
     if (reply) {
       mainPanel.webview.postMessage({ type: "showReply", data: reply });
       lastReplyTimestamp = reply.timestamp;
     } else {
       lastReplyTimestamp = undefined;
     }
-    const count = getQueueCount();
+    const count = getQueueCountFor(selectedAgentId);
     mainPanel.webview.postMessage({ type: "queueCount", count });
     lastQueueCount = count;
   }
@@ -936,7 +1067,7 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
     if (!mainPanel) {
       return;
     }
-    mainPanel.webview.postMessage({ type: "queueData", data: readQueue() });
+    mainPanel.webview.postMessage({ type: "queueData", data: readQueueFor(selectedAgentId) });
   }
 
   private pushCardState(): void {
@@ -1006,7 +1137,7 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async ackReply(timestamp?: string): Promise<void> {
-    const reply = readReply();
+    const reply = readReplyFor(selectedAgentId);
     if (!reply) {
       lastReplyTimestamp = undefined;
       return;
@@ -1026,7 +1157,7 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
           }
         }
       }
-      clearReply();
+      clearReplyFor(selectedAgentId);
       lastReplyTimestamp = undefined;
     }
   }

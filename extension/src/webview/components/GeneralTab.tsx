@@ -116,7 +116,7 @@ export function GeneralTab(props: {
             className="card-input workflow-secs"
             type="number"
             min={0}
-            placeholder="Max secs (600)"
+            placeholder="Max secs (6000)"
             value={maxSecs}
             disabled={workflowRunning}
             onChange={(e) => setMaxSecs(e.target.value)}
