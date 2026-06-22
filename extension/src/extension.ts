@@ -106,7 +106,7 @@ const agentStats = new Map<string, AgentStat>();
 
 // ── Agent workflow automation (CDP) ─────────────────────────────────────────
 // The extension can invoke the Python CDP workflow that spawns a fresh Cursor
-// agent tile, sends a stand-by prompt, switches to Opus, types the invoke-mcp
+// agent tile, sends a stand-by prompt, switches to GPT-5.5, types the invoke-mcp
 // prompt, and holds Enter past "Planning next moves".
 
 /** The CDP automation runner. Lives outside the extension in the user's tools. */

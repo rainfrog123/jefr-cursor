@@ -2,7 +2,7 @@
  * General-purpose tab (formerly "Usage").
  *
  * Hosts the CDP **agent workflow** runner — which spawns a fresh Cursor agent
- * tile, sends a stand-by prompt, switches to Opus, types the invoke-mcp prompt,
+ * tile, sends a stand-by prompt, switches to GPT-5.5, types the invoke-mcp prompt,
  * and holds Enter past "Planning next moves" — and keeps the original Cursor
  * usage panel below it.
  */
@@ -87,7 +87,7 @@ export function GeneralTab(props: {
 
         <p className="workflow-desc">
           Spawns a fresh Cursor agent tile over CDP, sends a stand-by prompt,
-          switches to Opus, types the invoke-mcp prompt, then holds Enter past
+          switches to GPT-5.5, types the invoke-mcp prompt, then holds Enter past
           “Planning next moves”. <strong>Reconnect</strong> instead re-primes a
           dropped (“Worked”) tile in place — auto-detecting it, or use the tile
           index — to rebuild the MCP loop on that same tile. Requires Cursor
@@ -104,7 +104,7 @@ export function GeneralTab(props: {
         />
         <textarea
           className="workflow-input"
-          placeholder="Opus prompt (optional — defaults to an invoke-mcp instruction)"
+          placeholder="MCP prompt (optional — defaults to an invoke-mcp instruction)"
           rows={2}
           value={opusPrompt}
           disabled={workflowRunning}
