@@ -72,18 +72,31 @@ let lastActivityTime = Date.now();
 
 // ── Agent workflow automation (CDP) ─────────────────────────────────────────
 // The extension can invoke the Python CDP workflow that spawns a fresh Cursor
-// agent tile, sends a stand-by prompt, switches to Opus, types the invoke-mcp
+// agent tile, sends a stand-by prompt, switches to GPT-5.5, types the invoke-mcp
 // prompt, and holds Enter past "Planning next moves".
 
-/** The CDP automation runner. Lives outside the extension in the user's tools. */
-const WORKFLOW_SCRIPT = path.join(
-  os.homedir(),
-  "blue",
-  "infra",
-  "cursor",
-  "automation",
-  "workflow.py"
-);
+/** Resolve workflow.py — sibling `automation/` when integrated under blue/infra/cursor. */
+function defaultWorkflowScript(): string {
+  const integrated = path.join(
+    __dirname,
+    "..",
+    "..",
+    "..",
+    "automation",
+    "workflow.py"
+  );
+  if (fs.existsSync(integrated)) return integrated;
+  return path.join(
+    os.homedir(),
+    "blue",
+    "infra",
+    "cursor",
+    "automation",
+    "workflow.py"
+  );
+}
+
+const WORKFLOW_SCRIPT = defaultWorkflowScript();
 
 let workflowProc: ChildProcess | undefined;
 /** undefined = not probed yet, null = no python found, string = the command. */
