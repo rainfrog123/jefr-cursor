@@ -72,10 +72,12 @@
 		"package": "npm run compile && npx @vscode/vsce package --no-dependencies"
 	},
 	"dependencies": {
-		"@modelcontextprotocol/sdk": "^1.12.1"
+		"@modelcontextprotocol/sdk": "^1.12.1",
+		"ws": "^8.18.0"
 	},
 	"devDependencies": {
 		"@types/node": "^20.0.0",
+		"@types/ws": "^8.5.10",
 		"@types/react": "^18.2.0",
 		"@types/react-dom": "^18.2.0",
 		"@types/vscode": "^1.80.0",

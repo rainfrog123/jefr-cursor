@@ -92,9 +92,10 @@ export interface Attachment {
 export interface LiveAgentInfo {
   /** The agent's stable id (its Cursor agentId / chat UUID). */
   id: string;
-  /** Fresh heartbeat within the stale window. */
+  /** Fresh heartbeat within the stale window (or CDP MCP connection). */
   connected: boolean;
-  state: "waiting" | "working" | "idle";
+  /** Agent state from CDP: mcp_connected, generating, planning, idle; or legacy: waiting, working. */
+  state: "waiting" | "working" | "idle" | "mcp_connected" | "generating" | "planning";
   /** Pending messages currently queued for this agent. */
   queueCount: number;
   /** Times it came online (first connect + each reconnect). */
@@ -103,6 +104,10 @@ export interface LiveAgentInfo {
   reconnectCount: number;
   /** Epoch ms the current connection began (0 when disconnected). */
   connectedSince: number;
+  /** Model name from CDP (if available). */
+  model?: string;
+  /** Tile index from CDP (if available). */
+  tileIndex?: number;
 }
 
 /** Cursor usage info returned by `fetchUsage`. */
@@ -146,6 +151,10 @@ export type InboundMessage =
       agents: LiveAgentInfo[];
       selected: string | null;
       autoReconnect: boolean;
+      /** Max agents the UI manages (slot count). */
+      targetAgentCount?: number;
+      /** True when CDP real-time monitoring is active. */
+      cdpConnected?: boolean;
     }
   | { type: "agentSelected"; agentId: string | null };
 
@@ -181,9 +190,22 @@ export type OutboundMessage =
       opusPrompt?: string;
       maxSecs?: number;
       enterInterval?: number;
+      model?: string;
+      /** Keep already-open tiles so spawns accumulate agents (default true). */
+      keepTiles?: boolean;
+    }
+  | {
+      type: "reconnectWorkflow";
+      tile?: number;
+      opusPrompt?: string;
+      maxSecs?: number;
+      enterInterval?: number;
     }
   | { type: "stopWorkflow" }
   | { type: "getWorkflowState" }
   | { type: "selectAgent"; agentId?: string }
   | { type: "setAutoReconnect"; enabled: boolean }
-  | { type: "reconnectAgent"; agentId: string };
+  | { type: "reconnectAgent"; agentId: string }
+  | { type: "addAgent"; model?: string }
+  | { type: "deleteAgent"; agentId: string }
+  | { type: "focusAgent"; agentId: string };

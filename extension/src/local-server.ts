@@ -6,21 +6,23 @@ import * as path from "path";
 import type { IncomingMessage, ServerResponse, Server } from "http";
 import type { Socket } from "net";
 import {
-  readQuestion,
-  readReply,
-  getQueueCount,
-  readQueue,
-  sendText,
-  sendImage,
+  readQuestionFor,
+  readReplyFor,
+  getQueueCountFor,
+  readQueueFor,
+  sendTextTo,
+  sendImageTo,
   pushHistoryItem,
   readSharedHistory,
   appendSharedHistory,
-  writeAnswer,
-  cancelQuestion,
-  clearReply,
-  getAgentStatus,
-  deleteQueueItem,
-  clearQueue,
+  appendReplyToSharedHistory,
+  writeAnswerFor,
+  cancelQuestionFor,
+  clearReplyFor,
+  getAgentStatusFor,
+  deleteQueueItemFor,
+  clearQueueFor,
+  readSelectedAgentId,
 } from "./messenger";
 
 /** Decode a `data:` URL into a temp file and queue it as an image message.
@@ -34,7 +36,7 @@ function handlePastedImage(dataUrl: string, caption?: string): boolean {
     const buf = Buffer.from(match[2], "base64");
     const tmpPath = path.join(os.tmpdir(), `jefr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`);
     fs.writeFileSync(tmpPath, buf);
-    const item = sendImage(tmpPath, caption);
+    const item = sendImageTo(targetAgentId(), tmpPath, caption);
     // Echo into the panel history with the inline data so it shows a thumbnail.
     pushHistoryItem({ ...item, dataUrl });
     // Record in the shared history so all front-ends can render it.
@@ -72,9 +74,21 @@ let serverPort = 0;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let lastPushState = "";
 let _workspaceInfo: WorkspaceInfo = { name: "", path: "" };
+/** Mirrors the jefr panel's Agent Picker — Obsidian sends follow this target. */
+let _selectedAgentId: string | undefined;
 
 export function setWorkspaceInfo(name: string, wsPath: string): void {
   _workspaceInfo = { name, path: wsPath };
+}
+
+export function setSelectedAgentId(agentId?: string): void {
+  _selectedAgentId = agentId && agentId.trim() ? agentId.trim() : undefined;
+  lastPushState = "";
+  broadcastStateNow();
+}
+
+function targetAgentId(): string | undefined {
+  return _selectedAgentId || readSelectedAgentId();
 }
 
 export function getServerPort(): number {
@@ -158,21 +172,23 @@ function handleHttp(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
   if (req.url === "/api/status" && req.method === "GET") {
-    const q = readQuestion();
-    const reply = readReply();
+    const aid = targetAgentId();
+    const q = readQuestionFor(aid);
+    const reply = readReplyFor(aid);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
         cardActive: true,
         cardCode: null,
         cardExpiresAt: null,
-        queueCount: getQueueCount(),
-        queue: readQueue(),
+        queueCount: getQueueCountFor(aid),
+        queue: readQueueFor(aid),
         hasQuestion: !!q,
         hasReply: !!reply,
         workspace: _workspaceInfo,
         wsClients: wsClients.length,
-        agent: getAgentStatus(),
+        agent: getAgentStatusFor(aid),
+        selectedAgentId: aid || null,
         port: serverPort,
       })
     );
@@ -187,10 +203,17 @@ function handleHttp(req: IncomingMessage, res: ServerResponse): void {
       try {
         const data = JSON.parse(body);
         if (data.text) {
-          pushHistoryItem(sendText(data.text));
+          const aid = targetAgentId();
+          const item = sendTextTo(aid, data.text);
+          pushHistoryItem({
+            id: item.id,
+            type: "text",
+            content: data.text,
+            timestamp: item.timestamp,
+          });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true }));
-          broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+          broadcastWs({ type: "queueUpdate", count: getQueueCountFor(aid) });
           broadcastStateNow();
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
@@ -274,15 +297,22 @@ function seenCid(cid: unknown): boolean {
 function handleWsMessage(client: WsClient, raw: string): void {
   try {
     const msg = JSON.parse(raw);
+    const aid = targetAgentId();
     switch (msg.type) {
       case "sendText":
         if (msg.text) {
           // De-dupe resends by client id; always ack so the client stops resending.
           if (!seenCid(msg.cid)) {
-            pushHistoryItem(sendText(msg.text));
+            const item = sendTextTo(aid, msg.text);
+            pushHistoryItem({
+              id: item.id,
+              type: "text",
+              content: msg.text,
+              timestamp: item.timestamp,
+            });
           }
           if (msg.cid) wsSend(client.socket, JSON.stringify({ type: "sendAck", cid: msg.cid }));
-          broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+          broadcastWs({ type: "queueUpdate", count: getQueueCountFor(aid) });
           broadcastStateNow();
         }
         break;
@@ -291,32 +321,32 @@ function handleWsMessage(client: WsClient, raw: string): void {
           const fresh = !seenCid(msg.cid);
           if (!fresh || handlePastedImage(msg.dataUrl, msg.caption)) {
             if (msg.cid) wsSend(client.socket, JSON.stringify({ type: "sendAck", cid: msg.cid }));
-            broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+            broadcastWs({ type: "queueUpdate", count: getQueueCountFor(aid) });
             broadcastStateNow();
           }
         }
         break;
       case "submitAnswer":
         if (msg.data) {
-          writeAnswer(msg.data);
+          writeAnswerFor(msg.data, aid);
         }
         break;
       case "cancelQuestion":
-        cancelQuestion();
+        cancelQuestionFor(aid);
         break;
       case "ackReply":
-        clearReply();
+        clearReplyFor(aid);
         break;
       case "deleteQueueItem":
         if (msg.id) {
-          deleteQueueItem(msg.id);
-          broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+          deleteQueueItemFor(msg.id, aid);
+          broadcastWs({ type: "queueUpdate", count: getQueueCountFor(aid) });
           broadcastStateNow();
         }
         break;
       case "clearQueue":
-        clearQueue();
-        broadcastWs({ type: "queueUpdate", count: getQueueCount() });
+        clearQueueFor(aid);
+        broadcastWs({ type: "queueUpdate", count: getQueueCountFor(aid) });
         broadcastStateNow();
         break;
       case "ping":
@@ -429,18 +459,20 @@ function wsSendRaw(socket: Socket, buf: Buffer): void {
 }
 
 function buildPushState() {
+  const aid = targetAgentId();
   return {
     cardActive: true,
     cardCode: null,
     cardExpiresAt: null,
-    queueCount: getQueueCount(),
-    queue: readQueue(),
-    question: readQuestion(),
-    reply: readReply(),
+    queueCount: getQueueCountFor(aid),
+    queue: readQueueFor(aid),
+    question: readQuestionFor(aid),
+    reply: readReplyFor(aid),
     history: readSharedHistory(),
     workspace: _workspaceInfo,
     wsClients: wsClients.length,
-    agent: getAgentStatus(),
+    agent: getAgentStatusFor(aid),
+    selectedAgentId: aid || null,
     port: serverPort,
   };
 }
@@ -454,25 +486,14 @@ function broadcastStateNow(): void {
   broadcastWs({ type: "stateUpdate", ...JSON.parse(state) });
 }
 
-let lastSyncedReplyTs = "";
-
 /** Mirror a new final reply (no percent) into the shared history. The extension
  *  is the SINGLE writer of history.json, so doing this here (rather than in the
  *  separate MCP server process) avoids lost-write races that dropped messages. */
 function syncReplyToHistory(): void {
   try {
-    const reply = readReply();
+    const reply = readReplyFor(targetAgentId());
     if (!reply || !reply.content) return;
-    const ts = reply.timestamp || "";
-    if (ts === lastSyncedReplyTs) return;
-    lastSyncedReplyTs = ts;
-    if (typeof (reply as { percent?: number }).percent === "number") return; // progress, not a reply bubble
-    appendSharedHistory({
-      id: "r-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
-      kind: "reply",
-      text: reply.content,
-      timestamp: ts || new Date().toISOString(),
-    });
+    appendReplyToSharedHistory(reply);
   } catch {
     // best-effort
   }

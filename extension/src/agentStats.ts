@@ -10,6 +10,9 @@ export interface AgentStat {
   connectCount: number;
   /** Times the host triggered a reconnect for it. */
   reconnectCount: number;
+  /** Reconnect attempts since the last successful landing (resets on connect).
+   *  Used to cap futile reconnects so a dead tile can't be re-primed forever. */
+  reconnectsSinceConnect: number;
   connected: boolean;
   /** Epoch ms the current connection began (0 when disconnected). */
   connectedSince: number;
@@ -22,6 +25,17 @@ export interface RosterEntry {
   connected: boolean;
   state: "waiting" | "working" | "idle";
   queueCount: number;
+  /** Epoch ms of this agent's last heartbeat (0 when none). Survives extension
+   *  restarts, so it's the source of truth for how long an agent has been gone. */
+  ts: number;
+}
+
+export interface ReconcileOpts {
+  /** Forget (drop from the roster) disconnected agents whose last heartbeat is
+   *  older than this — they're tombstones from closed tabs / past sessions. */
+  forgetMs: number;
+  /** Max auto-reconnect attempts between successful landings before giving up. */
+  maxReconnects: number;
 }
 
 export interface AgentView extends RosterEntry {
@@ -34,6 +48,7 @@ export function newStat(): AgentStat {
   return {
     connectCount: 0,
     reconnectCount: 0,
+    reconnectsSinceConnect: 0,
     connected: false,
     connectedSince: 0,
     lastSeen: 0,
@@ -43,14 +58,25 @@ export function newStat(): AgentStat {
 
 /**
  * Fold the current roster into the persistent stats map (mutating it), and
- * return the panel views plus the ids of agents that have DROPPED (were
- * connected at least once and are now down) and therefore may need reconnecting.
+ * return:
+ *  - `views`:   the agents to show — connected ones plus *recently* dropped ones.
+ *  - `dropped`: ids eligible for auto-reconnect (recently dropped, connected at
+ *               least once, and under the attempt cap).
+ *  - `prune`:   tombstone ids to forget — disconnected past the forget window or
+ *               junk dirs that never produced a heartbeat. The host removes their
+ *               stats (and optionally their on-disk dir) so they stop lingering
+ *               and stop driving reconnects.
  */
 export function reconcile(
   roster: RosterEntry[],
   stats: Map<string, AgentStat>,
   now: number,
-): { views: AgentView[]; dropped: string[] } {
+  opts: ReconcileOpts,
+): { views: AgentView[]; dropped: string[]; prune: string[] } {
+  const views: AgentView[] = [];
+  const dropped: string[] = [];
+  const prune: string[] = [];
+
   for (const r of roster) {
     let s = stats.get(r.id);
     if (!s) {
@@ -62,21 +88,27 @@ export function reconcile(
         s.connected = true;
         s.connectCount++;
         s.connectedSince = now;
+        s.reconnectsSinceConnect = 0; // a fresh landing clears the attempt cap
       }
       s.lastSeen = now;
     } else if (s.connected) {
       s.connected = false;
       s.connectedSince = 0;
     }
-  }
 
-  const dropped = roster
-    .filter((r) => !r.connected && (stats.get(r.id)?.connectCount ?? 0) > 0)
-    .map((r) => r.id);
+    // Best estimate of when this agent was last alive: its heartbeat timestamp
+    // (survives extension restarts) or the last time we saw it fresh.
+    const lastAlive = r.ts > 0 ? Math.max(r.ts, s.lastSeen) : s.lastSeen;
 
-  const views: AgentView[] = roster.map((r) => {
-    const s = stats.get(r.id)!;
-    return {
+    // Tombstone: disconnected and either never had a heartbeat or has been gone
+    // longer than the forget window. Drop it from the roster and report it for
+    // cleanup so it stops being shown and stops being reconnected.
+    if (!r.connected && (lastAlive === 0 || now - lastAlive > opts.forgetMs)) {
+      prune.push(r.id);
+      continue;
+    }
+
+    views.push({
       id: r.id,
       connected: r.connected,
       state: r.state,
@@ -84,10 +116,20 @@ export function reconcile(
       connectCount: s.connectCount,
       reconnectCount: s.reconnectCount,
       connectedSince: r.connected ? s.connectedSince : 0,
-    };
-  });
+    });
 
-  return { views, dropped };
+    // Eligible for auto-reconnect: recently dropped, has connected before, and
+    // hasn't exhausted the attempt cap since its last successful landing.
+    if (
+      !r.connected &&
+      s.connectCount > 0 &&
+      s.reconnectsSinceConnect < opts.maxReconnects
+    ) {
+      dropped.push(r.id);
+    }
+  }
+
+  return { views, dropped, prune };
 }
 
 /** Pick the first dropped agent whose last reconnect attempt is older than the

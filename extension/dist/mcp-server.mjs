@@ -31011,11 +31011,36 @@ async function touchAgentAlive(dir, state, agentId) {
 var activeWaits = 0;
 var lastInteractionTs = Date.now();
 var BUSY_WINDOW_MS = Number(process.env.MESSENGER_BUSY_WINDOW_MS) || 18e4;
+var agentLiveness = /* @__PURE__ */ new Map();
+function livenessKey(agentId) {
+  return sanitizeAgentId(agentId);
+}
+function noteAgentInteraction(dir, agentId) {
+  const key = livenessKey(agentId);
+  let rec = agentLiveness.get(key);
+  if (!rec) {
+    rec = { dir, lastInteractionTs: 0, activeWaits: 0 };
+    agentLiveness.set(key, rec);
+  }
+  rec.dir = dir;
+  rec.lastInteractionTs = Date.now();
+  return rec;
+}
 var livenessTicker = setInterval(() => {
+  const now = Date.now();
   if (activeWaits > 0) {
     void touchAgentAlive(DATA_DIR, "waiting");
-  } else if (Date.now() - lastInteractionTs < BUSY_WINDOW_MS) {
+  } else if (now - lastInteractionTs < BUSY_WINDOW_MS) {
     void touchAgentAlive(DATA_DIR, "working");
+  }
+  for (const [key, rec] of agentLiveness) {
+    if (!key)
+      continue;
+    if (rec.activeWaits > 0)
+      continue;
+    if (now - rec.lastInteractionTs < BUSY_WINDOW_MS) {
+      void touchAgentAlive(rec.dir, "working", key);
+    }
   }
 }, 2500);
 livenessTicker.unref?.();
@@ -31032,9 +31057,10 @@ var delay = (ms) => new Promise((r) => setTimeout(r, ms));
 async function acquireQueueLock(dir, timeoutMs = 2e3) {
   const lock = queueLockDir(dir);
   const start = Date.now();
+  await ensureDir(dir);
   for (; ; ) {
     try {
-      await fs.mkdir(lock, { recursive: true });
+      await fs.mkdir(lock);
       return true;
     } catch {
       try {
@@ -31079,21 +31105,38 @@ async function robustWriteFile(file2, data) {
 }
 async function drainQueue(dir) {
   const peek = await readQueue(dir);
-  if (peek.length === 0) {
-    return [];
-  }
-  const locked = await acquireQueueLock(dir);
-  try {
-    const queue = await readQueue(dir);
-    if (queue.length > 0) {
-      await robustWriteFile(queueFile(dir), "[]");
+  if (peek.length > 0) {
+    const locked = await acquireQueueLock(dir);
+    try {
+      const queue = await readQueue(dir);
+      if (queue.length > 0) {
+        await robustWriteFile(queueFile(dir), "[]");
+      }
+      return queue;
+    } finally {
+      if (locked) {
+        await releaseQueueLock(dir);
+      }
     }
-    return queue;
-  } finally {
-    if (locked) {
-      await releaseQueueLock(dir);
+  }
+  if (dir !== DATA_DIR) {
+    const rootPeek = await readQueue(DATA_DIR);
+    if (rootPeek.length > 0) {
+      const locked = await acquireQueueLock(DATA_DIR);
+      try {
+        const queue = await readQueue(DATA_DIR);
+        if (queue.length > 0) {
+          await robustWriteFile(queueFile(DATA_DIR), "[]");
+        }
+        return queue;
+      } finally {
+        if (locked) {
+          await releaseQueueLock(DATA_DIR);
+        }
+      }
     }
   }
+  return [];
 }
 function sleepWithAbort(signal, ms) {
   if (signal.aborted)
@@ -31281,6 +31324,7 @@ server.tool(
   async ({ reply, agent_id }, extra) => {
     const dir = dirFor(agent_id);
     await ensureDir(dir);
+    const live = noteAgentInteraction(dir, agent_id);
     await appendServerLog("info", `check_messages started${agent_id ? ` (agent ${sanitizeAgentId(agent_id)})` : ""}`);
     if (reply) {
       await fs.writeFile(
@@ -31290,6 +31334,7 @@ server.tool(
       );
     }
     activeWaits++;
+    live.activeWaits++;
     await touchAgentAlive(dir, "waiting", agent_id);
     try {
       const waitStart = Date.now();
@@ -31353,6 +31398,8 @@ server.tool(
       };
     } finally {
       activeWaits--;
+      live.activeWaits--;
+      live.lastInteractionTs = Date.now();
       lastInteractionTs = Date.now();
     }
   }
@@ -31368,6 +31415,7 @@ server.tool(
   async ({ progress, percent, agent_id }) => {
     const dir = dirFor(agent_id);
     await ensureDir(dir);
+    noteAgentInteraction(dir, agent_id);
     lastInteractionTs = Date.now();
     await touchAgentAlive(dir, "working", agent_id);
     const payload = {
@@ -31409,6 +31457,7 @@ server.tool(
   async ({ questions, agent_id }, extra) => {
     const dir = dirFor(agent_id);
     await ensureDir(dir);
+    const live = noteAgentInteraction(dir, agent_id);
     await appendServerLog("info", `ask_question started${agent_id ? ` (agent ${sanitizeAgentId(agent_id)})` : ""}`);
     const questionItems = questions.map((q, i) => ({
       id: "q" + i,
@@ -31427,6 +31476,7 @@ server.tool(
     } catch {
     }
     activeWaits++;
+    live.activeWaits++;
     await touchAgentAlive(dir, "waiting", agent_id);
     try {
       const waitStart = Date.now();
@@ -31510,6 +31560,8 @@ server.tool(
       };
     } finally {
       activeWaits--;
+      live.activeWaits--;
+      live.lastInteractionTs = Date.now();
       lastInteractionTs = Date.now();
     }
   }

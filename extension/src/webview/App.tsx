@@ -66,7 +66,9 @@ export function App(): JSX.Element {
 
   const [agents, setAgents] = useState<LiveAgentInfo[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-  const [autoReconnect, setAutoReconnect] = useState(true);
+  const [autoReconnect, setAutoReconnect] = useState(false);
+  const [targetAgentCount, setTargetAgentCount] = useState(5);
+  const [cdpConnected, setCdpConnected] = useState<boolean | undefined>(undefined);
 
   /* Route messages coming from the extension host. */
   useEffect(() => {
@@ -146,6 +148,8 @@ export function App(): JSX.Element {
           setAgents(msg.agents);
           setSelectedAgentId(msg.selected);
           setAutoReconnect(msg.autoReconnect);
+          if (msg.targetAgentCount != null) setTargetAgentCount(msg.targetAgentCount);
+          if (msg.cdpConnected !== undefined) setCdpConnected(msg.cdpConnected);
           break;
         case "agentSelected":
           setSelectedAgentId(msg.agentId);
@@ -221,7 +225,7 @@ export function App(): JSX.Element {
           current={tab}
           onClick={switchTab}
           label="Agents"
-          badge={agents.length}
+          badge={agents.filter((a) => a.connected).length}
         />
         <TabButton id="general" current={tab} onClick={switchTab} label="General" />
       </div>
@@ -243,6 +247,9 @@ export function App(): JSX.Element {
           agents={agents}
           selectedAgentId={selectedAgentId}
           autoReconnect={autoReconnect}
+          targetAgentCount={targetAgentCount}
+          cdpConnected={cdpConnected}
+          workflowRunning={workflowRunning}
           onSelectAgent={onSelectAgent}
         />
       )}
@@ -295,6 +302,7 @@ function AgentPicker(props: {
   }
 
   const shortId = (id: string) => id.slice(0, 8);
+  const connectedCount = agents.filter((a) => a.connected).length;
 
   return (
     <div className="agent-picker">
@@ -307,13 +315,13 @@ function AgentPicker(props: {
         <option value="">All (shared)</option>
         {agents.map((a) => (
           <option key={a.id} value={a.id}>
-            {shortId(a.id)} · {a.state}
+            {shortId(a.id)} · {a.connected ? a.state : "down"}
             {a.queueCount ? ` · ${a.queueCount} queued` : ""}
           </option>
         ))}
       </select>
       <span className="agent-picker-count">
-        {agents.length} live
+        {connectedCount} live
       </span>
     </div>
   );

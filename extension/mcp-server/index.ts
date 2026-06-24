@@ -145,19 +145,61 @@ async function touchAgentAlive(
 }
 
 // ── Background liveness ticker ──────────────────────────────────────────────
-// One shared process serves every agent tile, so the global counters below only
-// drive the *root* heartbeat (legacy single-listener case). Per-agent liveness
-// is refreshed by each blocked call itself (see check_messages/ask_question),
-// which keeps each agent's heartbeat warm independently.
+// One shared process serves every agent tile. The legacy globals below drive the
+// *root* heartbeat (single-listener case). For multi-agent, each agent gets its
+// own liveness record so the ticker can keep that agent's heartbeat warm as
+// "working" *during a task* — the stretch between finishing check_messages and
+// the next tool call, when nothing else refreshes it. Without this the per-agent
+// heartbeat goes stale after the 6s window, the panel flips the agent to "down"
+// mid-task, and its uptime counter restarts on the next call.
 let activeWaits = 0;
 let lastInteractionTs = Date.now();
 const BUSY_WINDOW_MS = Number(process.env.MESSENGER_BUSY_WINDOW_MS) || 180_000;
 
+/** Per-agent liveness, keyed by sanitized agent id ("" = root single-listener). */
+interface AgentLiveness {
+  dir: string;
+  lastInteractionTs: number;
+  /** >0 while this agent is blocked in check_messages/ask_question. */
+  activeWaits: number;
+}
+const agentLiveness = new Map<string, AgentLiveness>();
+
+function livenessKey(agentId?: string): string {
+  return sanitizeAgentId(agentId);
+}
+
+/** Record that this agent just interacted, so the ticker keeps it warm as
+ *  "working" through the next BUSY_WINDOW_MS of tool-call-free task time. */
+function noteAgentInteraction(dir: string, agentId?: string): AgentLiveness {
+  const key = livenessKey(agentId);
+  let rec = agentLiveness.get(key);
+  if (!rec) {
+    rec = { dir, lastInteractionTs: 0, activeWaits: 0 };
+    agentLiveness.set(key, rec);
+  }
+  rec.dir = dir;
+  rec.lastInteractionTs = Date.now();
+  return rec;
+}
+
 const livenessTicker = setInterval(() => {
+  const now = Date.now();
+  // Legacy root heartbeat (single-listener case).
   if (activeWaits > 0) {
     void touchAgentAlive(DATA_DIR, "waiting");
-  } else if (Date.now() - lastInteractionTs < BUSY_WINDOW_MS) {
+  } else if (now - lastInteractionTs < BUSY_WINDOW_MS) {
     void touchAgentAlive(DATA_DIR, "working");
+  }
+  // Per-agent: keep each recently-active agent warm as "working" while it's
+  // mid-task. Agents currently blocked-waiting refresh their own "waiting"
+  // heartbeat, so skip them here to avoid clobbering that state.
+  for (const [key, rec] of agentLiveness) {
+    if (!key) continue; // root is handled by the legacy globals above
+    if (rec.activeWaits > 0) continue; // blocked call keeps it warm as "waiting"
+    if (now - rec.lastInteractionTs < BUSY_WINDOW_MS) {
+      void touchAgentAlive(rec.dir, "working", key);
+    }
   }
 }, 2500);
 // Don't let the ticker alone keep the process alive.
@@ -180,9 +222,10 @@ const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function acquireQueueLock(dir: string, timeoutMs = 2000): Promise<boolean> {
   const lock = queueLockDir(dir);
   const start = Date.now();
+  await ensureDir(dir);
   for (;;) {
     try {
-      await fs.mkdir(lock, { recursive: true });
+      await fs.mkdir(lock);
       return true;
     } catch {
       try {
@@ -234,24 +277,50 @@ async function robustWriteFile(file: string, data: string): Promise<void> {
  * Atomically take ALL pending messages and clear the queue under the shared
  * lock, so a concurrent send from the extension can't be lost between our read
  * and clear. A lock-free peek avoids lock churn on the common empty case.
+ *
+ * Multi-agent fix: when reading from an agent-specific directory, also check
+ * the shared root queue as a fallback. This allows messages sent to the root
+ * queue (e.g., from Obsidian) to reach specific agents.
  */
 async function drainQueue(dir: string): Promise<QueueMessage[]> {
+  // First check the agent-specific queue
   const peek = await readQueue(dir);
-  if (peek.length === 0) {
-    return [];
-  }
-  const locked = await acquireQueueLock(dir);
-  try {
-    const queue = await readQueue(dir);
-    if (queue.length > 0) {
-      await robustWriteFile(queueFile(dir), "[]");
+  if (peek.length > 0) {
+    const locked = await acquireQueueLock(dir);
+    try {
+      const queue = await readQueue(dir);
+      if (queue.length > 0) {
+        await robustWriteFile(queueFile(dir), "[]");
+      }
+      return queue;
+    } finally {
+      if (locked) {
+        await releaseQueueLock(dir);
+      }
     }
-    return queue;
-  } finally {
-    if (locked) {
-      await releaseQueueLock(dir);
+  }
+
+  // Fallback: check the shared root queue (for Obsidian plugin, etc.)
+  // Only do this if we're reading from an agent-specific directory
+  if (dir !== DATA_DIR) {
+    const rootPeek = await readQueue(DATA_DIR);
+    if (rootPeek.length > 0) {
+      const locked = await acquireQueueLock(DATA_DIR);
+      try {
+        const queue = await readQueue(DATA_DIR);
+        if (queue.length > 0) {
+          await robustWriteFile(queueFile(DATA_DIR), "[]");
+        }
+        return queue;
+      } finally {
+        if (locked) {
+          await releaseQueueLock(DATA_DIR);
+        }
+      }
     }
   }
+
+  return [];
 }
 
 /** Resolves true after `ms`, or false immediately if the signal aborts. */
@@ -450,6 +519,7 @@ server.tool(
   async ({ reply, agent_id }, extra) => {
     const dir = dirFor(agent_id);
     await ensureDir(dir);
+    const live = noteAgentInteraction(dir, agent_id);
     await appendServerLog("info", `check_messages started${agent_id ? ` (agent ${sanitizeAgentId(agent_id)})` : ""}`);
 
     // 1) If the agent included a reply, surface it in the panel immediately.
@@ -463,6 +533,7 @@ server.tool(
 
     // 2) Block, polling the queue, until a message arrives (or we time out).
     activeWaits++;
+    live.activeWaits++;
     await touchAgentAlive(dir, "waiting", agent_id);
     try {
       const waitStart = Date.now();
@@ -533,6 +604,8 @@ server.tool(
       };
     } finally {
       activeWaits--;
+      live.activeWaits--;
+      live.lastInteractionTs = Date.now();
       lastInteractionTs = Date.now();
     }
   },
@@ -560,6 +633,7 @@ server.tool(
   async ({ progress, percent, agent_id }) => {
     const dir = dirFor(agent_id);
     await ensureDir(dir);
+    noteAgentInteraction(dir, agent_id);
     lastInteractionTs = Date.now();
     await touchAgentAlive(dir, "working", agent_id);
     const payload: Record<string, unknown> = {
@@ -609,6 +683,7 @@ server.tool(
   async ({ questions, agent_id }, extra) => {
     const dir = dirFor(agent_id);
     await ensureDir(dir);
+    const live = noteAgentInteraction(dir, agent_id);
     await appendServerLog("info", `ask_question started${agent_id ? ` (agent ${sanitizeAgentId(agent_id)})` : ""}`);
 
     // 1) Write the question for the panel; give each question a stable id.
@@ -632,6 +707,7 @@ server.tool(
 
     // 2) Block, polling for the answer file (or time out).
     activeWaits++;
+    live.activeWaits++;
     await touchAgentAlive(dir, "waiting", agent_id);
     try {
     const waitStart = Date.now();
@@ -715,6 +791,8 @@ server.tool(
     };
     } finally {
       activeWaits--;
+      live.activeWaits--;
+      live.lastInteractionTs = Date.now();
       lastInteractionTs = Date.now();
     }
   },

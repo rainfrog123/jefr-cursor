@@ -1,30 +1,31 @@
 :root {
-	--bg: var(--vscode-editor-background, #1e1e1e);
-	--fg: var(--vscode-editor-foreground, #e8e8e8);
-	--fg-secondary: color-mix(in srgb, var(--fg) 78%, transparent);
-	--fg-muted: color-mix(in srgb, var(--fg) 58%, transparent);
-	--border: color-mix(in srgb, var(--fg) 14%, transparent);
-	--border-strong: color-mix(in srgb, var(--fg) 22%, transparent);
-	--input-bg: var(--vscode-input-background, #2d2d2d);
-	--input-fg: var(--vscode-input-foreground, #f0f0f0);
-	--btn-bg: var(--vscode-button-background, #0e639c);
+	--bg: var(--vscode-sideBar-background, var(--vscode-editor-background, #ffffff));
+	--fg: var(--vscode-foreground, #3b3b3b);
+	--fg-secondary: color-mix(in srgb, var(--fg) 72%, transparent);
+	--fg-muted: color-mix(in srgb, var(--fg) 52%, transparent);
+	--border: var(--vscode-panel-border, color-mix(in srgb, var(--fg) 12%, transparent));
+	--border-strong: color-mix(in srgb, var(--fg) 18%, transparent);
+	--input-bg: var(--vscode-input-background, #f3f3f3);
+	--input-fg: var(--vscode-input-foreground, #3b3b3b);
+	--btn-bg: var(--vscode-button-background, #0066b8);
 	--btn-fg: var(--vscode-button-foreground, #ffffff);
-	--btn-hover: var(--vscode-button-hoverBackground, #1177bb);
-	--btn-secondary-bg: var(--vscode-button-secondaryBackground, #3a3d41);
-	--btn-secondary-fg: var(--vscode-button-secondaryForeground, #ececec);
-	--badge-bg: var(--vscode-badge-background, #4d4d4d);
-	--badge-fg: var(--vscode-badge-foreground, #ffffff);
-	--focus-border: var(--vscode-focusBorder, #007fd4);
-	--overlay-bg: rgba(0, 0, 0, 0.62);
-	--accent: #8b7cf8;
-	--accent-strong: #a78bfa;
-	--accent-soft: rgba(139, 124, 248, 0.16);
-	--success: #4ade80;
-	--danger: #f87171;
-	--radius: 12px;
-	--radius-sm: 8px;
-	--shadow-sm: 0 1px 2px rgba(0,0,0,0.24);
-	--shadow-md: 0 8px 24px rgba(0,0,0,0.35);
+	--btn-hover: var(--vscode-button-hoverBackground, #005a9e);
+	--btn-secondary-bg: var(--vscode-button-secondaryBackground, #e8e8e8);
+	--btn-secondary-fg: var(--vscode-button-secondaryForeground, #3b3b3b);
+	--badge-bg: var(--vscode-badge-background, #cccccc);
+	--badge-fg: var(--vscode-badge-foreground, #333333);
+	--focus-border: var(--vscode-focusBorder, #0066b8);
+	--overlay-bg: rgba(0, 0, 0, 0.45);
+	--accent: var(--vscode-textLink-foreground, #0066b8);
+	--accent-strong: var(--vscode-textLink-activeForeground, #005a9e);
+	--accent-soft: color-mix(in srgb, var(--accent) 10%, transparent);
+	--success: var(--vscode-charts-green, #388a34);
+	--danger: var(--vscode-errorForeground, #cd3131);
+	--warning: var(--vscode-editorWarning-foreground, #bf8803);
+	--radius: 10px;
+	--radius-sm: 6px;
+	--shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
+	--shadow-md: 0 4px 16px rgba(0,0,0,0.08);
 	--font-ui: var(--vscode-font-family, 'Segoe UI', system-ui, -apple-system, sans-serif);
 	--font-mono: var(--vscode-editor-font-family, 'Cascadia Code', 'Consolas', 'Courier New', monospace);
 	--text-xs: 12px;
@@ -70,11 +71,11 @@ body {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
-	padding: 12px 16px;
-	background: color-mix(in srgb, var(--input-bg) 88%, var(--accent) 12%);
-	border: 1px solid var(--border-strong);
+	padding: 10px 14px;
+	background: var(--input-bg);
+	border: 1px solid var(--border);
 	border-radius: var(--radius);
-	margin-bottom: 12px;
+	margin-bottom: 10px;
 	flex-shrink: 0;
 	order: 0;
 	box-shadow: var(--shadow-sm);
@@ -1512,6 +1513,48 @@ input:focus-visible {
 	color: var(--fg-muted);
 }
 
+.workflow-model-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin: 2px 0 2px;
+}
+.workflow-keep-tiles {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin: 2px 0 4px;
+	font-size: var(--text-xs);
+	color: var(--fg-secondary);
+	cursor: pointer;
+	user-select: none;
+}
+.workflow-keep-tiles input {
+	cursor: pointer;
+}
+.workflow-model-label {
+	font-size: var(--text-xs);
+	font-weight: 600;
+	color: var(--fg-secondary);
+	letter-spacing: 0.02em;
+}
+.workflow-model-select {
+	flex: 1;
+	min-width: 0;
+	padding: 6px 10px;
+	background: var(--input-bg);
+	color: var(--input-fg);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	font-family: var(--font-ui);
+	font-size: var(--text-sm);
+	outline: none;
+}
+.workflow-model-select:focus {
+	border-color: var(--accent);
+	box-shadow: 0 0 0 3px rgba(124,107,245,0.15);
+}
+
 .workflow-row {
 	display: flex;
 	align-items: center;
@@ -2177,84 +2220,243 @@ input:focus-visible {
 .agent-picker {
 	display: flex;
 	align-items: center;
-	gap: 8px;
-	padding: 6px 10px;
-	border-bottom: 1px solid var(--border);
-	background: color-mix(in srgb, var(--accent-soft) 60%, transparent);
+	gap: 7px;
+	padding: 5px 2px 8px;
+	border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+	background: transparent;
 	font-size: var(--text-xs);
 }
 .agent-picker-label {
 	color: var(--fg-secondary);
 	font-weight: 600;
-	letter-spacing: 0.02em;
+	letter-spacing: 0.01em;
 }
 .agent-picker-select {
 	flex: 1;
 	min-width: 0;
-	background: var(--input-bg);
+	background: color-mix(in srgb, var(--input-bg) 72%, var(--bg));
 	color: var(--input-fg);
-	border: 1px solid var(--border-strong);
+	border: 1px solid color-mix(in srgb, var(--border-strong) 78%, transparent);
 	border-radius: var(--radius-sm);
-	padding: 3px 6px;
+	padding: 4px 8px;
 	font-family: var(--font-mono);
 	font-size: var(--text-xs);
+	box-shadow: inset 0 1px 0 rgba(255,255,255,0.45);
 }
 .agent-picker-select:focus {
 	outline: none;
 	border-color: var(--focus-border);
+	box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent);
 }
 .agent-picker-count {
 	color: var(--fg-muted);
 	white-space: nowrap;
 }
 
-/* ── Agents manager (General tab) ───────────────────────────────────── */
-.agents-card {
-	margin: 8px;
-	padding: 10px;
-	border: 1px solid var(--border);
-	border-radius: var(--radius);
-	background: var(--input-bg);
-}
-.agents-head {
+/* ── Agents tab (redesigned) ─────────────────────────────────────────── */
+.agents-tab {
+	flex: 1;
+	overflow-y: auto;
+	padding: 0 2px 12px;
+	order: 5;
 	display: flex;
-	align-items: center;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.agents-hero {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
 	gap: 10px;
-	margin-bottom: 8px;
+	padding: 10px 10px;
+	border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+	border-radius: 8px;
+	background: color-mix(in srgb, var(--input-bg) 36%, var(--bg));
+	box-shadow: none;
 }
-.agents-title { font-weight: 700; }
-.agents-sub { color: var(--fg-muted); font-size: var(--text-xs); }
-.agents-auto {
-	margin-left: auto;
-	display: flex;
-	align-items: center;
-	gap: 4px;
+
+.agents-hero-title {
+	font-size: var(--text-sm);
+	font-weight: 700;
+	margin-bottom: 2px;
+	color: var(--fg);
+	letter-spacing: -0.01em;
+}
+
+.agents-hero-desc {
 	font-size: var(--text-xs);
 	color: var(--fg-secondary);
-	cursor: pointer;
+	line-height: 1.38;
+	max-width: 360px;
 }
-.agents-empty { color: var(--fg-muted); font-size: var(--text-xs); margin: 4px 0; }
-.agents-list { display: flex; flex-direction: column; gap: 6px; }
-.agent-row {
+
+.agents-hero-stats {
+	display: flex;
+	gap: 6px;
+	flex-shrink: 0;
+}
+
+.agents-stat {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	min-width: 44px;
+	padding: 5px 8px;
+	border-radius: 7px;
+	background: color-mix(in srgb, var(--bg) 82%, var(--input-bg));
+	border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+}
+
+.agents-stat-num {
+	font-size: var(--text-xs);
+	font-weight: 700;
+	font-family: var(--font-mono);
+	color: var(--fg);
+}
+
+.agents-stat-label {
+	font-size: 9px;
+	color: var(--fg-muted);
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+}
+
+.agents-stat.cdp.on .agents-stat-num { color: var(--success); }
+.agents-stat.cdp.off .agents-stat-num { color: var(--warning); }
+
+.agents-toolbar {
 	display: flex;
 	align-items: center;
 	gap: 8px;
-	padding: 6px 8px;
-	border: 1px solid var(--border);
-	border-radius: var(--radius-sm);
-	background: var(--bg);
-	font-size: var(--text-xs);
+	flex-wrap: wrap;
+	padding: 1px 2px;
+	min-height: 30px;
 }
-.agent-row.main { border-color: var(--accent-strong); background: var(--accent-soft); }
-.agent-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
-.agent-dot.off { background: var(--danger); }
-.agent-dot.on { background: var(--success); }
-.agent-dot.on.working { background: var(--accent-strong); }
-.agent-id { font-family: var(--font-mono); font-weight: 600; }
-.agent-meta { color: var(--fg-muted); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.agent-counts { font-family: var(--font-mono); color: var(--fg-secondary); }
-.agent-row-actions { display: flex; gap: 4px; flex: 0 0 auto; }
 
-/* ── Agents tab ─────────────────────────────────────────────────────── */
-.agents-tab { flex: 1; overflow-y: auto; padding: 4px 0; }
-.agents-tab .agents-card { margin: 8px; }
+.agents-toolbar .btn {
+	padding: 5px 10px;
+	border-radius: 7px;
+}
+
+.agents-slots-hint {
+	font-size: var(--text-xs);
+	color: var(--fg-muted);
+	margin-left: auto;
+}
+
+.agents-auto {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	font-size: var(--text-xs);
+	color: var(--fg-secondary);
+	cursor: pointer;
+	margin-left: auto;
+}
+
+.agents-slots {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.agent-slot {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-height: 46px;
+	padding: 7px 8px;
+	border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+	border-radius: 8px;
+	background: color-mix(in srgb, var(--bg) 94%, var(--input-bg));
+	font-size: var(--text-xs);
+	transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+
+.agent-slot:hover {
+	background: color-mix(in srgb, var(--input-bg) 32%, var(--bg));
+	border-color: color-mix(in srgb, var(--border-strong) 80%, transparent);
+}
+
+.agent-slot.empty {
+	border-style: dashed;
+	background: transparent;
+	opacity: 0.72;
+}
+
+.agent-slot.filled.main {
+	border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+	box-shadow: inset 2px 0 0 var(--accent);
+	background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+}
+
+.agent-slot-num {
+	font-family: var(--font-mono);
+	font-size: 9px;
+	font-weight: 700;
+	color: var(--fg-muted);
+	min-width: 14px;
+	text-align: center;
+}
+
+.agent-slot-label {
+	flex: 1;
+	color: var(--fg-muted);
+}
+
+.agent-slot-body {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+}
+
+.agent-slot-actions {
+	display: flex;
+	gap: 3px;
+	flex-shrink: 0;
+	opacity: 0.72;
+	transition: opacity 0.15s;
+}
+
+.agent-slot:hover .agent-slot-actions,
+.agent-slot.filled.main .agent-slot-actions {
+	opacity: 1;
+}
+
+.agent-slot-actions .btn {
+	min-width: 28px;
+	height: 28px;
+	padding: 0 8px;
+	border-radius: 7px;
+}
+
+.agent-model {
+	font-size: 10px;
+	color: var(--fg-muted);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.agents-empty-hint {
+	font-size: var(--text-xs);
+	color: var(--fg-muted);
+	padding: 8px 4px;
+	line-height: 1.5;
+}
+
+.agent-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+.agent-dot.off { background: color-mix(in srgb, var(--danger) 82%, var(--bg)); }
+.agent-dot.on { background: var(--success); }
+.agent-dot.on.working { background: color-mix(in srgb, var(--accent-strong) 88%, var(--success)); }
+.agent-dot.on.mcp { background: var(--success); animation: pulse 1.5s infinite; }
+.agent-dot.on.generating { background: var(--accent-strong); animation: pulse 0.8s infinite; }
+.agent-dot.on.planning { background: color-mix(in srgb, var(--warning) 88%, #f6d365); animation: pulse 1s infinite; }
+.agent-dot.on.waiting { background: var(--success); }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.agent-id { font-family: var(--font-mono); font-weight: 700; color: var(--fg); letter-spacing: -0.01em; }
+.agent-meta { color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -121,6 +121,44 @@ let QUEUE_LOCK_DIR = path.join(dataDir, "queue.lock");
 const RULES_FILE_NAME = "mcp-messenger.mdc";
 const LEGACY_RULES_FILE_NAME = "system.mdc";
 
+function selectedAgentFile(): string {
+  return path.join(dataDir, "selected-agent.json");
+}
+
+/** Read the agent id last chosen in the jefr panel Agent Picker. */
+export function readSelectedAgentId(): string | undefined {
+  const file = selectedAgentFile();
+  if (!fs.existsSync(file)) {
+    return undefined;
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    const id = typeof data.agentId === "string" ? sanitizeAgentId(data.agentId) : "";
+    return id || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Persist the panel's Agent Picker choice so Obsidian/local-server stay in sync. */
+export function writeSelectedAgentId(agentId?: string): void {
+  ensureDir();
+  const file = selectedAgentFile();
+  if (!agentId) {
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // ignore
+    }
+    return;
+  }
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ agentId: sanitizeAgentId(agentId), timestamp: new Date().toISOString() }),
+    "utf-8"
+  );
+}
+
 export function setDataDir(dir: string): void {
   dataDir = dir;
   QUEUE_FILE = path.join(dir, "queue.json");
@@ -251,11 +289,17 @@ const AGENT_STALE_MS = 6000;
  *  real agent is currently running the perpetual loop. This is the signal the
  *  WebSocket connection state cannot provide. */
 export function getAgentStatus(): AgentStatus {
+  return getAgentStatusFor(undefined);
+}
+
+/** Read heartbeat for a specific agent (or the shared root when blank). */
+export function getAgentStatusFor(agentId?: string): AgentStatus {
+  const file = path.join(agentDirFor(agentId), "agent-alive.json");
   try {
-    if (!fs.existsSync(HEARTBEAT_FILE)) {
+    if (!fs.existsSync(file)) {
       return { alive: false, state: "idle" };
     }
-    const data = JSON.parse(fs.readFileSync(HEARTBEAT_FILE, "utf-8"));
+    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
     const ts = typeof data.ts === "number" ? data.ts : 0;
     if (Date.now() - ts >= AGENT_STALE_MS) {
       return { alive: false, state: "idle" };
@@ -287,6 +331,9 @@ export function readSharedHistory(): SharedHistoryItem[] {
 export function appendSharedHistory(item: SharedHistoryItem): void {
   try {
     const hist = readSharedHistory();
+    if (hist.some((existing) => existing.id === item.id)) {
+      return;
+    }
     hist.push(item);
     if (hist.length > HISTORY_CAP) {
       hist.splice(0, hist.length - HISTORY_CAP);
@@ -296,6 +343,19 @@ export function appendSharedHistory(item: SharedHistoryItem): void {
   } catch {
     // history is best-effort
   }
+}
+
+export function appendReplyToSharedHistory(reply: ReplyPayload): void {
+  if (!reply.content || typeof reply.percent === "number") {
+    return;
+  }
+  const timestamp = reply.timestamp || new Date().toISOString();
+  appendSharedHistory({
+    id: "reply-" + timestamp,
+    kind: "reply",
+    text: reply.content,
+    timestamp,
+  });
 }
 
 export function clearSharedHistory(): void {
@@ -514,6 +574,24 @@ function sanitizeAgentId(agentId?: string): string {
 export function agentDirFor(agentId?: string): string {
   const id = sanitizeAgentId(agentId);
   return id ? path.join(dataDir, AGENTS_SUBDIR, id) : dataDir;
+}
+
+/** Delete an agent's on-disk dir entirely (queue/reply/question/heartbeat) so a
+ *  forgotten tombstone stops being rediscovered. Never touches the shared root.
+ *  Best-effort: cleanup must never throw. */
+export function forgetAgentDir(agentId: string): void {
+  const id = sanitizeAgentId(agentId);
+  if (!id) {
+    return;
+  }
+  try {
+    fs.rmSync(path.join(dataDir, AGENTS_SUBDIR, id), {
+      recursive: true,
+      force: true,
+    });
+  } catch {
+    // best-effort
+  }
 }
 
 function ensureDirAt(dir: string): void {

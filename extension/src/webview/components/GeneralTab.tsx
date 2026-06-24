@@ -2,18 +2,26 @@
  * General-purpose tab (formerly "Usage").
  *
  * Hosts the CDP **agent workflow** runner — which spawns a fresh Cursor agent
- * tile, sends a stand-by prompt, switches to GPT-5.5, types the invoke-mcp prompt,
- * and holds Enter past "Planning next moves" — and keeps the original Cursor
- * usage panel below it.
+ * tile, sends a stand-by prompt, switches to the selected model (default
+ * Opus 4.8 1M Extra High Fast), types the invoke-mcp prompt, and holds Enter
+ * until MCP is connected.
  */
 import React, { useEffect, useRef, useState } from "react";
 import { post } from "../vscode";
 import type { UsageData } from "../types";
+import {
+  DEFAULT_WORKFLOW_MODEL,
+  WORKFLOW_MODELS,
+  type WorkflowModel,
+} from "../workflowModels";
 
 export interface WorkflowLine {
   stream: "stdout" | "stderr";
   line: string;
 }
+
+/** Default model for the agent workflow tile (full picker label). */
+const DEFAULT_MODEL = DEFAULT_WORKFLOW_MODEL;
 
 export function GeneralTab(props: {
   usage: UsageData | null;
@@ -35,8 +43,10 @@ export function GeneralTab(props: {
   const [token, setToken] = useState("");
   const [autoPrompt, setAutoPrompt] = useState("");
   const [opusPrompt, setOpusPrompt] = useState("");
-  const [maxSecs, setMaxSecs] = useState("");
+  const [maxSecs, setMaxSecs] = useState("6000");
   const [tile, setTile] = useState("");
+  const [model, setModel] = useState<WorkflowModel>(DEFAULT_MODEL);
+  const [keepTiles, setKeepTiles] = useState(true);
   const outRef = useRef<HTMLPreElement | null>(null);
 
   // Keep the log scrolled to the newest line.
@@ -54,6 +64,8 @@ export function GeneralTab(props: {
       opusPrompt: opusPrompt.trim() || undefined,
       maxSecs:
         maxSecsNum != null && isFinite(maxSecsNum) ? maxSecsNum : undefined,
+      model: model.trim() || undefined,
+      keepTiles,
     });
   };
 
@@ -87,12 +99,44 @@ export function GeneralTab(props: {
 
         <p className="workflow-desc">
           Spawns a fresh Cursor agent tile over CDP, sends a stand-by prompt,
-          switches to GPT-5.5, types the invoke-mcp prompt, then holds Enter past
-          “Planning next moves”. <strong>Reconnect</strong> instead re-primes a
-          dropped (“Worked”) tile in place — auto-detecting it, or use the tile
-          index — to rebuild the MCP loop on that same tile. Requires Cursor
-          launched with <code>--remote-debugging-port=9222</code>.
+          switches to the <strong>selected model</strong>, types the invoke-mcp
+          prompt, then holds Enter until the tile is <strong>connected to the
+          jefr MCP loop</strong>.{" "}
+          <strong>Reconnect</strong> instead re-primes a dropped (“Worked”) tile
+          in place — auto-detecting it, or use the tile index — to rebuild the
+          MCP loop on that same tile. Requires Cursor launched with{" "}
+          <code>--remote-debugging-port=9222</code>.
         </p>
+
+        <label className="workflow-model-row">
+          <span className="workflow-model-label">Model</span>
+          <select
+            className="workflow-model-select"
+            value={model}
+            disabled={workflowRunning}
+            onChange={(e) => setModel(e.target.value as WorkflowModel)}
+            title="Model to switch the spawned tile to after the stand-by prompt"
+          >
+            {WORKFLOW_MODELS.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label
+          className="workflow-keep-tiles"
+          title="Keep already-open agent tiles instead of collapsing them, so repeated spawns accumulate multiple agents online at once"
+        >
+          <input
+            type="checkbox"
+            checked={keepTiles}
+            disabled={workflowRunning}
+            onChange={(e) => setKeepTiles(e.target.checked)}
+          />
+          Keep existing agents (accumulate)
+        </label>
 
         <textarea
           className="workflow-input"

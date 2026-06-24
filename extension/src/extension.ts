@@ -18,6 +18,7 @@ import {
   sendImage,
   sendFile,
   appendSharedHistory,
+  appendReplyToSharedHistory,
   makeId,
   readQuestion,
   writeAnswer,
@@ -26,8 +27,10 @@ import {
   clearReply,
   listLiveAgents,
   scanAllAgents,
+  forgetAgentDir,
   readQueueFor,
   getQueueCountFor,
+  getAgentStatusFor,
   sendTextTo,
   sendImageTo,
   sendFileTo,
@@ -57,12 +60,15 @@ import {
   pollRemoteAnswer,
   sendWorkspaceHeartbeat,
   REMOTE_API_ENABLED,
+  writeSelectedAgentId,
+  readSelectedAgentId,
   type QuestionPayload,
 } from "./messenger";
 import {
   startLocalServer,
   stopLocalServer,
   setWorkspaceInfo,
+  setSelectedAgentId,
   getServerPort,
   getConnectedClients,
 } from "./local-server";
@@ -71,6 +77,8 @@ import {
   pickReconnect,
   type AgentStat,
 } from "./agentStats";
+import { getCdpMonitor, stopCdpMonitor, type CdpStatus } from "./cdp-monitor";
+import { TileStateManager, type AgentView } from "./tile-state";
 
 // ── Module state ────────────────────────────────────────────────────────────
 
@@ -98,28 +106,192 @@ let selectedAgentId: string | undefined;
 let lastAgentListJson: string | undefined;
 
 // Auto-reconnect: when a previously-connected agent's heartbeat goes stale, the
-// extension re-primes its tile via the CDP workflow. On by default; togglable.
-let autoReconnect = true;
+// extension re-primes its tile via the CDP workflow. Off by default; togglable.
+let autoReconnect = false;
 const RECONNECT_DEBOUNCE_MS = 45_000;
+/** Forget disconnected agents after this long without a heartbeat — they're
+ *  tombstones from closed tabs / past sessions and shouldn't linger or be
+ *  reconnected. */
+const AGENT_FORGET_MS = 5 * 60_000;
+/** Give up auto-reconnecting an agent after this many failed attempts since its
+ *  last successful landing. The manual Reconnect button still works anytime. */
+const MAX_RECONNECT_ATTEMPTS = 3;
+/** When true, also delete a forgotten agent's on-disk dir (queue/history/etc).
+ *  Off by default — non-destructive: tombstones are only hidden from the roster. */
+const GC_AGENT_DIRS: boolean = false;
 
 const agentStats = new Map<string, AgentStat>();
 
-// ── Agent workflow automation (CDP) ─────────────────────────────────────────
-// The extension can invoke the Python CDP workflow that spawns a fresh Cursor
-// agent tile, sends a stand-by prompt, switches to GPT-5.5, types the invoke-mcp
-// prompt, and holds Enter past "Planning next moves".
+// ── CDP-based tile state (replaces file heartbeats) ─────────────────────────
+const tileStateManager = new TileStateManager();
+let cdpEnabled = true; // Set false to fall back to file-based heartbeats
+let lastCdpStatus: CdpStatus | null = null;
 
-/** The CDP automation runner. Lives outside the extension in the user's tools. */
-const WORKFLOW_SCRIPT = path.join(
-  os.homedir(),
-  "blue",
-  "infra",
-  "cursor",
-  "automation",
-  "workflow.py"
-);
+// ── CDP-based agent monitoring ──────────────────────────────────────────────
+
+function startCdpMonitoring(): void {
+  if (!cdpEnabled) return;
+
+  const monitor = getCdpMonitor();
+
+  // Listen for state changes
+  monitor.on("status", (status: CdpStatus) => {
+    lastCdpStatus = status;
+
+    if (!status.connected) {
+      // CDP not available — fall back to file-based heartbeats
+      return;
+    }
+
+    // Build filesystem-derived state. CDP knows which tile is visible, while the
+    // MCP heartbeat knows when an agent is actively working between tool calls.
+    const queueCounts = new Map<string, number>();
+    const heartbeatStates = new Map<string, "waiting" | "working">();
+    for (const tile of status.tiles) {
+      if (tile.agentId) {
+        queueCounts.set(tile.agentId, getQueueCountFor(tile.agentId));
+        const heartbeat = getAgentStatusFor(tile.agentId);
+        if (heartbeat.alive) {
+          heartbeatStates.set(tile.agentId, heartbeat.state);
+        }
+      }
+    }
+
+    // Update state machine (drops vanished tiles after the forget window)
+    const transitions = tileStateManager.update(
+      status.tiles,
+      queueCounts,
+      AGENT_FORGET_MS,
+      heartbeatStates,
+    );
+
+    // Auto-reconnect dropped agents
+    if (autoReconnect && !workflowProc) {
+      const dropped = tileStateManager.getDroppedAgents();
+      for (const agent of dropped) {
+        const debounceOk = Date.now() - agent.lastReconnectAt >= RECONNECT_DEBOUNCE_MS;
+        const attemptsOk = agent.reconnectStreak < MAX_RECONNECT_ATTEMPTS;
+        if (debounceOk && attemptsOk) {
+          tileStateManager.markReconnectAttempt(agent.agentId);
+          postWorkflow({
+            type: "workflowOutput",
+            stream: "stdout",
+            line: `[jefr] auto-reconnect: agent ${agent.agentId.slice(0, 8)} dropped — re-priming its tile`,
+          });
+          runWorkflow({ reconnect: true, agentId: agent.agentId });
+          break; // One at a time
+        }
+      }
+    }
+
+    // Push to webview
+    pushAgentListFromCdp();
+  });
+
+  // Start monitoring (async, non-blocking)
+  monitor.start().catch((e) => {
+    console.error("CDP monitor failed to start:", e);
+  });
+}
+
+function pushAgentListFromCdp(): void {
+  if (!mainPanel) return;
+
+  let agents = tileStateManager.toAgentViews();
+  // CDP can connect (e.g. to "Cursor Agents") yet find zero tiles when selectors
+  // drift — fall back to MCP heartbeats on disk so the roster stays populated.
+  if (agents.length === 0) {
+    pushAgentListFromHeartbeats(true);
+    return;
+  }
+
+  const payload = {
+    agents,
+    selected: selectedAgentId || null,
+    autoReconnect,
+    targetAgentCount: TARGET_AGENT_COUNT,
+    cdpConnected: lastCdpStatus?.connected ?? false,
+  };
+
+  // Write CDP status to file for external consumers (Obsidian plugin).
+  writeCdpStatusFile(agents);
+
+  setSelectedAgentId(selectedAgentId);
+
+  // Dedupe to avoid spam
+  const json = JSON.stringify(payload);
+  if (json !== lastAgentListJson) {
+    lastAgentListJson = json;
+    mainPanel.webview.postMessage({ type: "agentList", ...payload });
+  }
+}
+
+/** Write CDP-derived agent status to a file for external consumers (Obsidian plugin). */
+function writeCdpStatusFile(agents: AgentView[]): void {
+  try {
+    const statusFile = path.join(os.homedir(), ".moyu-message", "cdp-status.json");
+    const status = {
+      ts: Date.now(),
+      cdpConnected: lastCdpStatus?.connected ?? false,
+      pageTitle: lastCdpStatus?.pageTitle ?? null,
+      agents: agents.map((a) => ({
+        id: a.id,
+        state: a.state,
+        connected: a.connected,
+        model: a.model,
+        tileIndex: a.tileIndex,
+        connectedSince: a.connectedSince,
+        queueCount: a.queueCount,
+      })),
+    };
+    fs.writeFileSync(statusFile, JSON.stringify(status, null, 2), "utf-8");
+  } catch {
+    // best-effort — don't crash on file errors
+  }
+}
+
+// ── Agent workflow automation (CDP) ─────────────────────────────────────────
+// All workflow routes resolve to jefr-cursor/automation/workflow.py — never a
+// legacy copy elsewhere on disk.
 
 let workflowProc: ChildProcess | undefined;
+
+/** Resolve automation/workflow.py relative to this extension install (repo layout:
+ *  jefr-cursor/extension/dist/extension.js → jefr-cursor/automation/workflow.py). */
+function bundledWorkflowScript(): string {
+  return path.join(__dirname, "..", "..", "automation", "workflow.py");
+}
+
+/** Cached workflow script path (recomputed when workspace folders change). */
+let resolvedWorkflowScript: string | undefined;
+let resolvedWorkflowScriptFor: string | undefined;
+
+/**
+ * Resolve workflow.py. Only these locations are considered:
+ *   1. jefr-cursor/automation/ bundled next to this extension
+ *   2. automation/workflow.py in each open workspace folder
+ * Returns null when neither exists.
+ */
+function resolveWorkflowScript(): string | null {
+  const wsKey = (vscode.workspace.workspaceFolders || [])
+    .map((f) => f.uri.fsPath)
+    .join("|");
+  if (resolvedWorkflowScript !== undefined && resolvedWorkflowScriptFor === wsKey) {
+    return resolvedWorkflowScript || null;
+  }
+  const candidates: string[] = [bundledWorkflowScript()];
+  for (const folder of vscode.workspace.workspaceFolders || []) {
+    candidates.push(path.join(folder.uri.fsPath, "automation", "workflow.py"));
+  }
+  resolvedWorkflowScript = candidates.find((p) => fs.existsSync(p)) ?? "";
+  resolvedWorkflowScriptFor = wsKey;
+  return resolvedWorkflowScript || null;
+}
+
+/** Default model for workflow spawn (--model when the UI omits one). */
+const WORKFLOW_DEFAULT_MODEL = "Opus 4.8 1M Extra High Fast";
+/** Target number of agents to keep online (UI slot count). */
+const TARGET_AGENT_COUNT = 5;
 /** undefined = not probed yet, null = no python found, string = the command. */
 let resolvedPython: string | null | undefined;
 
@@ -168,6 +340,11 @@ interface WorkflowOptions {
   tile?: number;
   /** Target agent id for reconnect (the workflow maps it to the right tile). */
   agentId?: string;
+  /** Model to switch the spawned tile to (passed as --model; spawn path only). */
+  model?: string;
+  /** Keep existing tiles (don't collapse) so spawns accumulate agents. Spawn
+   *  path only; reconnect never collapses. */
+  keepTiles?: boolean;
 }
 
 /** Spawn the CDP workflow and stream its output back to the webview. */
@@ -192,7 +369,18 @@ function runWorkflow(opts: WorkflowOptions): void {
     return;
   }
 
-  const script = opts.scriptPath || WORKFLOW_SCRIPT;
+  const script = opts.scriptPath || resolveWorkflowScript();
+  if (!script) {
+    postWorkflow({
+      type: "workflowOutput",
+      stream: "stderr",
+      line:
+        "[jefr] Workflow script not found. Open the jefr-cursor workspace " +
+        "(automation/workflow.py) or install the extension from that repo.",
+    });
+    postWorkflow({ type: "workflowExit", code: null });
+    return;
+  }
   if (!fs.existsSync(script)) {
     postWorkflow({
       type: "workflowOutput",
@@ -215,6 +403,14 @@ function runWorkflow(opts: WorkflowOptions): void {
   } else if (opts.autoPrompt && opts.autoPrompt.trim()) {
     args.push(opts.autoPrompt);
   }
+  if (!opts.reconnect) {
+    args.push("--model", (opts.model && opts.model.trim()) || WORKFLOW_DEFAULT_MODEL);
+    // Accumulate agents by default: keep already-open tiles instead of collapsing
+    // them, so the roster can hold several agents online at once.
+    if (opts.keepTiles !== false) {
+      args.push("--keep-tiles");
+    }
+  }
   if (opts.opusPrompt && opts.opusPrompt.trim()) {
     args.push("--type-text", opts.opusPrompt);
   }
@@ -226,6 +422,11 @@ function runWorkflow(opts: WorkflowOptions): void {
   }
 
   postWorkflow({ type: "workflowState", running: true });
+  postWorkflow({
+    type: "workflowOutput",
+    stream: "stdout",
+    line: `[jefr] workflow script: ${script}`,
+  });
   const shown = args
     .map((a) => (/\s/.test(a) ? JSON.stringify(a) : a))
     .join(" ");
@@ -289,8 +490,11 @@ function runWorkflow(opts: WorkflowOptions): void {
 function stopWorkflow(): void {
   const proc = workflowProc;
   if (!proc) {
+    postWorkflow({ type: "workflowState", running: false });
     return;
   }
+  workflowProc = undefined;
+  postWorkflow({ type: "workflowState", running: false });
   try {
     if (process.platform === "win32" && proc.pid) {
       spawnSync("taskkill", ["/pid", String(proc.pid), "/t", "/f"], {
@@ -339,12 +543,38 @@ function computeDataDir(workspaceFolders: readonly vscode.WorkspaceFolder[]): st
   return path.join(rootDir, hash);
 }
 
+/** Prefer MESSENGER_DATA_DIR from jefr MCP config so the panel, Obsidian bridge,
+ *  and MCP server process always share one folder (avoids split-brain routing). */
+function readMcpDataDir(
+  workspaceFolders: readonly vscode.WorkspaceFolder[] = [],
+): string | undefined {
+  const candidates = [
+    path.join(os.homedir(), ".cursor", "mcp.json"),
+    ...workspaceFolders.map((f) => path.join(f.uri.fsPath, ".cursor", "mcp.json")),
+  ];
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) {
+        continue;
+      }
+      const config = JSON.parse(fs.readFileSync(p, "utf-8"));
+      const dir = config?.mcpServers?.jefr?.env?.MESSENGER_DATA_DIR;
+      if (typeof dir === "string" && dir.trim()) {
+        return dir.trim();
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+  return undefined;
+}
+
 // ── Activation ──────────────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionVersion = context.extension.packageJSON?.version || "0.0.0";
   const workspaceFolders = vscode.workspace.workspaceFolders || [];
-  currentDataDir = computeDataDir(workspaceFolders);
+  currentDataDir = readMcpDataDir(workspaceFolders) ?? computeDataDir(workspaceFolders);
   setDataDir(currentDataDir);
   migrateFromRootDir();
 
@@ -424,11 +654,16 @@ export function activate(context: vscode.ExtensionContext): void {
   startHeartbeat();
   startIdleTimer();
   autoSetupMcp();
+  startCdpMonitoring(); // CDP-based tile state monitoring
   setWorkspaceInfo(getWorkspaceName(), getWorkspacePath() || "");
 
   startLocalServer()
     .then((port) => {
       console.log(`jefr console started: http://127.0.0.1:${port}`);
+      const restored = readSelectedAgentId();
+      if (restored) {
+        selectAgent(restored);
+      }
     })
     .catch((e) => {
       console.error("Failed to start console server:", e);
@@ -478,6 +713,7 @@ export function deactivate(): void {
   }
   stopWorkflow();
   stopLocalServer();
+  stopCdpMonitor(); // Stop CDP monitoring
 }
 
 // ── Local polling: mirror file state into the webview ───────────────────────
@@ -528,24 +764,40 @@ function startPolling(): void {
   pollTimer2 = setInterval(poll, 500);
 }
 
-/** Scan the agent roster, update connect/reconnect stats, drive auto-reconnect,
- *  and push the merged list to the panel (deduped on stable fields). */
-function pushAgentList(): void {
+/** Scan file heartbeats, reconcile stats, auto-reconnect, and push the roster.
+ *  When `cdpFallback` is true, CDP is connected but saw no tiles — annotate payload. */
+function pushAgentListFromHeartbeats(cdpFallback = false): void {
   if (!mainPanel) {
     return;
   }
+
   const now = Date.now();
   const roster = scanAllAgents();
-  const { views: agents, dropped } = reconcile(roster, agentStats, now);
+  const { views: agents, dropped, prune } = reconcile(roster, agentStats, now, {
+    forgetMs: AGENT_FORGET_MS,
+    maxReconnects: MAX_RECONNECT_ATTEMPTS,
+  });
 
-  // Auto-reconnect: re-prime one dropped agent at a time (serialized by the
-  // workflowProc guard + the debounce inside pickReconnect).
+  for (const id of prune) {
+    agentStats.delete(id);
+    if (id === selectedAgentId) {
+      selectedAgentId = undefined;
+      writeSelectedAgentId(undefined);
+      setSelectedAgentId(undefined);
+      mainPanel.webview.postMessage({ type: "agentSelected", agentId: null });
+    }
+    if (GC_AGENT_DIRS) {
+      forgetAgentDir(id);
+    }
+  }
+
   if (autoReconnect && !workflowProc) {
     const target = pickReconnect(dropped, agentStats, now, RECONNECT_DEBOUNCE_MS);
     if (target) {
       const s = agentStats.get(target);
       if (s) {
         s.reconnectCount++;
+        s.reconnectsSinceConnect++;
         s.lastReconnectAt = now;
       }
       postWorkflow({
@@ -557,9 +809,16 @@ function pushAgentList(): void {
     }
   }
 
-  // Dedupe on stable fields only (connectedSince changes solely on reconnect),
-  // so a live uptime counter in the panel won't spam re-renders.
-  const payload = { agents, selected: selectedAgentId || null, autoReconnect };
+  writeCdpStatusFile(agents);
+
+  const payload = {
+    agents,
+    selected: selectedAgentId || null,
+    autoReconnect,
+    targetAgentCount: TARGET_AGENT_COUNT,
+    cdpConnected: cdpFallback ? (lastCdpStatus?.connected ?? false) : false,
+  };
+  setSelectedAgentId(selectedAgentId);
   const json = JSON.stringify(payload);
   if (json !== lastAgentListJson) {
     lastAgentListJson = json;
@@ -567,9 +826,30 @@ function pushAgentList(): void {
   }
 }
 
+/** Scan the agent roster, update connect/reconnect stats, drive auto-reconnect,
+ *  and push the merged list to the panel (deduped on stable fields).
+ *
+ *  When CDP is connected, this delegates to pushAgentListFromCdp().
+ *  Falls back to file-based heartbeats when CDP is unavailable. */
+function pushAgentList(): void {
+  if (!mainPanel) {
+    return;
+  }
+
+  // Use CDP-based state when it can actually see tiles.
+  if (cdpEnabled && lastCdpStatus?.connected && tileStateManager.toAgentViews().length > 0) {
+    pushAgentListFromCdp();
+    return;
+  }
+
+  pushAgentListFromHeartbeats(cdpEnabled && (lastCdpStatus?.connected ?? false));
+}
+
 /** Switch the panel's target agent and immediately re-push that agent's state. */
 function selectAgent(agentId?: string): void {
   selectedAgentId = agentId && agentId.trim() ? agentId.trim() : undefined;
+  writeSelectedAgentId(selectedAgentId);
+  setSelectedAgentId(selectedAgentId);
   // Force the next poll to re-emit question/reply/queue for the new target.
   lastQuestionId = undefined;
   lastReplyTimestamp = undefined;
@@ -579,6 +859,12 @@ function selectAgent(agentId?: string): void {
     type: "agentSelected",
     agentId: selectedAgentId || null,
   });
+  // Focus the agent's tile in Cursor so MCP routing lands on the right pane.
+  if (selectedAgentId && cdpEnabled) {
+    getCdpMonitor()
+      .focusAgent(selectedAgentId)
+      .catch(() => {});
+  }
   // Push the freshly-selected agent's current state right away.
   const reply = readReplyFor(selectedAgentId);
   if (reply) {
@@ -813,12 +1099,72 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
         case "reconnectAgent": {
           const aid = typeof msg.agentId === "string" ? msg.agentId : undefined;
           if (aid) {
+            // Unify bookkeeping: update whichever store is the active source.
+            // The CDP store (tile-state) drives debounce/streak + the displayed
+            // counts when CDP is connected; the heartbeat store backs the
+            // file-based fallback. Marking both keeps them consistent and stops a
+            // manual reconnect from being ignored or double-fired.
+            tileStateManager.markReconnectAttempt(aid); // no-op if unknown there
             const s = agentStats.get(aid);
             if (s) {
               s.reconnectCount++;
+              s.reconnectsSinceConnect++;
               s.lastReconnectAt = Date.now();
             }
             runWorkflow({ reconnect: true, agentId: aid });
+          }
+          break;
+        }
+        case "addAgent": {
+          const current = tileStateManager.toAgentViews().length;
+          if (current >= TARGET_AGENT_COUNT) {
+            postWorkflow({
+              type: "workflowOutput",
+              stream: "stderr",
+              line: `[jefr] Already at ${TARGET_AGENT_COUNT} agents — delete one first.`,
+            });
+            break;
+          }
+          runWorkflow({
+            model: (typeof msg.model === "string" && msg.model.trim()) || WORKFLOW_DEFAULT_MODEL,
+            keepTiles: true,
+          });
+          break;
+        }
+        case "deleteAgent": {
+          const aid = typeof msg.agentId === "string" ? msg.agentId.trim() : "";
+          if (!aid) break;
+          const wasVisible = (tileStateManager.getAgent(aid)?.tileIndex ?? -1) >= 0;
+          let closed = true;
+          if (cdpEnabled && wasVisible) {
+            closed = await getCdpMonitor()
+              .closeAgentTile(aid)
+              .catch(() => false);
+          }
+          if (!closed) {
+            postWorkflow({
+              type: "workflowOutput",
+              stream: "stderr",
+              line: `[jefr] Failed to close tile for agent ${aid.slice(0, 8)}; keeping it in the roster.`,
+            });
+            lastAgentListJson = undefined;
+            pushAgentList();
+            break;
+          }
+          tileStateManager.forgetAgent(aid);
+          agentStats.delete(aid);
+          if (aid === selectedAgentId) {
+            selectAgent(undefined);
+          } else {
+            lastAgentListJson = undefined;
+            pushAgentList();
+          }
+          break;
+        }
+        case "focusAgent": {
+          const aid = typeof msg.agentId === "string" ? msg.agentId.trim() : "";
+          if (aid && cdpEnabled) {
+            getCdpMonitor().focusAgent(aid).catch(() => {});
           }
           break;
         }
@@ -918,24 +1264,48 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
           });
           break;
         case "runWorkflow":
-          runWorkflow({
-            autoPrompt: msg.autoPrompt,
-            opusPrompt: msg.opusPrompt,
-            maxSecs: msg.maxSecs,
-            enterInterval: msg.enterInterval,
-          });
+          try {
+            runWorkflow({
+              autoPrompt: msg.autoPrompt,
+              opusPrompt: msg.opusPrompt,
+              maxSecs: msg.maxSecs,
+              enterInterval: msg.enterInterval,
+              model: msg.model,
+              // Default to keeping existing tiles so spawns accumulate agents;
+              // the UI can pass keepTiles:false to force the clean-collapse spawn.
+              keepTiles: msg.keepTiles !== false,
+            });
+          } catch (e) {
+            postWorkflow({
+              type: "workflowOutput",
+              stream: "stderr",
+              line: `[jefr] runWorkflow failed: ${(e as Error).message}`,
+            });
+            postWorkflow({ type: "workflowState", running: false });
+            postWorkflow({ type: "workflowExit", code: null });
+          }
           break;
         case "reconnectWorkflow":
-          runWorkflow({
-            reconnect: true,
-            tile:
-              typeof msg.tile === "number" && Number.isInteger(msg.tile)
-                ? msg.tile
-                : undefined,
-            opusPrompt: msg.opusPrompt,
-            maxSecs: msg.maxSecs,
-            enterInterval: msg.enterInterval,
-          });
+          try {
+            runWorkflow({
+              reconnect: true,
+              tile:
+                typeof msg.tile === "number" && Number.isInteger(msg.tile)
+                  ? msg.tile
+                  : undefined,
+              opusPrompt: msg.opusPrompt,
+              maxSecs: msg.maxSecs,
+              enterInterval: msg.enterInterval,
+            });
+          } catch (e) {
+            postWorkflow({
+              type: "workflowOutput",
+              stream: "stderr",
+              line: `[jefr] reconnectWorkflow failed: ${(e as Error).message}`,
+            });
+            postWorkflow({ type: "workflowState", running: false });
+            postWorkflow({ type: "workflowExit", code: null });
+          }
           break;
         case "stopWorkflow":
           stopWorkflow();
@@ -1157,6 +1527,7 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
           }
         }
       }
+      appendReplyToSharedHistory(reply);
       clearReplyFor(selectedAgentId);
       lastReplyTimestamp = undefined;
     }
