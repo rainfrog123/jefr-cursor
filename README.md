@@ -12,6 +12,10 @@ See [QUICKSTART.txt](QUICKSTART.txt).
 4. Send `Hello` once in native chat to start the loop
 5. Continue from the **jefr cursor** bottom panel
 
+## Location
+
+Integrated under **`C:\Users\jar71\blue\infra\cursor\jefr-cursor`**, sibling to `automation/` (CDP workflow scripts).
+
 ## Repository layout
 
 ```
@@ -19,6 +23,7 @@ extension/
   dist/           Built extension + MCP server
   rules/          English MCP rules (mcp-messenger.mdc)
   HOW_IT_WORKS.md Architecture documentation
+obsidian-plugin/  Optional Obsidian chat client
 .cursor/rules/    Workspace copy of MCP rules (English)
 ```
 
