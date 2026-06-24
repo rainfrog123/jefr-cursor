@@ -14,7 +14,7 @@ See [QUICKSTART.txt](QUICKSTART.txt).
 
 ## Location
 
-Integrated under **`C:\Users\jar71\blue\infra\cursor\jefr-cursor`**, sibling to `automation/` (CDP workflow scripts).
+Canonical checkout: **`C:\Users\jar71\Downloads\jefr-cursor`** (extension + `automation/` CDP scripts in one tree).
 
 ## Repository layout
 

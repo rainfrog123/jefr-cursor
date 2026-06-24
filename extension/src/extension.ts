@@ -75,22 +75,14 @@ let lastActivityTime = Date.now();
 // agent tile, sends a stand-by prompt, switches to GPT-5.5, types the invoke-mcp
 // prompt, and holds Enter past "Planning next moves".
 
-/** Resolve workflow.py — sibling `automation/` when integrated under blue/infra/cursor. */
+/** Resolve workflow.py — sibling `automation/` under the Downloads jefr-cursor tree. */
 function defaultWorkflowScript(): string {
-  const integrated = path.join(
-    __dirname,
-    "..",
-    "..",
-    "..",
-    "automation",
-    "workflow.py"
-  );
-  if (fs.existsSync(integrated)) return integrated;
+  const inRepo = path.join(__dirname, "..", "..", "automation", "workflow.py");
+  if (fs.existsSync(inRepo)) return inRepo;
   return path.join(
     os.homedir(),
-    "blue",
-    "infra",
-    "cursor",
+    "Downloads",
+    "jefr-cursor",
     "automation",
     "workflow.py"
   );
