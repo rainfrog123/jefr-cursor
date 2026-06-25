@@ -173,7 +173,7 @@ export type InboundMessage =
   | { type: "showQuestion"; data: QuestionData }
   | { type: "clearQuestion" }
   | { type: "showReply"; data: ReplyData }
-  | { type: "historyAppend"; item: HistoryItem }
+  | { type: "historyAppend"; item: HistoryItem; agentId?: string }
   | { type: "attachmentAdded"; item: Attachment }
   | { type: "cardState"; data: { active: boolean } }
   | { type: "cardActivated"; data: unknown }

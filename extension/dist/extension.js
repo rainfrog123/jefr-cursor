@@ -6652,7 +6652,13 @@ var TileStateManager = class {
           connectedSince: isConnectedState(state) ? now : 0,
           lastMcpAt,
           lastBusyAt,
-          connectCount: isConnectedState(state) ? 1 : 0,
+          // A "Worked for…" completion stamp proves the tile already ran a full
+          // MCP turn, so even if we never caught it live (it finished before our
+          // first poll, or was adopted via Refresh after the turn ended) it has
+          // connected at least once. Seed connectCount so the present stamp can
+          // classify it as a re-primeable "Dropped" tile instead of falling
+          // through to a plain, unreconnectable "Down".
+          connectCount: isConnectedState(state) || tile.worked ? 1 : 0,
           reconnectCount: 0,
           reconnectStreak: 0,
           lastReconnectAt: 0,
@@ -6707,6 +6713,9 @@ var TileStateManager = class {
             });
             existing.connectedSince = 0;
           }
+        }
+        if (existing.connectCount === 0 && tile.worked) {
+          existing.connectCount = 1;
         }
       }
     }
@@ -7463,7 +7472,17 @@ function startIdleTimer() {
       `idle ${IDLE_TIMEOUT_MS / 6e4}m: stand-by nudge \u2192 ${targets.length} agent(s): ${targets.map((a) => a.agentId.slice(0, 8)).join(", ")}`
     );
     for (const a of targets) {
-      sendTextTo(a.agentId, STANDBY_MESSAGE);
+      const item = sendTextTo(a.agentId, STANDBY_MESSAGE);
+      mainPanel?.webview.postMessage({
+        type: "historyAppend",
+        agentId: a.agentId,
+        item: {
+          id: item.id,
+          kind: "text",
+          text: STANDBY_MESSAGE,
+          time: new Date(item.timestamp || Date.now()).toLocaleTimeString()
+        }
+      });
     }
     resetIdleTimer();
   }, 6e4);
@@ -7750,10 +7769,6 @@ function selectAgent(agentId) {
     type: "agentSelected",
     agentId: selectedAgentId || null
   });
-  if (selectedAgentId && cdpEnabled) {
-    getCdpMonitor().focusAgent(selectedAgentId).catch(() => {
-    });
-  }
   const reply = readReplyFor(selectedAgentId);
   if (reply) {
     mainPanel?.webview.postMessage({ type: "showReply", data: reply });

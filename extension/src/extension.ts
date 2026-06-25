@@ -943,7 +943,21 @@ function startIdleTimer(): void {
         .join(", ")}`,
     );
     for (const a of targets) {
-      sendTextTo(a.agentId, STANDBY_MESSAGE);
+      const item = sendTextTo(a.agentId, STANDBY_MESSAGE);
+      // Mirror the auto-send into THIS agent's chat thread. sendTextTo only
+      // queues + writes the agent-less shared history, so without this the nudge
+      // never shows in the per-agent conversation. Target the real agentId (not
+      // the selected one) so it lands in the right bucket even when unfocused.
+      mainPanel?.webview.postMessage({
+        type: "historyAppend",
+        agentId: a.agentId,
+        item: {
+          id: item.id,
+          kind: "text",
+          text: STANDBY_MESSAGE,
+          time: new Date(item.timestamp || Date.now()).toLocaleTimeString(),
+        },
+      });
     }
     resetIdleTimer();
   }, 60000);
@@ -1068,7 +1082,7 @@ export function activate(context: vscode.ExtensionContext): void {
   startPolling();
   startRemotePolling();
   startHeartbeat();
-  // Idle keep-alive: after IDLE_TIMEOUT_MS (10m) with no activity, send a
+  // Idle keep-alive: after IDLE_TIMEOUT_MS (5m) with no activity, send a
   // "STAND BY" nudge to every online + idle agent (never the shared chat, never a
   // busy agent or one with queued work). See startIdleTimer.
   startIdleTimer();
@@ -1295,12 +1309,12 @@ function selectAgent(agentId?: string): void {
     type: "agentSelected",
     agentId: selectedAgentId || null,
   });
-  // Focus the agent's tile in Cursor so MCP routing lands on the right pane.
-  if (selectedAgentId && cdpEnabled) {
-    getCdpMonitor()
-      .focusAgent(selectedAgentId)
-      .catch(() => {});
-  }
+  // NOTE: selection is routing-only. MCP delivery is keyed by each agent's own
+  // agent_id (and the panel routes user messages to selectedAgentId), so it does
+  // NOT depend on which Cursor tile has focus. We deliberately do NOT focus the
+  // tile here — stealing focus on a plain card click yanks the cursor away from
+  // whatever the user is doing and interrupts an in-flight spawn / workflow.
+  // Explicit focus is still available on demand via the "focusAgent" message.
   // Push the freshly-selected agent's current state right away.
   const reply = readReplyFor(selectedAgentId);
   if (reply) {

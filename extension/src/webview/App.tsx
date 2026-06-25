@@ -157,7 +157,10 @@ export function App(): JSX.Element {
           break;
         }
         case "historyAppend":
-          appendToHistory(keyFor(selectedRef.current), msg.item);
+          // Route to the explicit target agent when the host names one (e.g. the
+          // idle STAND BY nudge, which targets a specific agentId rather than the
+          // currently-selected one); otherwise fall back to the selected agent.
+          appendToHistory(keyFor(msg.agentId ?? selectedRef.current), msg.item);
           break;
         case "attachmentAdded":
           setAttachments((a) => [...a, msg.item]);
