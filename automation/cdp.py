@@ -21,9 +21,9 @@ import websocket  # pip install websocket-client
 
 CDP = "http://127.0.0.1:9222"
 
-# Windows-style keyboard repeat when interval <= 0 (human finger held down).
-HUMAN_REPEAT_DELAY = 0.5      # seconds before the first autorepeat tick
-HUMAN_REPEAT_INTERVAL = 0.01  # ~100 repeats/sec after the initial delay
+# Keyboard repeat when interval <= 0 (human finger held down).
+HUMAN_REPEAT_DELAY = 0.5       # seconds before the first autorepeat tick
+HUMAN_REPEAT_INTERVAL = 0.005  # 200 repeats/sec
 
 
 def http_json(path):
@@ -180,9 +180,10 @@ def click_at(ws_url, x, y):
 
 
 def hold_key(ws_url, key_name, duration=None, interval=0, jitter=0.15,
-             focus_eval=None, refocus_every=8, stop_eval=None, stop_check=None,
-             poll_every=3, max_secs=None, stop_poll_secs=0.03, refocus_secs=0,
-             min_hold_secs=0.0, keep_alive_on_stop=False, release_on_stop=False):
+             focus_eval=None, refocus_fn=None, refocus_every=8, stop_eval=None,
+             stop_check=None, poll_every=3, max_secs=None, stop_poll_secs=0.03,
+             refocus_secs=0, min_hold_secs=0.0, keep_alive_on_stop=False,
+             release_on_stop=False):
     """Press and HOLD a key down like a human holding it: one initial keyDown,
     then OS-rate autoRepeat keyDowns while the finger stays down.
 
@@ -191,6 +192,10 @@ def hold_key(ws_url, key_name, duration=None, interval=0, jitter=0.15,
 
     When `interval` <= 0 (default), uses HUMAN_REPEAT_DELAY / HUMAN_REPEAT_INTERVAL.
     A positive `interval` overrides only the repeat spacing (initial delay unchanged).
+
+    Refocus: pass `refocus_fn` (callable, e.g. real mouse click) and/or `focus_eval`
+    (JS). `refocus_fn` takes precedence. When `refocus_secs` > 0, refocus runs at
+    start and every refocus_secs during the hold.
 
     `keep_alive_on_stop`: block forever without closing the CDP session (rare; default off).
 
@@ -202,7 +207,9 @@ def hold_key(ws_url, key_name, duration=None, interval=0, jitter=0.15,
         s.call("Runtime.enable")
 
         def focus():
-            if focus_eval:
+            if refocus_fn:
+                refocus_fn()
+            elif focus_eval:
                 s.call("Runtime.evaluate", {
                     "expression": focus_eval, "awaitPromise": True, "userGesture": True,
                 })
@@ -239,10 +246,20 @@ def hold_key(ws_url, key_name, duration=None, interval=0, jitter=0.15,
         deadline = start + duration if duration else None
         next_stop = start + stop_poll_secs
         next_repeat = start + repeat_delay
+        # Forced re-focus: if the caller opted in (refocus_secs>0), keep yanking
+        # focus back onto the target composer so the held-Enter autorepeat always
+        # lands on THIS tile. Without it, any focus drift (a popover, a re-render,
+        # the user clicking away) silently sends the Enter spam into the void.
+        do_refocus = bool(refocus_fn or focus_eval) and refocus_secs and refocus_secs > 0
+        next_refocus = (start + refocus_secs) if do_refocus else None
         stop_reason = "unknown"
 
         while True:
             now = time.time()
+
+            if next_refocus is not None and now >= next_refocus:
+                focus()
+                next_refocus = now + refocus_secs
 
             if (stop_eval or stop_check) and now >= next_stop:
                 if (now - start) >= min_hold_secs:

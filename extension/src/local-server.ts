@@ -27,7 +27,11 @@ import {
 
 /** Decode a `data:` URL into a temp file and queue it as an image message.
  *  Returns true if it was handled. Used for images pasted in the Obsidian plugin. */
-function handlePastedImage(dataUrl: string, caption?: string): boolean {
+function handlePastedImage(
+  dataUrl: string,
+  caption?: string,
+  target?: string,
+): boolean {
   const match = /^data:image\/([\w.+-]+);base64,(.+)$/.exec(dataUrl || "");
   if (!match) return false;
   try {
@@ -36,7 +40,8 @@ function handlePastedImage(dataUrl: string, caption?: string): boolean {
     const buf = Buffer.from(match[2], "base64");
     const tmpPath = path.join(os.tmpdir(), `jefr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`);
     fs.writeFileSync(tmpPath, buf);
-    const item = sendImageTo(targetAgentId(), tmpPath, caption);
+    const tgt = target !== undefined ? target : targetAgentId();
+    const item = sendImageTo(tgt, tmpPath, caption, dataUrl);
     // Echo into the panel history with the inline data so it shows a thumbnail.
     pushHistoryItem({ ...item, dataUrl });
     // Record in the shared history so all front-ends can render it.
@@ -57,6 +62,37 @@ function handlePastedImage(dataUrl: string, caption?: string): boolean {
 
 const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const PREFERRED_PORT = 39517;
+/** Largest single WS message / HTTP body we accept (guards against a malformed
+ *  or hostile frame growing the read buffer without bound). Images are a few MB. */
+const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+/** Retries on the preferred port before falling back to an ephemeral one — a
+ *  window reload can leave the old host holding the port for a beat. */
+const PORT_RETRY_MAX = 6;
+const PORT_RETRY_DELAY_MS = 400;
+/** Where the chosen port is published so a port-aware client can discover it
+ *  even if we had to fall back off the preferred port. */
+const PORT_FILE = path.join(os.homedir(), ".moyu-message", "server.json");
+
+function writePortFile(port: number): void {
+  try {
+    fs.mkdirSync(path.dirname(PORT_FILE), { recursive: true });
+    fs.writeFileSync(
+      PORT_FILE,
+      JSON.stringify({ port, pid: process.pid, preferred: PREFERRED_PORT, ts: Date.now() }),
+      "utf-8",
+    );
+  } catch {
+    // best-effort discovery file
+  }
+}
+
+function removePortFile(): void {
+  try {
+    fs.unlinkSync(PORT_FILE);
+  } catch {
+    // already gone
+  }
+}
 
 interface WsClient {
   socket: Socket;
@@ -99,7 +135,10 @@ export function getConnectedClients(): number {
   return wsClients.length;
 }
 
-export function startLocalServer(port: number = PREFERRED_PORT): Promise<number> {
+export function startLocalServer(
+  port: number = PREFERRED_PORT,
+  attempt = 0,
+): Promise<number> {
   return new Promise((resolve, reject) => {
     if (server) {
       resolve(serverPort);
@@ -118,8 +157,24 @@ export function startLocalServer(port: number = PREFERRED_PORT): Promise<number>
       } catch {
         // ignore
       }
-      if (err && err.code === "EADDRINUSE" && port !== 0) {
-        startLocalServer(0).then(resolve, reject);
+      if (err && err.code === "EADDRINUSE" && port === PREFERRED_PORT) {
+        if (attempt < PORT_RETRY_MAX) {
+          // A previous extension host (window reload) may still be releasing the
+          // port. Retry the SAME preferred port briefly so a fixed-port client
+          // (Obsidian) keeps working across reloads instead of us hopping ports.
+          setTimeout(
+            () => startLocalServer(PREFERRED_PORT, attempt + 1).then(resolve, reject),
+            PORT_RETRY_DELAY_MS,
+          );
+        } else {
+          // Still taken — fall back to an ephemeral port, but publish it in the
+          // port file and warn loudly so the mismatch is diagnosable.
+          console.warn(
+            `[jefr] port ${PREFERRED_PORT} is still in use after ${PORT_RETRY_MAX} retries; ` +
+              `falling back to an ephemeral port. A fixed-port client must read ${PORT_FILE}.`,
+          );
+          startLocalServer(0, attempt + 1).then(resolve, reject);
+        }
       } else {
         reject(err);
       }
@@ -131,6 +186,13 @@ export function startLocalServer(port: number = PREFERRED_PORT): Promise<number>
       settled = true;
       server = srv;
       serverPort = (srv.address() as { port: number }).port;
+      writePortFile(serverPort);
+      if (serverPort !== PREFERRED_PORT) {
+        console.warn(
+          `[jefr] local server bound to ${serverPort} (preferred ${PREFERRED_PORT} unavailable). ` +
+            `Clients should read the port from ${PORT_FILE}.`,
+        );
+      }
       startPushPolling();
       resolve(serverPort);
     });
@@ -155,6 +217,7 @@ export function stopLocalServer(): void {
     server = null;
     serverPort = 0;
   }
+  removePortFile();
 }
 
 function handleHttp(req: IncomingMessage, res: ServerResponse): void {
@@ -196,10 +259,20 @@ function handleHttp(req: IncomingMessage, res: ServerResponse): void {
   }
   if (req.url === "/api/send" && req.method === "POST") {
     let body = "";
+    let aborted = false;
     req.on("data", (chunk) => {
+      if (aborted) return;
       body += chunk;
+      // Guard against an unbounded request body (OOM). 413 + drop the socket.
+      if (body.length > MAX_MESSAGE_BYTES) {
+        aborted = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "Payload too large" }));
+        req.destroy();
+      }
     });
     req.on("end", () => {
+      if (aborted) return;
       try {
         const data = JSON.parse(body);
         if (data.text) {
@@ -248,14 +321,31 @@ function handleUpgrade(req: IncomingMessage, socket: Socket): void {
   const pushState = buildPushState();
   wsSend(socket, JSON.stringify({ type: "init", ...pushState }));
   let buffer = Buffer.alloc(0);
+  // Reassembly state for fragmented messages (a data frame with FIN=0 followed
+  // by opcode-0 continuation frames). Most clients send a single frame, but
+  // handling fragments keeps large/streamed messages from being dropped.
+  let fragOpcode = 0;
+  let fragParts: Buffer[] = [];
+  let fragBytes = 0;
+  const resetFrag = () => {
+    fragOpcode = 0;
+    fragParts = [];
+    fragBytes = 0;
+  };
   socket.on("data", (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
+    // Guard: never let the read buffer grow without bound (malformed/huge frame).
+    if (buffer.length > MAX_MESSAGE_BYTES) {
+      removeClient(client);
+      return;
+    }
     while (buffer.length >= 2) {
       const parsed = parseFrame(buffer);
       if (!parsed) {
         break;
       }
       buffer = buffer.subarray(parsed.totalLength);
+      // Control frames (8/9/10) can be interleaved between data fragments.
       if (parsed.opcode === 8) {
         removeClient(client);
         socket.end();
@@ -269,8 +359,30 @@ function handleUpgrade(req: IncomingMessage, socket: Socket): void {
         client.alive = true;
         continue;
       }
-      if (parsed.opcode === 1) {
-        handleWsMessage(client, parsed.payload.toString("utf-8"));
+      // Data frames: 1 = text (start), 2 = binary (start), 0 = continuation.
+      if (parsed.opcode === 1 || parsed.opcode === 2 || parsed.opcode === 0) {
+        if (parsed.opcode !== 0) {
+          // A new data message starts — drop any incomplete prior fragment.
+          fragOpcode = parsed.opcode;
+          fragParts = [];
+          fragBytes = 0;
+        }
+        fragParts.push(parsed.payload);
+        fragBytes += parsed.payload.length;
+        if (fragBytes > MAX_MESSAGE_BYTES) {
+          resetFrag();
+          removeClient(client);
+          return;
+        }
+        if (parsed.fin) {
+          const full = Buffer.concat(fragParts);
+          const op = fragOpcode;
+          resetFrag();
+          if (op === 1) {
+            handleWsMessage(client, full.toString("utf-8"));
+          }
+          // binary (op === 2) is unused by the protocol; ignored.
+        }
       }
     }
   });
@@ -294,11 +406,68 @@ function seenCid(cid: unknown): boolean {
   return false;
 }
 
+/** Reply to a request with a structured ack (new protocol). No-op without a cid. */
+function ack(
+  client: WsClient,
+  cid: unknown,
+  ok: boolean,
+  extra?: Record<string, unknown>,
+): void {
+  if (typeof cid !== "string" || !cid) return;
+  wsSend(client.socket, JSON.stringify({ type: "ack", cid, ok, ...extra }));
+}
+
 function handleWsMessage(client: WsClient, raw: string): void {
   try {
     const msg = JSON.parse(raw);
     const aid = targetAgentId();
     switch (msg.type) {
+      // ── New composite message envelope ──────────────────────────────────
+      // { type:"send", cid, targetAgentId?, text?, attachments:[{kind,dataUrl,...}] }
+      // One request carries text + image(s) together; replies with a single
+      // { type:"ack", cid, ok, queued, error? }. Idempotent by cid.
+      case "send": {
+        const target =
+          typeof msg.targetAgentId === "string" && msg.targetAgentId.trim()
+            ? msg.targetAgentId.trim()
+            : aid;
+        if (seenCid(msg.cid)) {
+          ack(client, msg.cid, true, { duplicate: true });
+          break;
+        }
+        const text = typeof msg.text === "string" ? msg.text.trim() : "";
+        const atts = Array.isArray(msg.attachments) ? msg.attachments : [];
+        const images = atts.filter(
+          (a: { kind?: string; dataUrl?: string }) =>
+            a && a.kind === "image" && typeof a.dataUrl === "string",
+        );
+        let queued = 0;
+        try {
+          if (images.length > 0) {
+            // Text rides with the first image as its caption → one message.
+            images.forEach((a: { dataUrl: string }, i: number) => {
+              if (handlePastedImage(a.dataUrl, i === 0 ? text : "", target)) {
+                queued++;
+              }
+            });
+          } else if (text) {
+            const item = sendTextTo(target, text);
+            pushHistoryItem({
+              id: item.id,
+              type: "text",
+              content: text,
+              timestamp: item.timestamp,
+            });
+            queued++;
+          }
+          ack(client, msg.cid, true, { queued });
+          broadcastWs({ type: "queueUpdate", count: getQueueCountFor(target) });
+          broadcastStateNow();
+        } catch (e) {
+          ack(client, msg.cid, false, { error: String(e), queued });
+        }
+        break;
+      }
       case "sendText":
         if (msg.text) {
           // De-dupe resends by client id; always ack so the client stops resending.
@@ -379,6 +548,7 @@ function broadcastWs(data: unknown): void {
 
 interface ParsedFrame {
   opcode: number;
+  fin: boolean;
   payload: Buffer;
   totalLength: number;
 }
@@ -387,6 +557,7 @@ function parseFrame(buf: Buffer): ParsedFrame | null {
   if (buf.length < 2) {
     return null;
   }
+  const fin = (buf[0] & 128) !== 0;
   const opcode = buf[0] & 15;
   const masked = (buf[1] & 128) !== 0;
   let payloadLen = buf[1] & 127;
@@ -417,7 +588,7 @@ function parseFrame(buf: Buffer): ParsedFrame | null {
       payload[i] ^= mask[i % 4];
     }
   }
-  return { opcode, payload, totalLength };
+  return { opcode, fin, payload, totalLength };
 }
 
 function buildFrame(payload: string | Buffer, opcode = 1): Buffer {
@@ -762,8 +933,11 @@ sendBtn.addEventListener('click',doSend);
 function doSend(){
 	if(!canSend())return;
 	var txt=input.value.trim();
-	if(txt){ws.send(JSON.stringify({type:'sendText',text:txt}));log('Send: '+txt.substring(0,40)+(txt.length>40?'...':''));}
-	for(var i=0;i<pendingImages.length;i++){ws.send(JSON.stringify({type:'sendImage',dataUrl:pendingImages[i].dataUrl,caption:''}));log('Send: [image]');}
+	var atts=pendingImages.map(function(im){return {kind:'image',dataUrl:im.dataUrl}});
+	var cid='c'+Date.now()+'-'+Math.random().toString(36).slice(2,7);
+	// One composite message (text + image[s]) instead of separate sends.
+	ws.send(JSON.stringify({type:'send',cid:cid,text:txt,attachments:atts}));
+	log('Send: '+(txt?txt.substring(0,40):'')+(atts.length?' [+'+atts.length+' image]':''));
 	input.value='';pendingImages=[];renderThumbs();updateSendBtn();
 	sendStatus.innerHTML='<span class="sent-ok">Sent</span>';
 	setTimeout(function(){sendStatus.innerHTML=''},2000);
@@ -858,9 +1032,17 @@ function renderQueue(items){
 	$('queueBadge').textContent=items.length+' items';$('queueBadge').className='card-badge on';
 	var h='';
 	for(var i=0;i<items.length;i++){
-		var it=items[i],tp=it.type||'text',preview=tp==='text'?(it.content||''):(tp==='image'?'[Image]':'[File] '+(it.path||'').split(/[\\/\\\\]/).pop());
+		var it=items[i],tp=it.type||'text';
 		var time=it.timestamp?new Date(it.timestamp).toLocaleTimeString():'';
-		h+='<div class="queue-item"><span class="qi-type '+tp+'">'+({text:'Text',image:'Image',file:'File'}[tp]||tp)+'</span><span class="qi-content">'+esc(preview.substring(0,120))+'</span><span class="qi-time">'+time+'</span></div>';
+		var contentHtml;
+		if(tp==='image'){
+			contentHtml=(it.dataUrl?'<img src="'+it.dataUrl+'" style="max-width:120px;max-height:90px;border-radius:6px;display:block;margin-bottom:4px">':'')+(it.caption?'<div>'+esc(it.caption)+'</div>':(it.dataUrl?'':'[Image]'));
+		}else if(tp==='file'){
+			contentHtml=esc('[File] '+((it.path||'').split(/[\\/\\\\]/).pop()||''));
+		}else{
+			contentHtml=esc((it.content||'').substring(0,120));
+		}
+		h+='<div class="queue-item"><span class="qi-type '+tp+'">'+({text:'Text',image:'Image',file:'File'}[tp]||tp)+'</span><span class="qi-content">'+contentHtml+'</span><span class="qi-time">'+time+'</span></div>';
 	}
 	L.innerHTML=h;
 }
@@ -910,6 +1092,7 @@ function connect(){
 			var m=JSON.parse(e.data);
 			if(m.type==='init'||m.type==='stateUpdate'){updateDashboard(m);updateSendBtn()}
 			else if(m.type==='queueUpdate'){$('statQueue').textContent=m.count||0}
+			else if(m.type==='ack'){if(!m.ok)log('Send failed: '+(m.error||'unknown'))}
 			else if(m.type==='pong'){}
 		}catch(err){log('Parse error')}
 	};

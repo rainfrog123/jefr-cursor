@@ -273,54 +273,48 @@ async function robustWriteFile(file: string, data: string): Promise<void> {
   }
 }
 
+/** Atomically take and clear ALL pending messages from one queue dir under its
+ *  lock, so a concurrent send can't be lost between our read and clear. A
+ *  lock-free peek avoids lock churn on the common empty case. */
+async function takeQueue(dir: string): Promise<QueueMessage[]> {
+  const peek = await readQueue(dir);
+  if (peek.length === 0) return [];
+  const locked = await acquireQueueLock(dir);
+  try {
+    const queue = await readQueue(dir);
+    if (queue.length > 0) {
+      await robustWriteFile(queueFile(dir), "[]");
+    }
+    return queue;
+  } finally {
+    if (locked) {
+      await releaseQueueLock(dir);
+    }
+  }
+}
+
 /**
- * Atomically take ALL pending messages and clear the queue under the shared
- * lock, so a concurrent send from the extension can't be lost between our read
- * and clear. A lock-free peek avoids lock churn on the common empty case.
+ * Drain everything pending for this agent: its own queue AND the shared root
+ * queue ("General · shared", e.g. from the Obsidian plugin).
  *
- * Multi-agent fix: when reading from an agent-specific directory, also check
- * the shared root queue as a fallback. This allows messages sent to the root
- * queue (e.g., from Obsidian) to reach specific agents.
+ * The root is drained on EVERY call — not only when the agent's own queue is
+ * empty. Otherwise an agent that always has its own messages would never fall
+ * back to the root, so shared-root messages would starve indefinitely once
+ * every agent is addressed by its own agent_id. The lock makes each take
+ * atomic, so when several agents are listening exactly one wins the shared
+ * message (single delivery), never a duplicate.
+ *
+ * Agent-specific items come first, then shared-root items.
  */
 async function drainQueue(dir: string): Promise<QueueMessage[]> {
-  // First check the agent-specific queue
-  const peek = await readQueue(dir);
-  if (peek.length > 0) {
-    const locked = await acquireQueueLock(dir);
-    try {
-      const queue = await readQueue(dir);
-      if (queue.length > 0) {
-        await robustWriteFile(queueFile(dir), "[]");
-      }
-      return queue;
-    } finally {
-      if (locked) {
-        await releaseQueueLock(dir);
-      }
-    }
+  const own = await takeQueue(dir);
+  if (dir === DATA_DIR) {
+    // Already draining the root itself — nothing extra to merge.
+    return own;
   }
-
-  // Fallback: check the shared root queue (for Obsidian plugin, etc.)
-  // Only do this if we're reading from an agent-specific directory
-  if (dir !== DATA_DIR) {
-    const rootPeek = await readQueue(DATA_DIR);
-    if (rootPeek.length > 0) {
-      const locked = await acquireQueueLock(DATA_DIR);
-      try {
-        const queue = await readQueue(DATA_DIR);
-        if (queue.length > 0) {
-          await robustWriteFile(queueFile(DATA_DIR), "[]");
-        }
-        return queue;
-      } finally {
-        if (locked) {
-          await releaseQueueLock(DATA_DIR);
-        }
-      }
-    }
-  }
-
-  return [];
+  const shared = await takeQueue(DATA_DIR);
+  if (shared.length === 0) return own;
+  return own.concat(shared);
 }
 
 /** Resolves true after `ms`, or false immediately if the signal aborts. */
@@ -549,10 +543,23 @@ server.tool(
         const queue = await drainQueue(dir);
         if (queue.length > 0) {
           const results: ContentPart[] = [];
-          for (const msg of queue) {
-            const processed = await processMessage(msg);
-            if (Array.isArray(processed)) results.push(...processed);
-            else results.push(processed);
+          // When several messages drain at once, the model otherwise reads them
+          // as one merged blob. Label each with a "Message i of N" header so they
+          // stay DISTINCT user messages (separate points). A lone message is left
+          // clean — no header noise.
+          const multi = queue.length > 1;
+          for (let i = 0; i < queue.length; i++) {
+            const processed = await processMessage(queue[i]);
+            const parts = Array.isArray(processed) ? processed : [processed];
+            if (multi) {
+              const header = `[Message ${i + 1} of ${queue.length}]`;
+              const firstText = parts.find((p) => p.type === "text") as
+                | { type: "text"; text: string }
+                | undefined;
+              if (firstText) firstText.text = `${header}\n${firstText.text}`;
+              else parts.unshift({ type: "text", text: header });
+            }
+            results.push(...parts);
           }
 
           // Append the loop-reminder suffix to the last text part.

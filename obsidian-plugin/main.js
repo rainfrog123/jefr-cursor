@@ -32,6 +32,10 @@ const DEFAULT_SETTINGS = {
   autoReconnect: true,
   maxHistory: 400,
   minimized: false,
+  // Fire a native OS (Windows) notification whenever the MCP Response Log is
+  // rewritten by the agent. Path is vault-relative (forward slashes).
+  notifyOnLogRewrite: true,
+  logNotifyPath: "Tech/Meta/MCP Response Log.md",
 };
 
 /* ------------------------------------------------------------------ */
@@ -93,10 +97,51 @@ class JefrPlugin extends Plugin {
     });
 
     this.addSettingTab(new JefrSettingTab(this.app, this));
+
+    // Watch the vault for the MCP Response Log being rewritten and raise a
+    // native OS notification. Obsidian fires "modify" for external writes too,
+    // so this catches the agent overwriting the file from outside Obsidian.
+    this._lastLogNotifyAt = 0;
+    void ensureNotificationPermission();
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => this.onVaultModify(file)),
+    );
   }
 
   onunload() {
     // Views detach themselves and close their sockets via onClose().
+  }
+
+  /** Vault "modify" handler — fire an OS notification when the configured
+   *  MCP Response Log file changes. Debounced so one rewrite = one toast. */
+  onVaultModify(file) {
+    if (!this.settings.notifyOnLogRewrite || !file || !file.path) return;
+    const target = (this.settings.logNotifyPath || "").trim();
+    if (!target) return;
+
+    const norm = (p) => p.replace(/\\/g, "/").toLowerCase();
+    const fp = norm(file.path);
+    const tp = norm(target);
+    // Match the configured vault-relative path, or fall back to basename so a
+    // mis-set folder still works as long as the filename matches.
+    const baseOf = (p) => p.slice(p.lastIndexOf("/") + 1);
+    const matches = fp === tp || fp.endsWith("/" + tp) || baseOf(fp) === baseOf(tp);
+    if (!matches) return;
+
+    const now = Date.now();
+    if (now - (this._lastLogNotifyAt || 0) < 800) return; // debounce double-fires
+    this._lastLogNotifyAt = now;
+
+    showOsNotification("MCP Response Log updated", {
+      body: (file.basename || baseOf(file.path)) + " was just rewritten by the agent.",
+      onClick: () => {
+        try {
+          this.app.workspace.openLinkText(file.path, "", false);
+        } catch {
+          /* ignore */
+        }
+      },
+    });
   }
 
   async saveSettings() {
@@ -738,6 +783,7 @@ class JefrView extends ItemView {
 
   renderQuestion(q) {
     if (!q || !q.questions || !q.questions.length) {
+      this.removeQuestionKeyHandler();
       this.questionEl.empty();
       this.currentQuestionId = null;
       return;
@@ -768,7 +814,11 @@ class JefrView extends ItemView {
       }
       const other = block.createEl("input", {
         cls: "jefr-qother",
-        attr: { type: "text", placeholder: "Additional notes (optional)", "data-qid": qi.id },
+        attr: {
+          type: "text",
+          placeholder: "Additional notes (Enter to submit)",
+          "data-qid": qi.id,
+        },
       });
       void other;
     }
@@ -779,7 +829,29 @@ class JefrView extends ItemView {
     const submit = actions.createEl("button", { cls: "jefr-btn jefr-btn-send", text: "Submit answer" });
     submit.onclick = () => this.submitQuestion(q);
 
+    // Enter (anywhere except the main message box) submits the question; Shift+
+    // Enter is left alone. Registered while the card is shown and torn down on
+    // submit / cancel / replace so it never lingers or double-fires.
+    this.removeQuestionKeyHandler();
+    const onKey = (e) => {
+      if (e.key !== "Enter" || e.shiftKey) return;
+      const ae = document.activeElement;
+      if (ae && ae.classList && ae.classList.contains("jefr-input")) return;
+      e.preventDefault();
+      this.submitQuestion(q);
+    };
+    document.addEventListener("keydown", onKey, true);
+    this._removeQuestionKey = () =>
+      document.removeEventListener("keydown", onKey, true);
+
     this.scrollToBottom();
+  }
+
+  removeQuestionKeyHandler() {
+    if (this._removeQuestionKey) {
+      this._removeQuestionKey();
+      this._removeQuestionKey = null;
+    }
   }
 
   toggleOption(qi, optId, optEl, optsContainer) {
@@ -797,6 +869,9 @@ class JefrView extends ItemView {
   }
 
   submitQuestion(q) {
+    // Guard against a double-submit (e.g. Enter + button, or repeated Enter):
+    // once the active question is cleared, ignore further submits for it.
+    if (!q || this.currentQuestionId !== q.id) return;
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       new Notice("jefr is offline.");
       return;
@@ -812,6 +887,7 @@ class JefrView extends ItemView {
     }
     this.ws.send(JSON.stringify({ type: "submitAnswer", data: { id: q.id, answers } }));
     this.addSystemNote("Answer submitted");
+    this.removeQuestionKeyHandler();
     this.questionEl.empty();
     this.currentQuestionId = null;
   }
@@ -821,6 +897,7 @@ class JefrView extends ItemView {
       this.ws.send(JSON.stringify({ type: "cancelQuestion" }));
     }
     this.addSystemNote("Question cancelled");
+    this.removeQuestionKeyHandler();
     this.questionEl.empty();
     this.currentQuestionId = null;
   }
@@ -853,6 +930,7 @@ class JefrView extends ItemView {
     if (d.question) {
       this.renderQuestion(d.question);
     } else if (this.currentQuestionId) {
+      this.removeQuestionKeyHandler();
       this.questionEl.empty();
       this.currentQuestionId = null;
     }
@@ -1293,6 +1371,44 @@ class JefrSettingTab extends PluginSettingTab {
           })
       );
 
+    containerEl.createEl("h3", { text: "Notifications" });
+
+    new Setting(containerEl)
+      .setName("Notify on MCP log rewrite")
+      .setDesc("Show a native OS (Windows) notification whenever the MCP Response Log file is rewritten.")
+      .addToggle((tg) =>
+        tg.setValue(this.plugin.settings.notifyOnLogRewrite).onChange(async (v) => {
+          this.plugin.settings.notifyOnLogRewrite = v;
+          await this.plugin.saveSettings();
+          if (v) ensureNotificationPermission();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("MCP log path")
+      .setDesc("Vault-relative path to the MCP Response Log to watch (forward slashes).")
+      .addText((t) =>
+        t
+          .setPlaceholder("Tech/Meta/MCP Response Log.md")
+          .setValue(this.plugin.settings.logNotifyPath)
+          .onChange(async (v) => {
+            this.plugin.settings.logNotifyPath = (v || "").trim() || "Tech/Meta/MCP Response Log.md";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Test notification")
+      .setDesc("Fire a sample OS notification to confirm Windows toasts work.")
+      .addButton((b) =>
+        b.setButtonText("Send test").onClick(async () => {
+          await ensureNotificationPermission();
+          showOsNotification("MCP Response Log updated", {
+            body: "This is a test notification from the jefr plugin.",
+          });
+        })
+      );
+
     const tip = containerEl.createEl("p", { cls: "jefr-settings-tip" });
     tip.setText(
       "The jefr Cursor extension must be running for this to connect. Messages you send here go through the same queue your agent reads and also appear in the jefr panel inside Cursor."
@@ -1306,6 +1422,53 @@ class JefrSettingTab extends PluginSettingTab {
 
 function makeId() {
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
+
+/** Ask the browser/Electron for notification permission once (no-op if already
+ *  granted or unsupported). Returns a promise that resolves to the permission. */
+async function ensureNotificationPermission() {
+  try {
+    if (typeof Notification === "undefined") return "unsupported";
+    if (Notification.permission === "granted" || Notification.permission === "denied") {
+      return Notification.permission;
+    }
+    return await Notification.requestPermission();
+  } catch {
+    return "default";
+  }
+}
+
+/** Show a native OS notification (Windows toast in Electron). Falls back to an
+ *  in-app Obsidian Notice if the web Notification API is unavailable/blocked. */
+function showOsNotification(title, opts) {
+  const body = (opts && opts.body) || "";
+  const onClick = opts && opts.onClick;
+  try {
+    if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+      const n = new Notification(title, { body, silent: false });
+      if (onClick) n.onclick = () => onClick();
+      return;
+    }
+    if (typeof Notification !== "undefined" && Notification.permission !== "denied") {
+      // Permission not resolved yet — request, then show on grant.
+      ensureNotificationPermission().then((perm) => {
+        if (perm === "granted") {
+          const n = new Notification(title, { body, silent: false });
+          if (onClick) n.onclick = () => onClick();
+        } else {
+          new Notice(title + (body ? " — " + body : ""));
+        }
+      });
+      return;
+    }
+  } catch {
+    /* fall through to Notice */
+  }
+  try {
+    new Notice(title + (body ? " — " + body : ""));
+  } catch {
+    /* ignore */
+  }
 }
 
 function nowTime() {

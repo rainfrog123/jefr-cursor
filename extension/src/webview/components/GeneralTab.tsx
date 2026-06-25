@@ -1,27 +1,27 @@
 /**
- * General-purpose tab (formerly "Usage").
- *
- * Hosts the CDP **agent workflow** runner — which spawns a fresh Cursor agent
- * tile, sends a stand-by prompt, switches to the selected model (default
- * Opus 4.8 1M Extra High Fast), types the invoke-mcp prompt, and holds Enter
- * until MCP is connected.
+ * General tab — Cursor usage + session token, the agent **workflow runner**
+ * (model + prompts + keep-tiles + Run/Reconnect), and a live log.
  */
 import React, { useEffect, useRef, useState } from "react";
 import { post } from "../vscode";
-import type { UsageData } from "../types";
+import type { DebugEntry, UsageData } from "../types";
 import {
   DEFAULT_WORKFLOW_MODEL,
   WORKFLOW_MODELS,
   type WorkflowModel,
 } from "../workflowModels";
+import { BrandHeader } from "./Header";
 
 export interface WorkflowLine {
   stream: "stdout" | "stderr";
   line: string;
 }
 
-/** Default model for the agent workflow tile (full picker label). */
-const DEFAULT_MODEL = DEFAULT_WORKFLOW_MODEL;
+function fmtClock(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
 
 export function GeneralTab(props: {
   usage: UsageData | null;
@@ -30,6 +30,10 @@ export function GeneralTab(props: {
   workflowRunning: boolean;
   workflowOutput: WorkflowLine[];
   onClearWorkflowOutput: () => void;
+  debugLog: DebugEntry[];
+  onClearDebugLog: () => void;
+  version: string;
+  onOpenConsole: () => void;
 }): JSX.Element {
   const {
     usage,
@@ -38,16 +42,28 @@ export function GeneralTab(props: {
     workflowRunning,
     workflowOutput,
     onClearWorkflowOutput,
+    debugLog,
+    onClearDebugLog,
+    version,
+    onOpenConsole,
   } = props;
 
   const [token, setToken] = useState("");
+  const [model, setModel] = useState<WorkflowModel>(DEFAULT_WORKFLOW_MODEL);
+  const [keepTiles, setKeepTiles] = useState(true);
   const [autoPrompt, setAutoPrompt] = useState("");
   const [opusPrompt, setOpusPrompt] = useState("");
   const [maxSecs, setMaxSecs] = useState("6000");
   const [tile, setTile] = useState("");
-  const [model, setModel] = useState<WorkflowModel>(DEFAULT_MODEL);
-  const [keepTiles, setKeepTiles] = useState(true);
   const outRef = useRef<HTMLPreElement | null>(null);
+  const dbgRef = useRef<HTMLPreElement | null>(null);
+
+  // Keep the debug log scrolled to the newest line.
+  useEffect(() => {
+    if (dbgRef.current) {
+      dbgRef.current.scrollTop = dbgRef.current.scrollHeight;
+    }
+  }, [debugLog]);
 
   // Keep the log scrolled to the newest line.
   useEffect(() => {
@@ -57,59 +73,45 @@ export function GeneralTab(props: {
   }, [workflowOutput]);
 
   const runWorkflow = () => {
-    const maxSecsNum = maxSecs.trim() ? Number(maxSecs.trim()) : undefined;
+    const n = maxSecs.trim() ? Number(maxSecs.trim()) : undefined;
     post({
       type: "runWorkflow",
       autoPrompt: autoPrompt.trim() || undefined,
       opusPrompt: opusPrompt.trim() || undefined,
-      maxSecs:
-        maxSecsNum != null && isFinite(maxSecsNum) ? maxSecsNum : undefined,
+      maxSecs: n != null && isFinite(n) ? n : undefined,
       model: model.trim() || undefined,
       keepTiles,
     });
   };
 
   const reconnectWorkflow = () => {
-    const maxSecsNum = maxSecs.trim() ? Number(maxSecs.trim()) : undefined;
-    const tileNum = tile.trim() ? Number(tile.trim()) : undefined;
+    const n = maxSecs.trim() ? Number(maxSecs.trim()) : undefined;
+    const t = tile.trim() ? Number(tile.trim()) : undefined;
     post({
       type: "reconnectWorkflow",
-      tile:
-        tileNum != null && Number.isInteger(tileNum) ? tileNum : undefined,
+      tile: t != null && Number.isInteger(t) ? t : undefined,
       opusPrompt: opusPrompt.trim() || undefined,
-      maxSecs:
-        maxSecsNum != null && isFinite(maxSecsNum) ? maxSecsNum : undefined,
+      maxSecs: n != null && isFinite(n) ? n : undefined,
     });
   };
 
   return (
     <div className="general-tab">
+      {/* ── Brand header (moved here from the footer) ── */}
+      <BrandHeader version={version} onOpenConsole={onOpenConsole} />
+
       {/* ── Agent workflow runner ── */}
       <div className="workflow-card">
         <div className="workflow-head">
           <span className="workflow-title">Agent workflow</span>
           <span
-            className={
-              "workflow-status" + (workflowRunning ? " on" : " off")
-            }
+            className={"workflow-status" + (workflowRunning ? " on" : " off")}
           >
             {workflowRunning ? "Running" : "Idle"}
           </span>
         </div>
 
-        <p className="workflow-desc">
-          Spawns a fresh Cursor agent tile over CDP, sends a stand-by prompt,
-          switches to the <strong>selected model</strong>, types the invoke-mcp
-          prompt, then holds Enter until the tile is <strong>connected to the
-          jefr MCP loop</strong>.{" "}
-          <strong>Reconnect</strong> instead re-primes a dropped (“Worked”) tile
-          in place — auto-detecting it, or use the tile index — to rebuild the
-          MCP loop on that same tile. Requires Cursor launched with{" "}
-          <code>--remote-debugging-port=9222</code>.
-        </p>
-
-        <label className="workflow-model-row">
-          <span className="workflow-model-label">Model</span>
+        <div className="workflow-row">
           <select
             className="workflow-model-select"
             value={model}
@@ -123,24 +125,23 @@ export function GeneralTab(props: {
               </option>
             ))}
           </select>
-        </label>
-
-        <label
-          className="workflow-keep-tiles"
-          title="Keep already-open agent tiles instead of collapsing them, so repeated spawns accumulate multiple agents online at once"
-        >
-          <input
-            type="checkbox"
-            checked={keepTiles}
-            disabled={workflowRunning}
-            onChange={(e) => setKeepTiles(e.target.checked)}
-          />
-          Keep existing agents (accumulate)
-        </label>
+          <label
+            className="workflow-keep-tiles"
+            title="Keep already-open tiles so repeated spawns accumulate agents"
+          >
+            <input
+              type="checkbox"
+              checked={keepTiles}
+              disabled={workflowRunning}
+              onChange={(e) => setKeepTiles(e.target.checked)}
+            />
+            Keep agents
+          </label>
+        </div>
 
         <textarea
           className="workflow-input"
-          placeholder="Auto / stand-by prompt (optional — defaults to a timestamped stand-by)"
+          placeholder="Stand-by prompt (optional)"
           rows={2}
           value={autoPrompt}
           disabled={workflowRunning}
@@ -148,7 +149,7 @@ export function GeneralTab(props: {
         />
         <textarea
           className="workflow-input"
-          placeholder="MCP prompt (optional — defaults to an invoke-mcp instruction)"
+          placeholder="MCP prompt (optional)"
           rows={2}
           value={opusPrompt}
           disabled={workflowRunning}
@@ -160,7 +161,7 @@ export function GeneralTab(props: {
             className="card-input workflow-secs"
             type="number"
             min={0}
-            placeholder="Max secs (6000)"
+            placeholder="Max secs"
             value={maxSecs}
             disabled={workflowRunning}
             onChange={(e) => setMaxSecs(e.target.value)}
@@ -173,7 +174,7 @@ export function GeneralTab(props: {
             value={tile}
             disabled={workflowRunning}
             onChange={(e) => setTile(e.target.value)}
-            title="Tile index to reconnect (leave blank to auto-detect the dropped tile)"
+            title="Tile to reconnect (blank = auto-detect the dropped tile)"
           />
           {workflowRunning ? (
             <button
@@ -188,7 +189,7 @@ export function GeneralTab(props: {
                 className="btn btn-primary btn-small"
                 onClick={runWorkflow}
               >
-                Run workflow
+                Run
               </button>
               <button
                 className="btn btn-secondary btn-small"
@@ -208,8 +209,7 @@ export function GeneralTab(props: {
                 <div
                   key={i}
                   className={
-                    "workflow-line" +
-                    (l.stream === "stderr" ? " err" : "")
+                    "workflow-line" + (l.stream === "stderr" ? " err" : "")
                   }
                 >
                   {l.line}
@@ -302,6 +302,52 @@ export function GeneralTab(props: {
           )}
         </div>
       )}
+
+      {/* ── Debug log ── */}
+      <div className="debug-card">
+        <div className="debug-head">
+          <span className="debug-title">Debug log</span>
+          <span className="debug-count">{debugLog.length}</span>
+          <div className="debug-actions">
+            <button
+              className="btn btn-secondary btn-small"
+              disabled={debugLog.length === 0}
+              onClick={() => {
+                const text = debugLog
+                  .map((e) => `${fmtClock(e.ts)} [${e.level}] ${e.line}`)
+                  .join("\n");
+                navigator.clipboard?.writeText(text).catch(() => {});
+              }}
+              title="Copy the whole debug log"
+            >
+              Copy
+            </button>
+            <button
+              className="btn btn-secondary btn-small"
+              disabled={debugLog.length === 0}
+              onClick={onClearDebugLog}
+              title="Clear the debug log"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+        {debugLog.length === 0 ? (
+          <div className="debug-empty">
+            No events yet — agent connects, drops, self-heals, spawns and reaps
+            will show up here.
+          </div>
+        ) : (
+          <pre className="debug-output" ref={dbgRef}>
+            {debugLog.map((e, i) => (
+              <div key={i} className={"debug-line " + e.level}>
+                <span className="debug-time">{fmtClock(e.ts)}</span>
+                <span className="debug-msg">{e.line}</span>
+              </div>
+            ))}
+          </pre>
+        )}
+      </div>
     </div>
   );
 }

@@ -1,0 +1,24 @@
+{
+  "timestamp": "20260618_023640",
+  "cap_secs": 240.0,
+  "total": 2,
+  "invoked": 2,
+  "timed_out": 0,
+  "tiles": [
+    {
+      "n": 1,
+      "idx": 1,
+      "prompt": "check repo #4702",
+      "started": true,
+      "elapsed": 218.3
+    },
+    {
+      "n": 2,
+      "idx": 2,
+      "prompt": "explain repo #9461",
+      "started": true,
+      "elapsed": 99.5
+    }
+  ],
+  "timed_out_tiles": []
+}

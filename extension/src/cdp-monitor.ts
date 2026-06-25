@@ -25,6 +25,13 @@ export interface TileInfo {
   /** True only while a check_messages call is *currently running* (live tool
    *  card / shimmer) — not when "Ran Check Messages" merely sits in scrollback. */
   mcpVisible: boolean;
+  /** True when a jefr check_messages tool card is in an ERROR/failed state — the
+   *  server-drop fingerprint: the held-open call died, so there's no "Ran…"
+   *  success and no "Worked for…" stamp, and the tile would otherwise read as a
+   *  plain idle/down. Determined from the card's status/class/error-icon only —
+   *  never from arbitrary card text — so a reply that merely mentions "error"
+   *  can't false-positive. */
+  mcpErrored: boolean;
   /** True when submit button is in stop/generating mode */
   generating: boolean;
   /** True when "Planning next moves" shimmer is visible */
@@ -134,6 +141,28 @@ export class CdpMonitor extends EventEmitter {
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /** Poll an evaluate expression until it returns truthy or the timeout elapses.
+   *  Returns as soon as the UI settles, so it's far faster than a fixed sleep
+   *  while still bounding the worst case. */
+  private async pollEval(
+    expr: string,
+    timeoutMs: number,
+    stepMs = 50,
+  ): Promise<unknown> {
+    const start = Date.now();
+    for (;;) {
+      let v: unknown;
+      try {
+        v = await this.session!.evaluate(expr, false);
+      } catch {
+        v = undefined;
+      }
+      if (v) return v;
+      if (Date.now() - start >= timeoutMs) return v;
+      await this.sleep(stepMs);
+    }
   }
 
   private async clickAt(x: number, y: number): Promise<void> {
@@ -366,6 +395,70 @@ export class CdpMonitor extends EventEmitter {
     }
   }
 
+  /** Press a key chord via CDP (keyDown + keyUp). Modifier bits per CDP:
+   *  Alt=1, Ctrl=2, Meta=4, Shift=8. */
+  private async pressKey(
+    key: string,
+    code: string,
+    vk: number,
+    mods: { ctrl?: boolean; shift?: boolean; alt?: boolean; meta?: boolean } = {},
+  ): Promise<void> {
+    if (!this.session) {
+      throw new Error("CDP session not connected");
+    }
+    let modifiers = 0;
+    if (mods.alt) modifiers |= 1;
+    if (mods.ctrl) modifiers |= 2;
+    if (mods.meta) modifiers |= 4;
+    if (mods.shift) modifiers |= 8;
+    const base = {
+      modifiers,
+      key,
+      code,
+      windowsVirtualKeyCode: vk,
+      nativeVirtualKeyCode: vk,
+    };
+    await this.session.call("Input.dispatchKeyEvent", { type: "keyDown", ...base });
+    await this.session.call("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  }
+
+  /** Fast tile close: focus the tile, then send Ctrl+W (Cursor's close-tile
+   *  shortcut; Ctrl+D is OPEN/new-tile, not close). Far quicker than driving the
+   *  tile menu. Verifies the SPECIFIC agent's tile is gone, so a mis-focus or a
+   *  swallowed chord can't close the wrong one; returns false if it's still
+   *  present (the caller falls back to the menu close). */
+  async closeAgentTileFast(agentId: string): Promise<boolean> {
+    if (!this.session) return false;
+    const focused = await this.focusAgent(agentId);
+    if (!focused) return false;
+    await this.sleep(80);
+    try {
+      await this.pressKey("w", "KeyW", 87, { ctrl: true });
+    } catch {
+      return false;
+    }
+    const goneJs = `
+(function() {
+  const TARGET = ${JSON.stringify(agentId)};
+  const tiles = [...document.querySelectorAll('.glass-agent-conversation-tiling__tile')];
+  function agentIdOf(node) {
+    const k = Object.keys(node).find(x =>
+      x.startsWith('__reactFiber$') || x.startsWith('__reactInternalInstance$')
+    );
+    let f = k ? node[k] : null, steps = 0;
+    while (f && steps++ < 40) {
+      const p = f.memoizedProps;
+      if (p && typeof p === 'object' && typeof p.agentId === 'string') return p.agentId;
+      f = f.return;
+    }
+    return null;
+  }
+  return !tiles.some(t => agentIdOf(t) === TARGET);
+})()
+    `;
+    return !!(await this.pollEval(goneJs, 900, 50));
+  }
+
   /** Close the tile for agentId. Returns true only after the target tile is gone. */
   async closeAgentTile(agentId: string): Promise<boolean> {
     if (!this.session) return false;
@@ -451,14 +544,74 @@ export class CdpMonitor extends EventEmitter {
         return false;
       }
       await this.clickAt(trigger.x, trigger.y);
-      await this.sleep(350);
-      const close = await this.session.evaluate(closeJs, false) as { x?: number; y?: number } | false;
+      // Poll for the "Close" menu item instead of a fixed wait — it renders fast.
+      const close = (await this.pollEval(closeJs, 700, 40)) as
+        | { x?: number; y?: number }
+        | false
+        | undefined;
       if (!close || typeof close.x !== "number" || typeof close.y !== "number") {
         return false;
       }
       await this.clickAt(close.x, close.y);
-      await this.sleep(900);
-      return !!(await this.session.evaluate(goneJs, false));
+      // Poll for the tile to actually vanish rather than waiting a flat 900ms.
+      return !!(await this.pollEval(goneJs, 1200, 60));
+    } catch {
+      return false;
+    }
+  }
+
+  /** Close the tile at a given index (for tiles with no resolvable agentId).
+   *  Returns true once the tile count drops. */
+  async closeTileByIndex(index: number): Promise<boolean> {
+    if (!this.session || !Number.isInteger(index) || index < 0) return false;
+    const triggerJs = `
+(function() {
+  const IDX = ${index};
+  const tiles = [...document.querySelectorAll('.glass-agent-conversation-tiling__tile')];
+  if (tiles.length <= 1 || IDX >= tiles.length) return false;
+  function tileMenuTrigger(tile, idx) {
+    const inTile = tile?.querySelector('[aria-label="Tile actions"],.glass-agent-conversation-tiling__menu-trigger');
+    if (inTile) return inTile;
+    const actions = [...document.querySelectorAll('[aria-label="Tile actions"],.glass-agent-conversation-tiling__menu-trigger')]
+      .filter(e => e.offsetParent);
+    return actions[idx] || null;
+  }
+  const trig = tileMenuTrigger(tiles[IDX], IDX);
+  if (!trig) return false;
+  const r = trig.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2, count: tiles.length };
+})()
+    `;
+    const closeJs = `
+(function() {
+  const items = [...document.querySelectorAll('[role^="menuitem"],[role="option"]')]
+    .filter(e => e.offsetParent);
+  const close = items.find(e => (e.textContent || '').trim().toLowerCase().startsWith('close'));
+  if (!close) return false;
+  const r = close.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+})()
+    `;
+    try {
+      const trigger = (await this.session.evaluate(triggerJs, false)) as
+        | { x?: number; y?: number; count?: number }
+        | false;
+      if (!trigger || typeof trigger.x !== "number" || typeof trigger.y !== "number") {
+        return false;
+      }
+      const before = typeof trigger.count === "number" ? trigger.count : 0;
+      await this.clickAt(trigger.x, trigger.y);
+      const close = (await this.pollEval(closeJs, 700, 40)) as
+        | { x?: number; y?: number }
+        | false
+        | undefined;
+      if (!close || typeof close.x !== "number" || typeof close.y !== "number") {
+        return false;
+      }
+      await this.clickAt(close.x, close.y);
+      // Poll until the tile count actually drops below the pre-close count.
+      const droppedJs = `document.querySelectorAll('.glass-agent-conversation-tiling__tile').length < ${before}`;
+      return !!(await this.pollEval(droppedJs, 1200, 60));
     } catch {
       return false;
     }
@@ -517,6 +670,56 @@ export class CdpMonitor extends EventEmitter {
     return false;
   }
 
+  // The server-drop fingerprint, confirmed by CDP-inspecting a live drop: when the
+  // held-open call dies (server crash/restart, transport break, client abort),
+  // Cursor marks the in-flight check_messages tool card as **Cancelled** — it
+  // carries data-tool-status="cancelled" and renders "Cancelled Check Messages in
+  // jefr". A healthy call reads "Running…" then "Ran" (status running/completed),
+  // so only a cancelled/failed/errored status is a drop. We key off the card's own
+  // status (attribute + its lead status word) — NEVER the delivered reply text —
+  // so a reply that merely contains "error" can't false-trip it.
+  function mcpErroredIn(t) {
+    const toolCards = [...t.querySelectorAll('[data-message-kind="tool"]')];
+    // Only the MOST RECENT jefr check_messages card matters: an agent that
+    // dropped then reconnected leaves an old "Cancelled" card up the transcript
+    // while its newest card reads "Running"/"Ran". Judging by the latest card
+    // alone means a recovered agent isn't stuck looking dropped.
+    let last = null;
+    for (const m of toolCards) {
+      const txt = m.textContent || '';
+      if (!/check\\s*messages/i.test(txt) || !/jefr/i.test(txt)) continue;
+      last = m;
+    }
+    if (!last) return false;
+    const status = (last.getAttribute('data-tool-status') || '').toLowerCase();
+    if (/cancel|error|fail|abort|reject/.test(status)) return true;
+    // Fallback for builds without the status attribute: the card text begins with
+    // its status word, e.g. "CancelledCheck Messages in jefr".
+    const txt = last.textContent || '';
+    if (/^\\s*(cancel|failed|errored|aborted|rejected)/i.test(txt)) return true;
+    return false;
+  }
+
+  // The agent is actively WORKING when any tool call is mid-flight: a tool card in
+  // a running/loading status, or carrying a live shimmer/spinner. This is true
+  // even when the submit button isn't in "stop" mode (tool execution happens
+  // between text generations). Without it, a long turn between check_messages
+  // calls reads as idle and can be misflagged as dropped. Verified via CDP: a
+  // working tile has a tool card with data-tool-status="loading".
+  function toolWorkingIn(t) {
+    const cards = [...t.querySelectorAll('[data-message-kind="tool"]')];
+    for (const m of cards) {
+      const status = (m.getAttribute('data-tool-status') || '').toLowerCase();
+      const cls = typeof m.className === 'string' ? m.className : '';
+      const running =
+        /run|load|pend|progress|stream/.test(status) ||
+        /with-stop/.test(cls) ||
+        !!m.querySelector('[class*="shimmer"],[class*="spinner"],.codicon-modifier-spin,[data-state="stop"]');
+      if (running) return true;
+    }
+    return false;
+  }
+
   return tiles.map((t, i) => {
     const submit = t.querySelector('.ui-prompt-input-submit-button');
     const aria = submit?.getAttribute('aria-label') || '';
@@ -526,6 +729,12 @@ export class CdpMonitor extends EventEmitter {
     const planning = /planning\\s+next\\s+move/i.test(sh);
 
     const mcpRunning = mcpRunningIn(t);
+    const toolWorking = toolWorkingIn(t);
+    // A cancelled-card drop only counts when the tile isn't otherwise busy — an
+    // agent that recovered and is generating / running a tool again must not read
+    // as dropped from a stale "Cancelled" card left up the transcript.
+    const mcpErrored =
+      !mcpRunning && !generating && !planning && !toolWorking && mcpErroredIn(t);
 
     // "Worked for ..." completion stamp = the turn ended (MCP cut out). Prefer the
     // live status/followup area; fall back to the recent tail. We do NOT scan the
@@ -548,6 +757,7 @@ export class CdpMonitor extends EventEmitter {
     if (mcpRunning) state = 'mcp_connected';
     else if (planning) state = 'planning';
     else if (generating) state = 'generating';
+    else if (toolWorking) state = 'generating';
 
     return {
       index: i,
@@ -555,7 +765,8 @@ export class CdpMonitor extends EventEmitter {
       model,
       state,
       mcpVisible: mcpRunning,
-      generating,
+      mcpErrored,
+      generating: generating || toolWorking,
       planning,
       worked,
     };

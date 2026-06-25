@@ -695,13 +695,15 @@ export function sendTextTo(agentId: string | undefined, text: string): QueueItem
 export function sendImageTo(
   agentId: string | undefined,
   filePath: string,
-  caption?: string
+  caption?: string,
+  dataUrl?: string
 ): QueueItem {
   const item: QueueItem = {
     id: makeId(),
     type: "image",
     path: filePath,
     caption,
+    dataUrl,
     timestamp: new Date().toISOString(),
   };
   const dir = agentDirFor(agentId);
@@ -741,6 +743,40 @@ export function deleteQueueItemFor(id: string, agentId?: string): void {
 export function clearQueueFor(agentId?: string): void {
   const dir = agentDirFor(agentId);
   withLockIn(dir, () => writeQueueFor([], agentId));
+}
+
+/** List every agent id that has an on-disk dir under agents/ (live or stale). */
+export function listAgentDirIds(): string[] {
+  try {
+    const base = path.join(dataDir, AGENTS_SUBDIR);
+    return fs.readdirSync(base).filter((id) => {
+      try {
+        return fs.statSync(path.join(base, id)).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return [];
+  }
+}
+
+/** Empty EVERY queue: the shared root plus every agent dir on disk (including
+ *  stale ones that aren't in the active roster). Best-effort. */
+export function clearAllQueues(): void {
+  clearQueueFor(undefined); // shared root
+  try {
+    const base = path.join(dataDir, AGENTS_SUBDIR);
+    for (const id of fs.readdirSync(base)) {
+      try {
+        if (fs.statSync(path.join(base, id)).isDirectory()) clearQueueFor(id);
+      } catch {
+        // skip entries we can't stat
+      }
+    }
+  } catch {
+    // no agents dir yet — nothing else to clear
+  }
 }
 
 export function updateQueueItemFor(

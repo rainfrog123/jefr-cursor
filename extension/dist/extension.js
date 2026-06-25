@@ -4210,12 +4210,13 @@ function sendTextTo(agentId, text) {
   appendSharedHistory({ id: item.id, kind: "text", text, timestamp: item.timestamp });
   return item;
 }
-function sendImageTo(agentId, filePath, caption) {
+function sendImageTo(agentId, filePath, caption, dataUrl) {
   const item = {
     id: makeId(),
     type: "image",
     path: filePath,
     caption,
+    dataUrl,
     timestamp: (/* @__PURE__ */ new Date()).toISOString()
   };
   const dir = agentDirFor(agentId);
@@ -4252,6 +4253,34 @@ function deleteQueueItemFor(id, agentId) {
 function clearQueueFor(agentId) {
   const dir = agentDirFor(agentId);
   withLockIn(dir, () => writeQueueFor([], agentId));
+}
+function listAgentDirIds() {
+  try {
+    const base = path.join(dataDir, AGENTS_SUBDIR);
+    return fs.readdirSync(base).filter((id) => {
+      try {
+        return fs.statSync(path.join(base, id)).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return [];
+  }
+}
+function clearAllQueues() {
+  clearQueueFor(void 0);
+  try {
+    const base = path.join(dataDir, AGENTS_SUBDIR);
+    for (const id of fs.readdirSync(base)) {
+      try {
+        if (fs.statSync(path.join(base, id)).isDirectory())
+          clearQueueFor(id);
+      } catch {
+      }
+    }
+  } catch {
+  }
 }
 function updateQueueItemFor(id, updates, agentId) {
   const dir = agentDirFor(agentId);
@@ -4771,7 +4800,7 @@ var crypto = __toESM(require("crypto"));
 var fs2 = __toESM(require("fs"));
 var os2 = __toESM(require("os"));
 var path2 = __toESM(require("path"));
-function handlePastedImage(dataUrl, caption) {
+function handlePastedImage(dataUrl, caption, target) {
   const match = /^data:image\/([\w.+-]+);base64,(.+)$/.exec(dataUrl || "");
   if (!match)
     return false;
@@ -4781,7 +4810,8 @@ function handlePastedImage(dataUrl, caption) {
     const buf = Buffer.from(match[2], "base64");
     const tmpPath = path2.join(os2.tmpdir(), `jefr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`);
     fs2.writeFileSync(tmpPath, buf);
-    const item = sendImageTo(targetAgentId(), tmpPath, caption);
+    const tgt = target !== void 0 ? target : targetAgentId();
+    const item = sendImageTo(tgt, tmpPath, caption, dataUrl);
     pushHistoryItem({ ...item, dataUrl });
     appendSharedHistory({
       id: item.id,
@@ -4799,6 +4829,27 @@ function handlePastedImage(dataUrl, caption) {
 }
 var WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 var PREFERRED_PORT = 39517;
+var MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+var PORT_RETRY_MAX = 6;
+var PORT_RETRY_DELAY_MS = 400;
+var PORT_FILE = path2.join(os2.homedir(), ".moyu-message", "server.json");
+function writePortFile(port) {
+  try {
+    fs2.mkdirSync(path2.dirname(PORT_FILE), { recursive: true });
+    fs2.writeFileSync(
+      PORT_FILE,
+      JSON.stringify({ port, pid: process.pid, preferred: PREFERRED_PORT, ts: Date.now() }),
+      "utf-8"
+    );
+  } catch {
+  }
+}
+function removePortFile() {
+  try {
+    fs2.unlinkSync(PORT_FILE);
+  } catch {
+  }
+}
 var server = null;
 var wsClients = [];
 var serverPort = 0;
@@ -4823,7 +4874,7 @@ function getServerPort() {
 function getConnectedClients() {
   return wsClients.length;
 }
-function startLocalServer(port = PREFERRED_PORT) {
+function startLocalServer(port = PREFERRED_PORT, attempt = 0) {
   return new Promise((resolve, reject) => {
     if (server) {
       resolve(serverPort);
@@ -4841,8 +4892,18 @@ function startLocalServer(port = PREFERRED_PORT) {
         srv.close();
       } catch {
       }
-      if (err && err.code === "EADDRINUSE" && port !== 0) {
-        startLocalServer(0).then(resolve, reject);
+      if (err && err.code === "EADDRINUSE" && port === PREFERRED_PORT) {
+        if (attempt < PORT_RETRY_MAX) {
+          setTimeout(
+            () => startLocalServer(PREFERRED_PORT, attempt + 1).then(resolve, reject),
+            PORT_RETRY_DELAY_MS
+          );
+        } else {
+          console.warn(
+            `[jefr] port ${PREFERRED_PORT} is still in use after ${PORT_RETRY_MAX} retries; falling back to an ephemeral port. A fixed-port client must read ${PORT_FILE}.`
+          );
+          startLocalServer(0, attempt + 1).then(resolve, reject);
+        }
       } else {
         reject(err);
       }
@@ -4854,6 +4915,12 @@ function startLocalServer(port = PREFERRED_PORT) {
       settled = true;
       server = srv;
       serverPort = srv.address().port;
+      writePortFile(serverPort);
+      if (serverPort !== PREFERRED_PORT) {
+        console.warn(
+          `[jefr] local server bound to ${serverPort} (preferred ${PREFERRED_PORT} unavailable). Clients should read the port from ${PORT_FILE}.`
+        );
+      }
       startPushPolling();
       resolve(serverPort);
     });
@@ -4876,6 +4943,7 @@ function stopLocalServer() {
     server = null;
     serverPort = 0;
   }
+  removePortFile();
 }
 function handleHttp(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -4916,10 +4984,21 @@ function handleHttp(req, res) {
   }
   if (req.url === "/api/send" && req.method === "POST") {
     let body = "";
+    let aborted = false;
     req.on("data", (chunk) => {
+      if (aborted)
+        return;
       body += chunk;
+      if (body.length > MAX_MESSAGE_BYTES) {
+        aborted = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "Payload too large" }));
+        req.destroy();
+      }
     });
     req.on("end", () => {
+      if (aborted)
+        return;
       try {
         const data = JSON.parse(body);
         if (data.text) {
@@ -4969,8 +5048,20 @@ Sec-WebSocket-Accept: ${accept}\r
   const pushState = buildPushState();
   wsSend(socket, JSON.stringify({ type: "init", ...pushState }));
   let buffer = Buffer.alloc(0);
+  let fragOpcode = 0;
+  let fragParts = [];
+  let fragBytes = 0;
+  const resetFrag = () => {
+    fragOpcode = 0;
+    fragParts = [];
+    fragBytes = 0;
+  };
   socket.on("data", (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
+    if (buffer.length > MAX_MESSAGE_BYTES) {
+      removeClient(client);
+      return;
+    }
     while (buffer.length >= 2) {
       const parsed = parseFrame(buffer);
       if (!parsed) {
@@ -4990,8 +5081,27 @@ Sec-WebSocket-Accept: ${accept}\r
         client.alive = true;
         continue;
       }
-      if (parsed.opcode === 1) {
-        handleWsMessage(client, parsed.payload.toString("utf-8"));
+      if (parsed.opcode === 1 || parsed.opcode === 2 || parsed.opcode === 0) {
+        if (parsed.opcode !== 0) {
+          fragOpcode = parsed.opcode;
+          fragParts = [];
+          fragBytes = 0;
+        }
+        fragParts.push(parsed.payload);
+        fragBytes += parsed.payload.length;
+        if (fragBytes > MAX_MESSAGE_BYTES) {
+          resetFrag();
+          removeClient(client);
+          return;
+        }
+        if (parsed.fin) {
+          const full = Buffer.concat(fragParts);
+          const op = fragOpcode;
+          resetFrag();
+          if (op === 1) {
+            handleWsMessage(client, full.toString("utf-8"));
+          }
+        }
       }
     }
   });
@@ -5014,11 +5124,53 @@ function seenCid(cid) {
   }
   return false;
 }
+function ack(client, cid, ok, extra) {
+  if (typeof cid !== "string" || !cid)
+    return;
+  wsSend(client.socket, JSON.stringify({ type: "ack", cid, ok, ...extra }));
+}
 function handleWsMessage(client, raw) {
   try {
     const msg = JSON.parse(raw);
     const aid = targetAgentId();
     switch (msg.type) {
+      case "send": {
+        const target = typeof msg.targetAgentId === "string" && msg.targetAgentId.trim() ? msg.targetAgentId.trim() : aid;
+        if (seenCid(msg.cid)) {
+          ack(client, msg.cid, true, { duplicate: true });
+          break;
+        }
+        const text = typeof msg.text === "string" ? msg.text.trim() : "";
+        const atts = Array.isArray(msg.attachments) ? msg.attachments : [];
+        const images = atts.filter(
+          (a) => a && a.kind === "image" && typeof a.dataUrl === "string"
+        );
+        let queued = 0;
+        try {
+          if (images.length > 0) {
+            images.forEach((a, i) => {
+              if (handlePastedImage(a.dataUrl, i === 0 ? text : "", target)) {
+                queued++;
+              }
+            });
+          } else if (text) {
+            const item = sendTextTo(target, text);
+            pushHistoryItem({
+              id: item.id,
+              type: "text",
+              content: text,
+              timestamp: item.timestamp
+            });
+            queued++;
+          }
+          ack(client, msg.cid, true, { queued });
+          broadcastWs({ type: "queueUpdate", count: getQueueCountFor(target) });
+          broadcastStateNow();
+        } catch (e) {
+          ack(client, msg.cid, false, { error: String(e), queued });
+        }
+        break;
+      }
       case "sendText":
         if (msg.text) {
           if (!seenCid(msg.cid)) {
@@ -5097,6 +5249,7 @@ function parseFrame(buf) {
   if (buf.length < 2) {
     return null;
   }
+  const fin = (buf[0] & 128) !== 0;
   const opcode = buf[0] & 15;
   const masked = (buf[1] & 128) !== 0;
   let payloadLen = buf[1] & 127;
@@ -5127,7 +5280,7 @@ function parseFrame(buf) {
       payload[i] ^= mask[i % 4];
     }
   }
-  return { opcode, payload, totalLength };
+  return { opcode, fin, payload, totalLength };
 }
 function buildFrame(payload, opcode = 1) {
   const data = typeof payload === "string" ? Buffer.from(payload, "utf-8") : payload;
@@ -5458,8 +5611,11 @@ sendBtn.addEventListener('click',doSend);
 function doSend(){
 	if(!canSend())return;
 	var txt=input.value.trim();
-	if(txt){ws.send(JSON.stringify({type:'sendText',text:txt}));log('Send: '+txt.substring(0,40)+(txt.length>40?'...':''));}
-	for(var i=0;i<pendingImages.length;i++){ws.send(JSON.stringify({type:'sendImage',dataUrl:pendingImages[i].dataUrl,caption:''}));log('Send: [image]');}
+	var atts=pendingImages.map(function(im){return {kind:'image',dataUrl:im.dataUrl}});
+	var cid='c'+Date.now()+'-'+Math.random().toString(36).slice(2,7);
+	// One composite message (text + image[s]) instead of separate sends.
+	ws.send(JSON.stringify({type:'send',cid:cid,text:txt,attachments:atts}));
+	log('Send: '+(txt?txt.substring(0,40):'')+(atts.length?' [+'+atts.length+' image]':''));
 	input.value='';pendingImages=[];renderThumbs();updateSendBtn();
 	sendStatus.innerHTML='<span class="sent-ok">Sent</span>';
 	setTimeout(function(){sendStatus.innerHTML=''},2000);
@@ -5554,9 +5710,17 @@ function renderQueue(items){
 	$('queueBadge').textContent=items.length+' items';$('queueBadge').className='card-badge on';
 	var h='';
 	for(var i=0;i<items.length;i++){
-		var it=items[i],tp=it.type||'text',preview=tp==='text'?(it.content||''):(tp==='image'?'[Image]':'[File] '+(it.path||'').split(/[\\/\\\\]/).pop());
+		var it=items[i],tp=it.type||'text';
 		var time=it.timestamp?new Date(it.timestamp).toLocaleTimeString():'';
-		h+='<div class="queue-item"><span class="qi-type '+tp+'">'+({text:'Text',image:'Image',file:'File'}[tp]||tp)+'</span><span class="qi-content">'+esc(preview.substring(0,120))+'</span><span class="qi-time">'+time+'</span></div>';
+		var contentHtml;
+		if(tp==='image'){
+			contentHtml=(it.dataUrl?'<img src="'+it.dataUrl+'" style="max-width:120px;max-height:90px;border-radius:6px;display:block;margin-bottom:4px">':'')+(it.caption?'<div>'+esc(it.caption)+'</div>':(it.dataUrl?'':'[Image]'));
+		}else if(tp==='file'){
+			contentHtml=esc('[File] '+((it.path||'').split(/[\\/\\\\]/).pop()||''));
+		}else{
+			contentHtml=esc((it.content||'').substring(0,120));
+		}
+		h+='<div class="queue-item"><span class="qi-type '+tp+'">'+({text:'Text',image:'Image',file:'File'}[tp]||tp)+'</span><span class="qi-content">'+contentHtml+'</span><span class="qi-time">'+time+'</span></div>';
 	}
 	L.innerHTML=h;
 }
@@ -5606,6 +5770,7 @@ function connect(){
 			var m=JSON.parse(e.data);
 			if(m.type==='init'||m.type==='stateUpdate'){updateDashboard(m);updateSendBtn()}
 			else if(m.type==='queueUpdate'){$('statQueue').textContent=m.count||0}
+			else if(m.type==='ack'){if(!m.ok)log('Send failed: '+(m.error||'unknown'))}
 			else if(m.type==='pong'){}
 		}catch(err){log('Parse error')}
 	};
@@ -5780,6 +5945,25 @@ var CdpMonitor = class extends import_events.EventEmitter {
   lastStatus = null;
   sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  /** Poll an evaluate expression until it returns truthy or the timeout elapses.
+   *  Returns as soon as the UI settles, so it's far faster than a fixed sleep
+   *  while still bounding the worst case. */
+  async pollEval(expr, timeoutMs, stepMs = 50) {
+    const start = Date.now();
+    for (; ; ) {
+      let v;
+      try {
+        v = await this.session.evaluate(expr, false);
+      } catch {
+        v = void 0;
+      }
+      if (v)
+        return v;
+      if (Date.now() - start >= timeoutMs)
+        return v;
+      await this.sleep(stepMs);
+    }
   }
   async clickAt(x, y) {
     if (!this.session) {
@@ -5995,6 +6179,69 @@ var CdpMonitor = class extends import_events.EventEmitter {
       return false;
     }
   }
+  /** Press a key chord via CDP (keyDown + keyUp). Modifier bits per CDP:
+   *  Alt=1, Ctrl=2, Meta=4, Shift=8. */
+  async pressKey(key, code, vk, mods = {}) {
+    if (!this.session) {
+      throw new Error("CDP session not connected");
+    }
+    let modifiers = 0;
+    if (mods.alt)
+      modifiers |= 1;
+    if (mods.ctrl)
+      modifiers |= 2;
+    if (mods.meta)
+      modifiers |= 4;
+    if (mods.shift)
+      modifiers |= 8;
+    const base = {
+      modifiers,
+      key,
+      code,
+      windowsVirtualKeyCode: vk,
+      nativeVirtualKeyCode: vk
+    };
+    await this.session.call("Input.dispatchKeyEvent", { type: "keyDown", ...base });
+    await this.session.call("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  }
+  /** Fast tile close: focus the tile, then send Ctrl+W (Cursor's close-tile
+   *  shortcut; Ctrl+D is OPEN/new-tile, not close). Far quicker than driving the
+   *  tile menu. Verifies the SPECIFIC agent's tile is gone, so a mis-focus or a
+   *  swallowed chord can't close the wrong one; returns false if it's still
+   *  present (the caller falls back to the menu close). */
+  async closeAgentTileFast(agentId) {
+    if (!this.session)
+      return false;
+    const focused = await this.focusAgent(agentId);
+    if (!focused)
+      return false;
+    await this.sleep(80);
+    try {
+      await this.pressKey("w", "KeyW", 87, { ctrl: true });
+    } catch {
+      return false;
+    }
+    const goneJs = `
+(function() {
+  const TARGET = ${JSON.stringify(agentId)};
+  const tiles = [...document.querySelectorAll('.glass-agent-conversation-tiling__tile')];
+  function agentIdOf(node) {
+    const k = Object.keys(node).find(x =>
+      x.startsWith('__reactFiber$') || x.startsWith('__reactInternalInstance$')
+    );
+    let f = k ? node[k] : null, steps = 0;
+    while (f && steps++ < 40) {
+      const p = f.memoizedProps;
+      if (p && typeof p === 'object' && typeof p.agentId === 'string') return p.agentId;
+      f = f.return;
+    }
+    return null;
+  }
+  return !tiles.some(t => agentIdOf(t) === TARGET);
+})()
+    `;
+    return !!await this.pollEval(goneJs, 900, 50);
+  }
   /** Close the tile for agentId. Returns true only after the target tile is gone. */
   async closeAgentTile(agentId) {
     if (!this.session)
@@ -6081,14 +6328,63 @@ var CdpMonitor = class extends import_events.EventEmitter {
         return false;
       }
       await this.clickAt(trigger.x, trigger.y);
-      await this.sleep(350);
-      const close = await this.session.evaluate(closeJs, false);
+      const close = await this.pollEval(closeJs, 700, 40);
       if (!close || typeof close.x !== "number" || typeof close.y !== "number") {
         return false;
       }
       await this.clickAt(close.x, close.y);
-      await this.sleep(900);
-      return !!await this.session.evaluate(goneJs, false);
+      return !!await this.pollEval(goneJs, 1200, 60);
+    } catch {
+      return false;
+    }
+  }
+  /** Close the tile at a given index (for tiles with no resolvable agentId).
+   *  Returns true once the tile count drops. */
+  async closeTileByIndex(index) {
+    if (!this.session || !Number.isInteger(index) || index < 0)
+      return false;
+    const triggerJs = `
+(function() {
+  const IDX = ${index};
+  const tiles = [...document.querySelectorAll('.glass-agent-conversation-tiling__tile')];
+  if (tiles.length <= 1 || IDX >= tiles.length) return false;
+  function tileMenuTrigger(tile, idx) {
+    const inTile = tile?.querySelector('[aria-label="Tile actions"],.glass-agent-conversation-tiling__menu-trigger');
+    if (inTile) return inTile;
+    const actions = [...document.querySelectorAll('[aria-label="Tile actions"],.glass-agent-conversation-tiling__menu-trigger')]
+      .filter(e => e.offsetParent);
+    return actions[idx] || null;
+  }
+  const trig = tileMenuTrigger(tiles[IDX], IDX);
+  if (!trig) return false;
+  const r = trig.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2, count: tiles.length };
+})()
+    `;
+    const closeJs = `
+(function() {
+  const items = [...document.querySelectorAll('[role^="menuitem"],[role="option"]')]
+    .filter(e => e.offsetParent);
+  const close = items.find(e => (e.textContent || '').trim().toLowerCase().startsWith('close'));
+  if (!close) return false;
+  const r = close.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+})()
+    `;
+    try {
+      const trigger = await this.session.evaluate(triggerJs, false);
+      if (!trigger || typeof trigger.x !== "number" || typeof trigger.y !== "number") {
+        return false;
+      }
+      const before = typeof trigger.count === "number" ? trigger.count : 0;
+      await this.clickAt(trigger.x, trigger.y);
+      const close = await this.pollEval(closeJs, 700, 40);
+      if (!close || typeof close.x !== "number" || typeof close.y !== "number") {
+        return false;
+      }
+      await this.clickAt(close.x, close.y);
+      const droppedJs = `document.querySelectorAll('.glass-agent-conversation-tiling__tile').length < ${before}`;
+      return !!await this.pollEval(droppedJs, 1200, 60);
     } catch {
       return false;
     }
@@ -6146,6 +6442,56 @@ var CdpMonitor = class extends import_events.EventEmitter {
     return false;
   }
 
+  // The server-drop fingerprint, confirmed by CDP-inspecting a live drop: when the
+  // held-open call dies (server crash/restart, transport break, client abort),
+  // Cursor marks the in-flight check_messages tool card as **Cancelled** \u2014 it
+  // carries data-tool-status="cancelled" and renders "Cancelled Check Messages in
+  // jefr". A healthy call reads "Running\u2026" then "Ran" (status running/completed),
+  // so only a cancelled/failed/errored status is a drop. We key off the card's own
+  // status (attribute + its lead status word) \u2014 NEVER the delivered reply text \u2014
+  // so a reply that merely contains "error" can't false-trip it.
+  function mcpErroredIn(t) {
+    const toolCards = [...t.querySelectorAll('[data-message-kind="tool"]')];
+    // Only the MOST RECENT jefr check_messages card matters: an agent that
+    // dropped then reconnected leaves an old "Cancelled" card up the transcript
+    // while its newest card reads "Running"/"Ran". Judging by the latest card
+    // alone means a recovered agent isn't stuck looking dropped.
+    let last = null;
+    for (const m of toolCards) {
+      const txt = m.textContent || '';
+      if (!/check\\s*messages/i.test(txt) || !/jefr/i.test(txt)) continue;
+      last = m;
+    }
+    if (!last) return false;
+    const status = (last.getAttribute('data-tool-status') || '').toLowerCase();
+    if (/cancel|error|fail|abort|reject/.test(status)) return true;
+    // Fallback for builds without the status attribute: the card text begins with
+    // its status word, e.g. "CancelledCheck Messages in jefr".
+    const txt = last.textContent || '';
+    if (/^\\s*(cancel|failed|errored|aborted|rejected)/i.test(txt)) return true;
+    return false;
+  }
+
+  // The agent is actively WORKING when any tool call is mid-flight: a tool card in
+  // a running/loading status, or carrying a live shimmer/spinner. This is true
+  // even when the submit button isn't in "stop" mode (tool execution happens
+  // between text generations). Without it, a long turn between check_messages
+  // calls reads as idle and can be misflagged as dropped. Verified via CDP: a
+  // working tile has a tool card with data-tool-status="loading".
+  function toolWorkingIn(t) {
+    const cards = [...t.querySelectorAll('[data-message-kind="tool"]')];
+    for (const m of cards) {
+      const status = (m.getAttribute('data-tool-status') || '').toLowerCase();
+      const cls = typeof m.className === 'string' ? m.className : '';
+      const running =
+        /run|load|pend|progress|stream/.test(status) ||
+        /with-stop/.test(cls) ||
+        !!m.querySelector('[class*="shimmer"],[class*="spinner"],.codicon-modifier-spin,[data-state="stop"]');
+      if (running) return true;
+    }
+    return false;
+  }
+
   return tiles.map((t, i) => {
     const submit = t.querySelector('.ui-prompt-input-submit-button');
     const aria = submit?.getAttribute('aria-label') || '';
@@ -6155,6 +6501,12 @@ var CdpMonitor = class extends import_events.EventEmitter {
     const planning = /planning\\s+next\\s+move/i.test(sh);
 
     const mcpRunning = mcpRunningIn(t);
+    const toolWorking = toolWorkingIn(t);
+    // A cancelled-card drop only counts when the tile isn't otherwise busy \u2014 an
+    // agent that recovered and is generating / running a tool again must not read
+    // as dropped from a stale "Cancelled" card left up the transcript.
+    const mcpErrored =
+      !mcpRunning && !generating && !planning && !toolWorking && mcpErroredIn(t);
 
     // "Worked for ..." completion stamp = the turn ended (MCP cut out). Prefer the
     // live status/followup area; fall back to the recent tail. We do NOT scan the
@@ -6177,6 +6529,7 @@ var CdpMonitor = class extends import_events.EventEmitter {
     if (mcpRunning) state = 'mcp_connected';
     else if (planning) state = 'planning';
     else if (generating) state = 'generating';
+    else if (toolWorking) state = 'generating';
 
     return {
       index: i,
@@ -6184,7 +6537,8 @@ var CdpMonitor = class extends import_events.EventEmitter {
       model,
       state,
       mcpVisible: mcpRunning,
-      generating,
+      mcpErrored,
+      generating: generating || toolWorking,
       planning,
       worked,
     };
@@ -6217,18 +6571,51 @@ function stopCdpMonitor() {
 }
 
 // src/tile-state.ts
-function stateWithHeartbeat(tileState, heartbeatState) {
-  return heartbeatState && tileState === "idle" ? heartbeatState : tileState;
-}
-function isMcpLoopState(state) {
-  return state === "mcp_connected" || state === "waiting" || state === "working";
-}
+var MISSING_TILE_GRACE_MS = 1e4;
+var MCP_GRACE_MS = 8e3;
+var BUSY_GRACE_MS = 8e3;
 function isLiveState(state) {
   return state !== "idle";
+}
+function isConnectedState(state) {
+  return state === "mcp_connected" || state === "waiting";
+}
+function isServerDropped(a) {
+  return a.connectCount > 0 && !isLiveState(a.state) && !a.worked && (a.mcpErrored || a.queueCount > 0 || !a.heartbeatAlive);
+}
+function resolveState(rawState, heartbeatState, loopAlive, mcpErrored, busyAlive) {
+  if (rawState === "mcp_connected")
+    return "mcp_connected";
+  if (rawState === "generating" || rawState === "planning")
+    return rawState;
+  if (mcpErrored)
+    return "idle";
+  if (loopAlive)
+    return "mcp_connected";
+  if (busyAlive)
+    return "generating";
+  if (heartbeatState && rawState === "idle")
+    return heartbeatState;
+  return rawState;
 }
 var TileStateManager = class {
   agents = /* @__PURE__ */ new Map();
   listeners = [];
+  /** Resolve a stable tracking id for a tile. Prefers the real React-fiber
+   *  agentId. When that isn't available (a freshly-opened tile, or a flaky poll
+   *  where the fiber walk missed), reuse the agent already tracked in this tile
+   *  slot so a momentary miss never drops a live tile; otherwise synthesize a
+   *  slot id so the new tile still appears on the Agents page. */
+  resolveTileId(tile, seen) {
+    if (tile.agentId)
+      return tile.agentId;
+    for (const a of this.agents.values()) {
+      if (a.tileIndex === tile.index && !seen.has(a.agentId)) {
+        return a.agentId;
+      }
+    }
+    return `tile:${tile.index}`;
+  }
   /** Update state from CDP tile info. Returns transitions that occurred.
    *  `forgetMs` drops vanished agents from the map after that long unseen.
    *  Fresh MCP heartbeats override an otherwise-idle CDP tile, because the DOM
@@ -6238,57 +6625,87 @@ var TileStateManager = class {
     const transitions = [];
     const seen = /* @__PURE__ */ new Set();
     for (const tile of tiles) {
-      if (!tile.agentId)
-        continue;
-      seen.add(tile.agentId);
-      const state = stateWithHeartbeat(tile.state, heartbeatStates.get(tile.agentId));
-      const existing = this.agents.get(tile.agentId);
+      const id = this.resolveTileId(tile, seen);
+      seen.add(id);
+      const existing = this.agents.get(id);
+      const rawMcp = tile.state === "mcp_connected";
+      const lastMcpAt = rawMcp ? now : existing?.lastMcpAt ?? 0;
+      const loopAlive = !!existing && existing.connectCount > 0 && lastMcpAt > 0 && now - lastMcpAt < MCP_GRACE_MS;
+      const rawBusy = tile.state === "generating" || tile.state === "planning";
+      const lastBusyAt = rawBusy ? now : existing?.lastBusyAt ?? 0;
+      const busyAlive = lastBusyAt > 0 && now - lastBusyAt < BUSY_GRACE_MS;
+      const state = resolveState(
+        tile.state,
+        heartbeatStates.get(id),
+        loopAlive,
+        tile.mcpErrored,
+        busyAlive
+      );
       if (!existing) {
         const newState = {
-          agentId: tile.agentId,
+          agentId: id,
           tileIndex: tile.index,
           state,
           model: tile.model,
-          queueCount: queueCounts.get(tile.agentId) || 0,
+          queueCount: queueCounts.get(id) || 0,
           firstSeen: now,
-          connectedSince: isMcpLoopState(state) ? now : 0,
-          connectCount: isMcpLoopState(state) ? 1 : 0,
+          connectedSince: isConnectedState(state) ? now : 0,
+          lastMcpAt,
+          lastBusyAt,
+          connectCount: isConnectedState(state) ? 1 : 0,
           reconnectCount: 0,
           reconnectStreak: 0,
           lastReconnectAt: 0,
           worked: tile.worked,
-          lastSeen: now
+          mcpErrored: tile.mcpErrored,
+          heartbeatAlive: heartbeatStates.has(id),
+          lastSeen: now,
+          lastConnectedMs: 0
         };
-        this.agents.set(tile.agentId, newState);
-        transitions.push({ type: "new_agent", agentId: tile.agentId, to: state });
-        if (isMcpLoopState(state)) {
-          transitions.push({ type: "connected", agentId: tile.agentId, to: state });
+        this.agents.set(id, newState);
+        transitions.push({ type: "new_agent", agentId: id, to: state });
+        if (isConnectedState(state)) {
+          transitions.push({ type: "connected", agentId: id, to: state });
         }
       } else {
         const prevState = existing.state;
-        const wasConnected = isMcpLoopState(prevState);
         existing.tileIndex = tile.index;
         existing.model = tile.model;
-        existing.queueCount = queueCounts.get(tile.agentId) || 0;
+        existing.queueCount = queueCounts.get(id) || 0;
         existing.worked = tile.worked;
+        existing.mcpErrored = tile.mcpErrored;
+        existing.heartbeatAlive = heartbeatStates.has(id);
+        existing.lastMcpAt = lastMcpAt;
+        existing.lastBusyAt = lastBusyAt;
         existing.lastSeen = now;
         if (prevState !== state) {
-          const isConnected = isMcpLoopState(state);
           existing.state = state;
           transitions.push({
             type: "state_changed",
-            agentId: tile.agentId,
+            agentId: id,
             from: prevState,
             to: state
           });
-          if (isConnected && !wasConnected) {
-            existing.connectedSince = now;
+          const enteredLoop = isConnectedState(state) && !isConnectedState(prevState) && (existing.connectCount === 0 || !isLiveState(prevState));
+          const wentDown = !isLiveState(state) && isLiveState(prevState);
+          if (enteredLoop) {
+            if (!existing.connectedSince)
+              existing.connectedSince = now;
             existing.connectCount++;
             existing.reconnectStreak = 0;
-            transitions.push({ type: "connected", agentId: tile.agentId, to: state });
-          } else if (wasConnected && !isConnected) {
+            transitions.push({ type: "connected", agentId: id, to: state });
+          } else if (wentDown && existing.connectCount > 0) {
+            const heldMs = existing.connectedSince ? now - existing.connectedSince : 0;
+            if (heldMs > 0)
+              existing.lastConnectedMs = heldMs;
+            transitions.push({
+              type: "disconnected",
+              agentId: id,
+              from: prevState,
+              to: state,
+              connectedMs: heldMs > 0 ? heldMs : void 0
+            });
             existing.connectedSince = 0;
-            transitions.push({ type: "disconnected", agentId: tile.agentId, from: prevState, to: state });
           }
         }
       }
@@ -6296,15 +6713,36 @@ var TileStateManager = class {
     for (const [agentId, agent] of this.agents) {
       if (seen.has(agentId))
         continue;
+      if (agentId.startsWith("tile:")) {
+        this.agents.delete(agentId);
+        continue;
+      }
+      if (now - agent.lastSeen <= MISSING_TILE_GRACE_MS) {
+        continue;
+      }
       if (agent.tileIndex >= 0) {
         const prevState = agent.state;
+        const prevConnectedSince = agent.connectedSince;
         agent.tileIndex = -1;
         agent.connectedSince = 0;
+        agent.lastMcpAt = 0;
+        agent.lastBusyAt = 0;
         agent.worked = false;
+        agent.mcpErrored = false;
+        agent.heartbeatAlive = false;
         if (prevState !== "idle") {
           agent.state = "idle";
+          const heldMs = prevConnectedSince ? now - prevConnectedSince : 0;
+          if (heldMs > 0)
+            agent.lastConnectedMs = heldMs;
           if (prevState === "mcp_connected") {
-            transitions.push({ type: "disconnected", agentId, from: prevState, to: "idle" });
+            transitions.push({
+              type: "disconnected",
+              agentId,
+              from: prevState,
+              to: "idle",
+              connectedMs: heldMs > 0 ? heldMs : void 0
+            });
           }
         }
       }
@@ -6327,18 +6765,26 @@ var TileStateManager = class {
   getAgent(agentId) {
     return this.agents.get(agentId);
   }
-  /** Get agents that need reconnection: a confirmed cut-out — visible, connected
-   *  before, now idle, and showing the "Worked for ..." completion stamp. The
-   *  stamp distinguishes a real drop from a tile that's merely idle (freshly
-   *  spawned, or the user is mid-type), avoiding needless re-primes. */
+  /** Get agents that need reconnection. Two reconnectable end-states, both
+   *  visible, previously connected, and no longer live:
+   *    • clean cut-off — the turn ended with a "Worked for…" completion stamp.
+   *    • server drop   — the loop died abruptly (errored check_messages card, or
+   *                      messages stranded in the queue) with NO stamp; without
+   *                      this arm it would fall through to a plain "down" tile and
+   *                      never be re-primed, stranding its queue forever.
+   *  The stamp / error / queue gates distinguish a real drop from a tile that's
+   *  merely idle (freshly spawned, or the user is mid-type), avoiding needless
+   *  re-primes. */
   getDroppedAgents() {
     return this.getAgents().filter(
       (a) => (
-        // Must be visible (tileIndex >= 0)
+        // Real agentId only — never try to reconnect a synthetic slot id, which
+        // the workflow can't target (no fiber agentId to focus).
+        !a.agentId.startsWith("tile:") && // Must be visible (tileIndex >= 0)
         a.tileIndex >= 0 && // Must have connected before (so it's a DROP, not a new tile)
         a.connectCount > 0 && // Not currently live (MCP loop, working heartbeat, generating, or planning)
-        !isLiveState(a.state) && // The turn actually ended (completion stamp present) — a real cut-out.
-        a.worked
+        !isLiveState(a.state) && // A clean cut-out (completion stamp) OR an abrupt server drop.
+        (a.worked || isServerDropped(a))
       )
     );
   }
@@ -6368,13 +6814,31 @@ var TileStateManager = class {
   toAgentViews() {
     return this.getAgents().filter((a) => a.tileIndex >= 0).map((a) => ({
       id: a.agentId,
-      connected: isLiveState(a.state),
+      // "connected" = a live state AND the tile has actually reached the MCP
+      // loop at least once (connectCount > 0). Requiring connectCount closes
+      // the pre-first-connect gap: while a fresh tile is still being primed it
+      // flaps idle ↔ generating/planning, and the grace window in resolveState
+      // can't smooth that yet (it only arms after the first real connect), so
+      // a bare isLiveState() check would bounce the connected count 0↔1. Once
+      // the tile is through the loop the grace window keeps this steady.
+      connected: isLiveState(a.state) && a.connectCount > 0,
       // Preserve CDP state for UI — the type now supports all states
       state: a.state,
+      // A clean cut-out: previously connected, now idle, "Worked for..."
+      // stamp present. Lets the UI show a distinct reconnectable state.
+      dropped: a.connectCount > 0 && !isLiveState(a.state) && a.worked,
+      // An abrupt server drop (no clean stamp) — surfaced separately so the UI
+      // can flag it distinctly from a polite cut-off. Synthetic slot ids can't
+      // be re-primed, so never mark them.
+      serverDropped: !a.agentId.startsWith("tile:") && isServerDropped(a),
       queueCount: a.queueCount,
       connectCount: a.connectCount,
       reconnectCount: a.reconnectCount,
       connectedSince: a.connectedSince,
+      // How long the last connection held before dropping — surfaced so a
+      // dropped tile can show "connected for X" even though connectedSince
+      // has been cleared back to 0.
+      lastConnectedMs: a.lastConnectedMs,
       model: a.model,
       tileIndex: a.tileIndex
     }));
@@ -6387,6 +6851,7 @@ var pollTimer2;
 var lastQuestionId;
 var lastReplyTimestamp;
 var lastQueueCount;
+var lastAllQueuesJson;
 var lastCardValid;
 var chatTriggered = false;
 var extensionVersion = "0.0.0";
@@ -6413,7 +6878,14 @@ function startCdpMonitoring() {
     return;
   const monitor2 = getCdpMonitor();
   monitor2.on("status", (status) => {
+    const wasCdp = lastCdpStatus?.connected ?? false;
     lastCdpStatus = status;
+    if (wasCdp !== status.connected) {
+      dlog(
+        `CDP ${status.connected ? "connected" : "disconnected"}${status.error ? " \u2014 " + status.error : ""}`,
+        status.connected ? "info" : "warn"
+      );
+    }
     if (!status.connected) {
       return;
     }
@@ -6434,28 +6906,38 @@ function startCdpMonitoring() {
       AGENT_FORGET_MS,
       heartbeatStates
     );
-    if (autoReconnect && !workflowProc) {
-      const dropped = tileStateManager.getDroppedAgents();
-      for (const agent of dropped) {
-        const debounceOk = Date.now() - agent.lastReconnectAt >= RECONNECT_DEBOUNCE_MS;
-        const attemptsOk = agent.reconnectStreak < MAX_RECONNECT_ATTEMPTS;
-        if (debounceOk && attemptsOk) {
-          tileStateManager.markReconnectAttempt(agent.agentId);
-          postWorkflow({
-            type: "workflowOutput",
-            stream: "stdout",
-            line: `[jefr] auto-reconnect: agent ${agent.agentId.slice(0, 8)} dropped \u2014 re-priming its tile`
-          });
-          runWorkflow({ reconnect: true, agentId: agent.agentId });
-          break;
-        }
-      }
+    for (const t of transitions) {
+      const who = t.agentId.slice(0, 8);
+      if (t.type === "connected")
+        dlog(`agent ${who} connected (${t.to})`);
+      else if (t.type === "disconnected") {
+        const held = typeof t.connectedMs === "number" && t.connectedMs > 0 ? ` after ${fmtHeldDuration(t.connectedMs)} connected` : "";
+        dlog(`agent ${who} dropped (${t.from} \u2192 ${t.to})${held}`, "warn");
+      } else if (t.type === "new_agent")
+        dlog(`agent ${who} appeared (${t.to})`);
     }
+    if (autoReconnect && !workflowProc && !healingTile) {
+      void maintainPool();
+    }
+    gcDeadAgentDirs();
     pushAgentListFromCdp();
   });
   monitor2.start().catch((e) => {
     console.error("CDP monitor failed to start:", e);
   });
+}
+function fmtHeldDuration(ms) {
+  if (ms <= 0)
+    return "0s";
+  const s = Math.floor(ms / 1e3);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor(s % 3600 / 60);
+  const sec = s % 60;
+  if (h > 0)
+    return `${h}h ${m}m`;
+  if (m > 0)
+    return `${m}m ${sec}s`;
+  return `${sec}s`;
 }
 function pushAgentListFromCdp() {
   if (!mainPanel)
@@ -6465,12 +6947,17 @@ function pushAgentListFromCdp() {
     pushAgentListFromHeartbeats(true);
     return;
   }
+  resolveSpawnConnectingId(agents);
+  recordConnectTime(agents);
+  lastPushedAgentIds = new Set(agents.map((a) => a.id));
   const payload = {
-    agents,
+    agents: agents.map((a) => ({ ...a, connectMs: agentConnectMs.get(a.id) })),
     selected: selectedAgentId || null,
     autoReconnect,
     targetAgentCount: TARGET_AGENT_COUNT,
-    cdpConnected: lastCdpStatus?.connected ?? false
+    cdpConnected: lastCdpStatus?.connected ?? false,
+    connectingAgentId: workflowProc ? activeWorkflowAgentId ?? null : null,
+    connectingSince: workflowProc ? workflowStartedAt : 0
   };
   writeCdpStatusFile(agents);
   setSelectedAgentId(selectedAgentId);
@@ -6502,6 +6989,60 @@ function writeCdpStatusFile(agents) {
   }
 }
 var workflowProc;
+var activeWorkflowAgentId;
+var spawnBaselineAgentIds;
+var lastPushedAgentIds = /* @__PURE__ */ new Set();
+var workflowStartedAt = 0;
+var agentConnectMs = /* @__PURE__ */ new Map();
+function resolveSpawnConnectingId(agents) {
+  if (!workflowProc || activeWorkflowAgentId || !spawnBaselineAgentIds)
+    return;
+  const fresh = agents.find(
+    (a) => !a.id.startsWith("tile:") && !spawnBaselineAgentIds.has(a.id)
+  );
+  if (fresh)
+    activeWorkflowAgentId = fresh.id;
+}
+function isConnectingTarget(aid) {
+  if (!workflowProc)
+    return false;
+  if (activeWorkflowAgentId)
+    return aid === activeWorkflowAgentId;
+  if (spawnBaselineAgentIds) {
+    return aid.startsWith("tile:") || !spawnBaselineAgentIds.has(aid);
+  }
+  return false;
+}
+function recordConnectTime(agents) {
+  if (!workflowProc || !activeWorkflowAgentId || !workflowStartedAt)
+    return;
+  if (agentConnectMs.has(activeWorkflowAgentId))
+    return;
+  const a = agents.find((x) => x.id === activeWorkflowAgentId);
+  const mcpLoop = a?.state === "mcp_connected" || a?.state === "waiting" || a?.state === "working";
+  if (!mcpLoop)
+    return;
+  const ms = Date.now() - workflowStartedAt;
+  agentConnectMs.set(activeWorkflowAgentId, ms);
+  postWorkflow({
+    type: "workflowOutput",
+    stream: "stdout",
+    line: `[jefr] agent ${activeWorkflowAgentId.slice(0, 8)} connected in ${(ms / 1e3).toFixed(1)}s`
+  });
+}
+var WORKFLOW_CONNECT_RE = /workflow:\s+(?:MCP connected|reconnected MCP)\s+in\s+([\d.]+)s\s+\(agent\s+([^)]+)\)/i;
+function maybeRecordWorkflowConnect(line) {
+  const m = WORKFLOW_CONNECT_RE.exec(line);
+  if (!m)
+    return;
+  const secs = parseFloat(m[1]);
+  const id = m[2].trim();
+  if (!isFinite(secs) || !id || id === "None")
+    return;
+  agentConnectMs.set(id, Math.round(secs * 1e3));
+  lastAgentListJson = void 0;
+  pushAgentList();
+}
 function bundledWorkflowScript() {
   return path3.join(__dirname, "..", "..", "automation", "workflow.py");
 }
@@ -6522,6 +7063,175 @@ function resolveWorkflowScript() {
 }
 var WORKFLOW_DEFAULT_MODEL = "Opus 4.8 1M Extra High Fast";
 var TARGET_AGENT_COUNT = 5;
+var pendingAgentAdds = 0;
+var pendingAgentModel = WORKFLOW_DEFAULT_MODEL;
+function queueAgentAdds(count, model) {
+  pendingAgentModel = model && model.trim() || WORKFLOW_DEFAULT_MODEL;
+  const current = tileStateManager.toAgentViews().length;
+  const room = Math.max(0, TARGET_AGENT_COUNT - current - pendingAgentAdds);
+  const toAdd = Math.max(0, Math.min(count, room));
+  if (toAdd <= 0) {
+    postWorkflow({
+      type: "workflowOutput",
+      stream: "stderr",
+      line: `[jefr] Pool already full or filling (target ${TARGET_AGENT_COUNT}).`
+    });
+    return;
+  }
+  pendingAgentAdds += toAdd;
+  postWorkflow({
+    type: "workflowOutput",
+    stream: "stdout",
+    line: `[jefr] Filling pool: queued ${toAdd} agent${toAdd !== 1 ? "s" : ""} (target ${TARGET_AGENT_COUNT}).`
+  });
+  processAgentAddQueue();
+}
+function processAgentAddQueue() {
+  if (pendingAgentAdds <= 0) {
+    return;
+  }
+  if (workflowProc) {
+    return;
+  }
+  const current = tileStateManager.toAgentViews().length;
+  if (current >= TARGET_AGENT_COUNT) {
+    pendingAgentAdds = 0;
+    return;
+  }
+  pendingAgentAdds--;
+  runWorkflow({ model: pendingAgentModel, keepTiles: true });
+}
+var healingTile = false;
+function topUpPool() {
+  if (workflowProc || pendingAgentAdds > 0 || healingTile)
+    return;
+  const tiles = tileStateManager.toAgentViews().length;
+  if (tiles < TARGET_AGENT_COUNT) {
+    queueAgentAdds(TARGET_AGENT_COUNT - tiles, WORKFLOW_DEFAULT_MODEL);
+  }
+}
+var lastDirGcAt = 0;
+var DIR_GC_INTERVAL_MS = 3e4;
+function gcDeadAgentDirs() {
+  const now = Date.now();
+  if (now - lastDirGcAt < DIR_GC_INTERVAL_MS)
+    return;
+  if (workflowProc || healingTile)
+    return;
+  lastDirGcAt = now;
+  const live = /* @__PURE__ */ new Set();
+  for (const v of tileStateManager.toAgentViews())
+    live.add(v.id);
+  if (selectedAgentId)
+    live.add(selectedAgentId);
+  for (const id of listAgentDirIds()) {
+    if (live.has(id))
+      continue;
+    if (getAgentStatusFor(id).alive)
+      continue;
+    tileStateManager.forgetAgent(id);
+    agentStats.delete(id);
+    forgetAgentDir(id);
+    dlog(`reaped dead agent ${id.slice(0, 8)} (no tile, stale heartbeat)`);
+  }
+}
+async function maintainPool() {
+  if (!autoReconnect || workflowProc || healingTile || pendingAgentAdds > 0)
+    return;
+  const now = Date.now();
+  const synth = tileStateManager.getAgents().find(
+    (a) => a.agentId.startsWith("tile:") && a.tileIndex >= 0 && a.state === "idle" && now - a.firstSeen > 15e3
+  );
+  if (synth && cdpEnabled) {
+    healingTile = true;
+    dlog(`keep-connected: closing dead tile at index ${synth.tileIndex} (no agentId)`, "warn");
+    try {
+      const closed = await getCdpMonitor().closeTileByIndex(synth.tileIndex).catch(() => false);
+      if (closed)
+        tileStateManager.forgetAgent(synth.agentId);
+    } finally {
+      healingTile = false;
+    }
+    lastAgentListJson = void 0;
+    pushAgentList();
+    return;
+  }
+  const dropped = tileStateManager.getDroppedAgents();
+  if (dropped.length > 0) {
+    const stranded = dropped.find((a) => a.queueCount > 0);
+    if (stranded) {
+      dlog(
+        `keep-connected: re-priming dropped agent ${stranded.agentId.slice(0, 8)} in place (${stranded.queueCount} queued)`,
+        "warn"
+      );
+      postWorkflow({
+        type: "workflowOutput",
+        stream: "stdout",
+        line: `[jefr] keep-connected: agent ${stranded.agentId.slice(0, 8)} dropped with ${stranded.queueCount} queued \u2014 re-priming in place to drain its queue`
+      });
+      tileStateManager.markReconnectAttempt(stranded.agentId);
+      runWorkflow({ reconnect: true, agentId: stranded.agentId });
+      return;
+    }
+    const victim = dropped[0];
+    healingTile = true;
+    dlog(`keep-connected: closing cut-off agent ${victim.agentId.slice(0, 8)} and replacing`, "warn");
+    postWorkflow({
+      type: "workflowOutput",
+      stream: "stdout",
+      line: `[jefr] keep-connected: agent ${victim.agentId.slice(0, 8)} cut out \u2014 closing its tile and spawning a replacement`
+    });
+    try {
+      const closed = cdpEnabled ? await getCdpMonitor().closeAgentTile(victim.agentId).catch(() => false) : false;
+      if (closed) {
+        tileStateManager.forgetAgent(victim.agentId);
+        agentStats.delete(victim.agentId);
+        forgetAgentDir(victim.agentId);
+        if (victim.agentId === selectedAgentId)
+          selectAgent(void 0);
+      } else {
+        tileStateManager.markReconnectAttempt(victim.agentId);
+        runWorkflow({ reconnect: true, agentId: victim.agentId });
+        return;
+      }
+    } finally {
+      healingTile = false;
+    }
+    lastAgentListJson = void 0;
+    pushAgentList();
+  }
+  topUpPool();
+}
+async function closeDroppedTiles() {
+  if (healingTile)
+    return 0;
+  const dropped = tileStateManager.getDroppedAgents();
+  if (dropped.length === 0)
+    return 0;
+  let closedCount = 0;
+  healingTile = true;
+  try {
+    for (const victim of dropped) {
+      const ok = cdpEnabled ? await getCdpMonitor().closeAgentTile(victim.agentId).catch(() => false) : false;
+      if (ok) {
+        tileStateManager.forgetAgent(victim.agentId);
+        agentStats.delete(victim.agentId);
+        forgetAgentDir(victim.agentId);
+        if (victim.agentId === selectedAgentId)
+          selectAgent(void 0);
+        closedCount++;
+        dlog(`close-dropped: closed ${victim.agentId.slice(0, 8)}`);
+      } else {
+        dlog(`close-dropped: failed to close ${victim.agentId.slice(0, 8)}`, "error");
+      }
+    }
+  } finally {
+    healingTile = false;
+  }
+  lastAgentListJson = void 0;
+  pushAgentList();
+  return closedCount;
+}
 var resolvedPython;
 function resolvePython() {
   if (resolvedPython !== void 0) {
@@ -6548,6 +7258,21 @@ function resolvePython() {
 }
 function postWorkflow(message) {
   mainPanel?.webview.postMessage(message);
+}
+var DEBUG_LOG_MAX = 500;
+var debugLogBuf = [];
+function dlog(line, level = "info") {
+  const entry = { ts: Date.now(), level, line };
+  debugLogBuf.push(entry);
+  if (debugLogBuf.length > DEBUG_LOG_MAX)
+    debugLogBuf.shift();
+  mainPanel?.webview.postMessage({ type: "debugLog", entry });
+}
+function sendDebugLogSnapshot() {
+  mainPanel?.webview.postMessage({
+    type: "debugLogSnapshot",
+    entries: debugLogBuf
+  });
 }
 function runWorkflow(opts) {
   if (workflowProc) {
@@ -6644,10 +7369,21 @@ function runWorkflow(opts) {
     return;
   }
   workflowProc = proc;
+  dlog(
+    opts.reconnect ? `workflow: reconnecting agent ${(opts.agentId || "?").slice(0, 8)}` : `workflow: spawning a new agent (model ${opts.model || WORKFLOW_DEFAULT_MODEL})`
+  );
+  activeWorkflowAgentId = opts.agentId && opts.agentId.trim() ? opts.agentId.trim() : void 0;
+  spawnBaselineAgentIds = opts.reconnect || activeWorkflowAgentId ? void 0 : new Set(lastPushedAgentIds);
+  workflowStartedAt = Date.now();
+  if (activeWorkflowAgentId)
+    agentConnectMs.delete(activeWorkflowAgentId);
+  lastAgentListJson = void 0;
+  pushAgentList();
   const pump = (buf, stream) => {
     const text = buf.toString();
     for (const line of text.split(/\r?\n/)) {
       if (line.length > 0) {
+        maybeRecordWorkflowConnect(line);
         postWorkflow({ type: "workflowOutput", stream, line });
       }
     }
@@ -6662,6 +7398,7 @@ function runWorkflow(opts) {
     });
   });
   proc.on("close", (code) => {
+    dlog(`workflow exited with code ${code}`, code === 0 ? "info" : "warn");
     postWorkflow({
       type: "workflowOutput",
       stream: "stdout",
@@ -6672,9 +7409,15 @@ function runWorkflow(opts) {
     if (workflowProc === proc) {
       workflowProc = void 0;
     }
+    activeWorkflowAgentId = void 0;
+    spawnBaselineAgentIds = void 0;
+    lastAgentListJson = void 0;
+    pushAgentList();
+    processAgentAddQueue();
   });
 }
 function stopWorkflow() {
+  pendingAgentAdds = 0;
   const proc = workflowProc;
   if (!proc) {
     postWorkflow({ type: "workflowState", running: false });
@@ -6693,7 +7436,8 @@ function stopWorkflow() {
   } catch {
   }
 }
-var IDLE_TIMEOUT_MS = 15 * 60 * 1e3;
+var IDLE_TIMEOUT_MS = 5 * 60 * 1e3;
+var STANDBY_MESSAGE = "Hello. IMPORTANT: STAND BY. Take NO action of any kind right now \u2014 do not run any tools, edit files, or make any changes. Just hold, keep the connection open, and wait for my next instruction.";
 function resetIdleTimer() {
   lastActivityTime = Date.now();
 }
@@ -6705,13 +7449,23 @@ function startIdleTimer() {
     if (!isCardValid()) {
       return;
     }
-    if (Date.now() - lastActivityTime >= IDLE_TIMEOUT_MS) {
-      sendText(
-        "Hello. IMPORTANT: STAND BY. Take NO action of any kind right now \u2014 do not run any tools, edit files, or make any changes. Just hold, keep the connection open, and wait for my next instruction."
-      );
-      triggerCursorChat();
-      resetIdleTimer();
+    if (Date.now() - lastActivityTime < IDLE_TIMEOUT_MS) {
+      return;
     }
+    const targets = tileStateManager.getAgents().filter(
+      (a) => !a.agentId.startsWith("tile:") && a.tileIndex >= 0 && a.connectCount > 0 && // Online + idle = parked in the MCP loop (not generating/planning/working).
+      (a.state === "mcp_connected" || a.state === "waiting") && a.queueCount === 0
+    );
+    if (targets.length === 0) {
+      return;
+    }
+    dlog(
+      `idle ${IDLE_TIMEOUT_MS / 6e4}m: stand-by nudge \u2192 ${targets.length} agent(s): ${targets.map((a) => a.agentId.slice(0, 8)).join(", ")}`
+    );
+    for (const a of targets) {
+      sendTextTo(a.agentId, STANDBY_MESSAGE);
+    }
+    resetIdleTimer();
   }, 6e4);
 }
 function computeDataDir(workspaceFolders) {
@@ -6902,6 +7656,7 @@ function startPolling() {
       mainPanel.webview.postMessage({ type: "queueData", data: readQueueFor(selectedAgentId) });
       lastQueueCount = count;
     }
+    pushAllQueues();
   };
   poll();
   pollTimer2 = setInterval(poll, 500);
@@ -6945,13 +7700,26 @@ function pushAgentListFromHeartbeats(cdpFallback = false) {
       runWorkflow({ reconnect: true, agentId: target });
     }
   }
+  const droppedSet = new Set(dropped);
+  const agentsWithDropped = agents.map((a) => ({
+    ...a,
+    dropped: !a.connected && droppedSet.has(a.id)
+  }));
   writeCdpStatusFile(agents);
+  resolveSpawnConnectingId(agentsWithDropped);
+  recordConnectTime(agentsWithDropped);
+  lastPushedAgentIds = new Set(agentsWithDropped.map((a) => a.id));
   const payload = {
-    agents,
+    agents: agentsWithDropped.map((a) => ({
+      ...a,
+      connectMs: agentConnectMs.get(a.id)
+    })),
     selected: selectedAgentId || null,
     autoReconnect,
     targetAgentCount: TARGET_AGENT_COUNT,
-    cdpConnected: cdpFallback ? lastCdpStatus?.connected ?? false : false
+    cdpConnected: cdpFallback ? lastCdpStatus?.connected ?? false : false,
+    connectingAgentId: workflowProc ? activeWorkflowAgentId ?? null : null,
+    connectingSince: workflowProc ? workflowStartedAt : 0
   };
   setSelectedAgentId(selectedAgentId);
   const json = JSON.stringify(payload);
@@ -6998,7 +7766,60 @@ function selectAgent(agentId) {
   lastQuestionId = question?.id;
   mainPanel?.webview.postMessage({ type: "queueData", data: readQueueFor(selectedAgentId) });
   mainPanel?.webview.postMessage({ type: "queueCount", count: getQueueCountFor(selectedAgentId) });
+  lastAllQueuesJson = void 0;
+  pushAllQueues();
   pushAgentList();
+}
+function queueTarget(agentId) {
+  return agentId === void 0 ? selectedAgentId : agentId;
+}
+function buildQueueGroups() {
+  const groups = [];
+  const selected = selectedAgentId;
+  const rootItems = readQueueFor(void 0);
+  if (rootItems.length > 0 || !selected) {
+    groups.push({
+      agentId: "",
+      label: "General \xB7 shared",
+      items: rootItems,
+      connected: false,
+      routing: !selected
+    });
+  }
+  let sawSelected = false;
+  for (const a of scanAllAgents()) {
+    if (a.id === selected)
+      sawSelected = true;
+    groups.push({
+      agentId: a.id,
+      label: a.id.slice(0, 8),
+      items: readQueueFor(a.id),
+      connected: a.connected,
+      routing: selected === a.id
+    });
+  }
+  if (selected && !sawSelected) {
+    groups.push({
+      agentId: selected,
+      label: selected.slice(0, 8),
+      items: readQueueFor(selected),
+      connected: false,
+      routing: true
+    });
+  }
+  return groups;
+}
+function pushAllQueues() {
+  if (!mainPanel) {
+    return;
+  }
+  const data = buildQueueGroups();
+  const json = JSON.stringify(data);
+  if (json === lastAllQueuesJson) {
+    return;
+  }
+  lastAllQueuesJson = json;
+  mainPanel.webview.postMessage({ type: "allQueues", data });
 }
 function getWorkspaceName() {
   const folders = vscode.workspace.workspaceFolders;
@@ -7164,8 +7985,39 @@ var MessengerViewProvider = class {
             injected: !!readInjectedToken()
           });
           this.pushQueueData();
+          lastAgentListJson = void 0;
           pushAgentList();
+          if (cdpEnabled) {
+            getCdpMonitor().pollNow().then(() => {
+              lastAgentListJson = void 0;
+              pushAgentList();
+            }).catch(() => {
+            });
+          }
           break;
+        case "refreshAgents": {
+          lastAgentListJson = void 0;
+          if (cdpEnabled) {
+            getCdpMonitor().pollNow().then(() => {
+              lastAgentListJson = void 0;
+              pushAgentList();
+            }).catch(() => {
+              pushAgentList();
+            });
+          } else {
+            pushAgentList();
+          }
+          break;
+        }
+        case "closeDropped": {
+          const n = await closeDroppedTiles();
+          postWorkflow({
+            type: "workflowOutput",
+            stream: "stdout",
+            line: n > 0 ? `[jefr] closed ${n} dropped tile${n !== 1 ? "s" : ""}` : "[jefr] no dropped tiles to close"
+          });
+          break;
+        }
         case "selectAgent":
           selectAgent(msg.agentId);
           break;
@@ -7189,31 +8041,47 @@ var MessengerViewProvider = class {
           break;
         }
         case "addAgent": {
-          const current = tileStateManager.toAgentViews().length;
-          if (current >= TARGET_AGENT_COUNT) {
-            postWorkflow({
-              type: "workflowOutput",
-              stream: "stderr",
-              line: `[jefr] Already at ${TARGET_AGENT_COUNT} agents \u2014 delete one first.`
-            });
-            break;
-          }
           runWorkflow({
             model: typeof msg.model === "string" && msg.model.trim() || WORKFLOW_DEFAULT_MODEL,
             keepTiles: true
           });
           break;
         }
+        case "addAgents": {
+          const model = typeof msg.model === "string" && msg.model.trim() || WORKFLOW_DEFAULT_MODEL;
+          const count = typeof msg.count === "number" && Number.isFinite(msg.count) && msg.count > 0 ? Math.floor(msg.count) : TARGET_AGENT_COUNT;
+          queueAgentAdds(count, model);
+          break;
+        }
         case "deleteAgent": {
           const aid = typeof msg.agentId === "string" ? msg.agentId.trim() : "";
           if (!aid)
             break;
-          const wasVisible = (tileStateManager.getAgent(aid)?.tileIndex ?? -1) >= 0;
+          if (isConnectingTarget(aid)) {
+            dlog(`delete: ${aid.slice(0, 8)} is the connecting tile \u2014 stopping its workflow first`, "warn");
+            postWorkflow({
+              type: "workflowOutput",
+              stream: "stdout",
+              line: `[jefr] closing the connecting tile ${aid.slice(0, 8)} \u2014 stopping its spawn workflow`
+            });
+            stopWorkflow();
+          }
+          const tracked = tileStateManager.getAgent(aid);
+          const tileIdx = tracked?.tileIndex ?? -1;
+          const wasVisible = tileIdx >= 0;
           let closed = true;
           if (cdpEnabled && wasVisible) {
-            closed = await getCdpMonitor().closeAgentTile(aid).catch(() => false);
+            if (aid.startsWith("tile:")) {
+              closed = await getCdpMonitor().closeTileByIndex(tileIdx).catch(() => false);
+            } else {
+              closed = await getCdpMonitor().closeAgentTileFast(aid).catch(() => false);
+              if (!closed) {
+                closed = await getCdpMonitor().closeAgentTile(aid).catch(() => false);
+              }
+            }
           }
           if (!closed) {
+            dlog(`delete: failed to close tile for ${aid.slice(0, 8)}`, "error");
             postWorkflow({
               type: "workflowOutput",
               stream: "stderr",
@@ -7223,8 +8091,10 @@ var MessengerViewProvider = class {
             pushAgentList();
             break;
           }
+          dlog(`deleted agent ${aid.slice(0, 8)} (tile closed)`);
           tileStateManager.forgetAgent(aid);
           agentStats.delete(aid);
+          forgetAgentDir(aid);
           if (aid === selectedAgentId) {
             selectAgent(void 0);
           } else {
@@ -7307,15 +8177,19 @@ var MessengerViewProvider = class {
           this.pushQueueData();
           break;
         case "deleteQueueItem":
-          deleteQueueItemFor(msg.id, selectedAgentId);
+          deleteQueueItemFor(msg.id, queueTarget(msg.agentId));
           this.pushQueueData();
           break;
         case "clearQueue":
-          clearQueueFor(selectedAgentId);
+          clearQueueFor(queueTarget(msg.agentId));
+          this.pushQueueData();
+          break;
+        case "clearAllQueues":
+          clearAllQueues();
           this.pushQueueData();
           break;
         case "updateQueueItem":
-          updateQueueItemFor(msg.id, { content: msg.content }, selectedAgentId);
+          updateQueueItemFor(msg.id, { content: msg.content }, queueTarget(msg.agentId));
           this.pushQueueData();
           break;
         case "fetchUsage":
@@ -7383,6 +8257,13 @@ var MessengerViewProvider = class {
         case "getWorkflowState":
           postWorkflow({ type: "workflowState", running: !!workflowProc });
           break;
+        case "getDebugLog":
+          sendDebugLogSnapshot();
+          break;
+        case "clearDebugLog":
+          debugLogBuf.length = 0;
+          sendDebugLogSnapshot();
+          break;
       }
     });
     webviewView.onDidDispose(() => {
@@ -7404,7 +8285,7 @@ var MessengerViewProvider = class {
       const buf = Buffer.from(match[2], "base64");
       const tmpPath = path3.join(os3.tmpdir(), "mcp_" + Date.now() + "." + ext);
       fs3.writeFileSync(tmpPath, buf);
-      const item = sendImageTo(selectedAgentId, tmpPath, caption);
+      const item = sendImageTo(selectedAgentId, tmpPath, caption, dataUrl);
       appendSharedHistory({
         id: item.id,
         kind: "image",
@@ -7499,6 +8380,7 @@ var MessengerViewProvider = class {
       return;
     }
     mainPanel.webview.postMessage({ type: "queueData", data: readQueueFor(selectedAgentId) });
+    pushAllQueues();
   }
   pushCardState() {
     if (!mainPanel) {

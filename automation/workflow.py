@@ -11,9 +11,9 @@ Stages:
   5. type      — type the MCP prompt (default: an improvised "directly invoke
                  the mcp, don't do anything else first, keep the connection" instruction)
                  into the Send follow-up composer
-  6. hold      — focus the composer, HOLD Enter: first until planning clears
-                 (120s cap — submit the prompt), then until MCP connected
-                 (--max-secs, default 6000s; Enter released on connect)
+  6. hold      — focus the composer, HOLD Enter continuously until MCP connected
+                 (planning-clear then MCP-detect in one session; --max-secs
+                 default 6000s; Enter released on connect)
 
 Requires Cursor launched with:
     --remote-debugging-port=9222 --remote-allow-origins=*
@@ -32,18 +32,18 @@ import mcp_alive
 
 DEFAULT_MODEL = "Opus 4.8 1M Extra High Fast"
 
-# Enter-hold caps per phase (--max-secs applies to the MCP wait, not planning).
-PLANNING_HOLD_CAP = 120.0
+# Enter-hold cap for the single continuous hold (--max-secs).
 MCP_HOLD_DEFAULT = 6000.0
 
-
-def _planning_hold_secs(_max_secs):
-    """Phase 1: spam Enter until planning clears (short cap — just need submit)."""
-    return PLANNING_HOLD_CAP
+# While holding Enter we keep re-asserting focus on the target tile's composer —
+# otherwise focus drift sends the autorepeat into the void. We use a CDP/JS focus
+# (not a real mouse click, which disrupts the held-Enter autorepeat speed), every
+# this many seconds.
+REFOCUS_SECS = 60
 
 
 def _mcp_hold_secs(max_secs):
-    """Phase 2: hold Enter until MCP loop confirmed (long cap — wait for check_messages)."""
+    """Return the Enter-hold cap in seconds (None = unlimited)."""
     if max_secs == 0:
         return None
     return max_secs if max_secs else MCP_HOLD_DEFAULT
@@ -229,6 +229,56 @@ def mcp_connected_stop_eval(idx, streak_needed=12):
         "if(connected){window.__wfMcpStreak=(window.__wfMcpStreak||0)+1;}"
         "else{window.__wfMcpStreak=0;}"
         "return window.__wfMcpStreak>=need;})()"
+    )
+
+
+def combined_mcp_stop_eval_by_agent(agent_id, clear_polls=35, min_planning_polls=5, mcp_streak_needed=12):
+    """Single stop_eval: planning must clear first, then MCP tool call must be running."""
+    return (
+        "(()=>{"
+        f"const ID={json.dumps(agent_id)},planNeed={clear_polls},minPlan={min_planning_polls},mcpNeed={mcp_streak_needed};"
+        "const ts=[...document.querySelectorAll('.glass-agent-conversation-tiling__tile')];"
+        "const fid=(n)=>{const k=Object.keys(n).find(x=>x.startsWith('__reactFiber$')||x.startsWith('__reactInternalInstance$'));"
+        "let f=k?n[k]:null,s=0;while(f&&s++<40){const p=f.memoizedProps;if(p&&typeof p.agentId==='string')return p.agentId;f=f.return;}return null;};"
+        "const t=ts.find(x=>fid(x)===ID);"
+        "if(!t){window.__wfMcpStreak=0;return false;}"
+        "const sh=t.querySelector('.ui-collapsible-action.ui-collapsible-shimmer')?.textContent||'';"
+        "const planning=/planning\\s+next\\s+move/i.test(sh);"
+        "if(planning){window.__wfPlanned=true;window.__wfPlanStreak=(window.__wfPlanStreak||0)+1;window.__wfClear=0;}"
+        "else{window.__wfPlanStreak=0;"
+        "if(window.__wfPlanned&&(window.__wfPlanPeak||0)>=minPlan){window.__wfClear=(window.__wfClear||0)+1;}}"
+        "window.__wfPlanPeak=Math.max(window.__wfPlanPeak||0,window.__wfPlanStreak||0);"
+        "const planningDone=!!window.__wfPlanned&&!planning&&(window.__wfPlanPeak>=minPlan)&&(window.__wfClear>=planNeed);"
+        "if(!planningDone)return false;"
+        + _MCP_RUNNING_JS +
+        "if(connected){window.__wfMcpStreak=(window.__wfMcpStreak||0)+1;}"
+        "else{window.__wfMcpStreak=0;}"
+        "return window.__wfMcpStreak>=mcpNeed;})()"
+    )
+
+
+def combined_mcp_stop_eval(idx, clear_polls=35, min_planning_polls=5, mcp_streak_needed=12):
+    """Tile-index version of combined_mcp_stop_eval_by_agent (self-contained)."""
+    return (
+        "(()=>{const idx=" + str(idx)
+        + ",planNeed=" + str(clear_polls)
+        + ",minPlan=" + str(min_planning_polls)
+        + ",mcpNeed=" + str(mcp_streak_needed) + ";"
+        "const ts=[...document.querySelectorAll('.glass-agent-conversation-tiling__tile')];"
+        "const t=ts.length?ts.at(idx<0?ts.length+idx:idx):document;"
+        "if(!t){window.__wfMcpStreak=0;return false;}"
+        "const sh=t.querySelector('.ui-collapsible-action.ui-collapsible-shimmer')?.textContent||'';"
+        "const planning=/planning\\s+next\\s+move/i.test(sh);"
+        "if(planning){window.__wfPlanned=true;window.__wfPlanStreak=(window.__wfPlanStreak||0)+1;window.__wfClear=0;}"
+        "else{window.__wfPlanStreak=0;"
+        "if(window.__wfPlanned&&(window.__wfPlanPeak||0)>=minPlan){window.__wfClear=(window.__wfClear||0)+1;}}"
+        "window.__wfPlanPeak=Math.max(window.__wfPlanPeak||0,window.__wfPlanStreak||0);"
+        "const planningDone=!!window.__wfPlanned&&!planning&&(window.__wfPlanPeak>=minPlan)&&(window.__wfClear>=planNeed);"
+        "if(!planningDone)return false;"
+        + _MCP_RUNNING_JS +
+        "if(connected){window.__wfMcpStreak=(window.__wfMcpStreak||0)+1;}"
+        "else{window.__wfMcpStreak=0;}"
+        "return window.__wfMcpStreak>=mcpNeed;})()"
     )
 
 
@@ -435,6 +485,15 @@ def real_focus(ws, idx):
     print(f"real click at {pt}; menu still open: {menu_open(ws)}")
 
 
+def real_focus_quick(ws, idx):
+    """Real mouse click into follow-up composer — no sleeps (hold-loop refocus)."""
+    pt = editor_center(ws, idx)
+    if not pt:
+        eval_js(ws, tile_focus_eval(idx), await_promise=True)
+        return
+    cdp.click_at(ws, pt["x"], pt["y"])
+
+
 def type_in_composer(ws, idx, text):
     """Real-click the follow-up composer, then insert `text` (replacing any draft)."""
     real_focus(ws, idx)
@@ -500,79 +559,43 @@ def _resolve_tile(ws, idx, agent_id):
     return idx
 
 
-def enter_spam_until_planning_clears(ws, idx, interval, max_secs, agent_id=None):
-    """Single-agent enter spam (borrowed): focus composer, hold Enter until
-    'Planning next moves' has appeared and then cleared on this tile."""
+def hold_enter_until_mcp_connected(ws, idx, interval, max_secs, agent_id=None):
+    """One continuous Enter hold: planning clears, then MCP loop confirmed — no release between."""
     idx = _resolve_tile(ws, idx, agent_id)
     cap = f"{max_secs}s cap" if max_secs else "unlimited"
     who = f"agent {agent_id}" if agent_id else f"tile {idx}"
-    print(f"hold Enter until planning clears on {who} ({cap})")
+    print(f"hold Enter continuously until MCP connected on {who} ({cap})")
     real_focus(ws, idx)
     time.sleep(random.uniform(0.3, 0.7))
 
     eval_js(
         ws,
         "window.__wfPlanned=false;window.__wfPlanStreak=0;"
-        "window.__wfClear=0;window.__wfPlanPeak=0;true;",
+        "window.__wfClear=0;window.__wfPlanPeak=0;window.__wfMcpStreak=0;true;",
         await_promise=False,
     )
     base = response_state(ws, idx)
     print(f"baseline: generating={base.get('generating')}, planning={base.get('planning')}")
 
-    focus_eval = agent_focus_eval(agent_id) if agent_id else tile_focus_eval(idx)
-    stop_eval = (
-        response_stop_eval_by_agent(agent_id)
-        if agent_id
-        else response_stop_eval(idx)
-    )
+    # Auto-refocus during the connect hold via a CDP/JS focus (NOT a real mouse
+    # click — the click mimic disrupts the held-Enter autorepeat speed). Re-asserts
+    # focus on THIS tile's composer every REFOCUS_SECS so the spam keeps landing.
+    refocus_eval = tile_focus_eval(idx)
 
-    presses, stop_reason = cdp.hold_key(
-        ws, "Enter", interval=interval, jitter=0.15,
-        focus_eval=focus_eval, stop_eval=stop_eval,
-        max_secs=(max_secs or None), min_hold_secs=0.0,
-    )
-
-    cleared = stop_reason == "stop_eval"
-    final = response_state(ws, idx)
-    print(
-        f"enter_presses={presses}; planning_cleared={cleared}; "
-        f"stop_reason={stop_reason}; planning={final.get('planning')}, "
-        f"lastText={final.get('lastText', '')[:80]!r}"
-    )
-    return cleared, idx, stop_reason
-
-
-def hold_until_mcp_connected(ws, idx, interval, max_secs, agent_id=None):
-    """Phase 2: after submit, hold Enter until the tile is in the jefr MCP loop.
-
-    Stop when either:
-      - CDP: tile shows a running Check Messages in jefr tool call (debounced)
-      - Filesystem: agents/<agent_id>/agent-alive.json is fresh (via stop_check)
-    """
-    idx = _resolve_tile(ws, idx, agent_id)
-    cap = f"{max_secs}s cap" if max_secs else "unlimited"
-    who = f"agent {agent_id}" if agent_id else f"tile {idx}"
-    print(f"hold Enter until MCP connected on {who} ({cap})")
-    real_focus(ws, idx)
-    time.sleep(random.uniform(0.3, 0.7))
-
-    eval_js(ws, "window.__wfMcpStreak=0;true;", await_promise=False)
-    base = response_state(ws, idx)
-    print(f"mcp-wait baseline: generating={base.get('generating')}, planning={base.get('planning')}")
-
-    focus_eval = agent_focus_eval(agent_id) if agent_id else tile_focus_eval(idx)
     if agent_id:
-        stop_eval = mcp_connected_stop_eval_by_agent(agent_id)
+        stop_eval = combined_mcp_stop_eval_by_agent(agent_id)
         stop_check = lambda: mcp_alive.is_connected(agent_id)
     else:
-        stop_eval = mcp_connected_stop_eval(idx)
+        stop_eval = combined_mcp_stop_eval(idx)
         stop_check = lambda: mcp_alive.is_connected(None)
 
     presses, stop_reason = cdp.hold_key(
         ws, "Enter", interval=interval, jitter=0.15,
-        focus_eval=focus_eval, stop_eval=stop_eval, stop_check=stop_check,
+        focus_eval=refocus_eval,
+        stop_eval=stop_eval, stop_check=stop_check,
         max_secs=(max_secs or None), min_hold_secs=5.0,
         release_on_stop=True,
+        refocus_secs=REFOCUS_SECS,
     )
 
     final = response_state(ws, idx)
@@ -581,62 +604,30 @@ def hold_until_mcp_connected(ws, idx, interval, max_secs, agent_id=None):
         if agent_id
         else mcp_alive.is_connected(None)
     )
-    snap(ws, "done")
+    if stop_reason in ("stop_eval", "stop_check"):
+        hb_ok = True
     print(
-        f"mcp_hold_presses={presses}; stop_reason={stop_reason}; "
+        f"hold_presses={presses}; stop_reason={stop_reason}; "
         f"mcp_connected={hb_ok}; planning={final.get('planning')}, "
         f"lastText={final.get('lastText', '')[:80]!r}"
     )
     return hb_ok, stop_reason, idx
 
 
-def enter_until_mcp_connected(ws, idx, interval, max_secs, agent_id=None):
-    """Alias kept for callers/tests: planning-clear spam, then MCP-connected hold."""
-    _, idx, _ = enter_spam_until_planning_clears(
-        ws, idx, interval, _planning_hold_secs(max_secs), agent_id=agent_id,
-    )
-    if agent_id and mcp_alive.is_connected(agent_id):
-        return True, "stop_check"
-    if not agent_id and mcp_alive.is_connected(None):
-        return True, "stop_check"
-    connected, stop_reason, _ = hold_until_mcp_connected(
-        ws, idx, interval, _mcp_hold_secs(max_secs), agent_id=agent_id,
-    )
-    return connected, stop_reason
-
-
 def enter_until_response(ws, idx, interval, max_secs, agent_id=None):
-    """Submit via single-agent enter spam, then wait for MCP loop confirmation."""
-    cleared, idx, _ = enter_spam_until_planning_clears(
-        ws, idx, interval, _planning_hold_secs(max_secs), agent_id=agent_id,
-    )
-    if not cleared:
-        print("WARN: planning did not clear during enter spam — continuing to MCP wait")
-
-    if agent_id and mcp_alive.is_connected(agent_id):
-        print("MCP loop confirmed immediately after enter spam")
-        cdp.release_key(ws, "Enter")
-        print("workflow: MCP connected — Enter released, workflow done")
-        return True
-    if not agent_id and mcp_alive.is_connected(None):
-        print("MCP loop confirmed immediately after enter spam")
-        cdp.release_key(ws, "Enter")
-        print("workflow: MCP connected — Enter released, workflow done")
-        return True
-
-    connected, _, idx = hold_until_mcp_connected(
-        ws, idx, interval, _mcp_hold_secs(max_secs), agent_id=agent_id,
+    """Type prompt already done — one continuous Enter hold until MCP loop confirmed."""
+    hold_cap = _mcp_hold_secs(max_secs)
+    connected, _, idx = hold_enter_until_mcp_connected(
+        ws, idx, interval, hold_cap, agent_id=agent_id,
     )
     if agent_id and not connected:
         print("WARN: MCP loop not confirmed on per-agent heartbeat — re-nudging agent_id routing")
         idx = _resolve_tile(ws, idx, agent_id)
         type_in_composer(ws, idx, agent_id_reminder(agent_id))
-        _, idx, _ = enter_spam_until_planning_clears(
-            ws, idx, interval, _planning_hold_secs(max_secs), agent_id=agent_id,
+        connected, _, _ = hold_enter_until_mcp_connected(
+            ws, idx, interval, hold_cap, agent_id=agent_id,
         )
-        connected, _, _ = hold_until_mcp_connected(
-            ws, idx, interval, _mcp_hold_secs(max_secs), agent_id=agent_id,
-        )
+    snap(ws, "done")
     if not connected:
         print("ERROR: tile never reached a confirmed MCP connection")
         return False
@@ -652,9 +643,8 @@ def main():
                          "initial 500ms delay (0 = OS human rate ~31ms; set e.g. "
                          "0.12 to pace slower)")
     ap.add_argument("--max-secs", type=float, default=6000.0,
-                    help="safety cap for MCP-wait Enter hold in seconds "
-                         f"(planning-clear cap is fixed at {PLANNING_HOLD_CAP:.0f}s; "
-                         "default 6000; 0 = unlimited)")
+                    help="safety cap for the continuous Enter hold in seconds "
+                         "(default 6000; 0 = unlimited)")
     ap.add_argument("--type-text", default=None,
                     help="MCP prompt to type into the composer before Enter spam "
                          "(default: an improvised 'directly invoke the mcp' instruction)")

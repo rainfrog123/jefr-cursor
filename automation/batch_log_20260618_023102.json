@@ -1,0 +1,27 @@
+{
+  "timestamp": "20260618_023102",
+  "cap_secs": 60.0,
+  "total": 2,
+  "invoked": 0,
+  "timed_out": 2,
+  "tiles": [
+    {
+      "n": 1,
+      "idx": 1,
+      "prompt": "explore files #3682",
+      "started": false,
+      "elapsed": null
+    },
+    {
+      "n": 2,
+      "idx": 2,
+      "prompt": "review tests #6624",
+      "started": true,
+      "elapsed": null
+    }
+  ],
+  "timed_out_tiles": [
+    1,
+    2
+  ]
+}

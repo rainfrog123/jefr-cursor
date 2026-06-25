@@ -5,9 +5,11 @@
  * host. Layout is a vertical flex column (`.app`): header, optional question
  * panel, then the active tab (Chat / Queue / Usage).
  */
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { post, vscode } from "./vscode";
 import type {
+  AgentQueueGroup,
+  DebugEntry,
   Attachment,
   HistoryItem,
   InboundMessage,
@@ -17,45 +19,81 @@ import type {
   ReplyData,
   UsageData,
 } from "./types";
-import { Header } from "./components/Header";
 import { QuestionPanel } from "./components/QuestionPanel";
-import { ChatTab } from "./components/ChatTab";
 import { QueueTab } from "./components/QueueTab";
 import { GeneralTab, type WorkflowLine } from "./components/GeneralTab";
 import { AgentsTab } from "./components/AgentsTab";
+import { AgentDetail } from "./components/AgentDetail";
+import { applyScale, loadScale } from "./fontScale";
 
-type TabId = "chat" | "queue" | "agents" | "general";
+type TabId = "agents" | "queue" | "general";
+type AgentView = "list" | "detail";
 
 /** Keep the workflow log bounded so it never grows without limit. */
 const MAX_WORKFLOW_LINES = 600;
 
+/** Per-agent chat history, keyed by agent id (or SHARED_KEY for the shared
+ *  queue). Each agent's conversation is preserved across switches/reloads. */
+type Histories = Record<string, HistoryItem[]>;
+
+/** Map key for the shared ("General") chat. */
+const SHARED_KEY = "__shared__";
+const keyFor = (id: string | null): string => id ?? SHARED_KEY;
+
 /** Persisted webview state shape (survives reloads via getState/setState). */
 interface PersistedState {
+  /** Legacy single-history blob (migrated into the shared bucket on load). */
   history?: HistoryItem[];
+  histories?: Histories;
 }
 
-/** Keep persisted history bounded so the state blob never grows unbounded. */
+/** Keep each agent's persisted history bounded so the blob never grows unbounded. */
 const MAX_PERSISTED_HISTORY = 300;
 
-function loadPersistedHistory(): HistoryItem[] {
+function loadPersistedHistories(): Histories {
   const saved = vscode.getState<PersistedState>();
-  const items = saved?.history ?? [];
-  // Renumber so indices stay sequential after a reload/cap.
-  return items.map((it, i) => ({ ...it, index: i + 1 }));
+  const stored = saved?.histories ?? {};
+  const out: Histories = {};
+  for (const [k, items] of Object.entries(stored)) {
+    out[k] = items.map((it, i) => ({ ...it, index: i + 1 }));
+  }
+  // Migrate any legacy single-history blob into the shared bucket.
+  if (saved?.history && saved.history.length && !out[SHARED_KEY]) {
+    out[SHARED_KEY] = saved.history.map((it, i) => ({ ...it, index: i + 1 }));
+  }
+  return out;
 }
 
 export function App(): JSX.Element {
   const [version, setVersion] = useState("");
-  const [tab, setTab] = useState<TabId>("chat");
+  const [tab, setTab] = useState<TabId>("agents");
+  const [agentView, setAgentView] = useState<AgentView>("list");
 
   const [question, setQuestion] = useState<QuestionData | null>(null);
   const [reply, setReply] = useState<ReplyData | null>(null);
 
-  const [history, setHistory] = useState<HistoryItem[]>(loadPersistedHistory);
+  const [histories, setHistories] = useState<Histories>(loadPersistedHistories);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+
+  /* The message handler is registered once, so it reads the live selection via a
+     ref to route replies/history into the right agent's bucket. */
+  const selectedRef = useRef<string | null>(null);
+
+  /** Append an item to a specific agent's history bucket (deduped by id). */
+  const appendToHistory = useCallback(
+    (key: string, item: HistoryItem) => {
+      setHistories((all) => {
+        const cur = all[key] ?? [];
+        if (cur.some((it) => it.id === item.id)) return all;
+        return { ...all, [key]: [...cur, { ...item, index: cur.length + 1 }] };
+      });
+    },
+    [],
+  );
 
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [queueCount, setQueueCount] = useState(0);
+  const [queueGroups, setQueueGroups] = useState<AgentQueueGroup[]>([]);
 
   const [usage, setUsage] = useState<UsageData | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
@@ -63,12 +101,23 @@ export function App(): JSX.Element {
 
   const [workflowRunning, setWorkflowRunning] = useState(false);
   const [workflowOutput, setWorkflowOutput] = useState<WorkflowLine[]>([]);
+  const [debugLog, setDebugLog] = useState<DebugEntry[]>([]);
 
   const [agents, setAgents] = useState<LiveAgentInfo[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [autoReconnect, setAutoReconnect] = useState(false);
   const [targetAgentCount, setTargetAgentCount] = useState(5);
   const [cdpConnected, setCdpConnected] = useState<boolean | undefined>(undefined);
+  const [connectingAgentId, setConnectingAgentId] = useState<string | null>(null);
+  const [connectingSince, setConnectingSince] = useState<number>(0);
+
+  /* Apply the saved font scale on first load. The FontScale control now lives on
+     the General tab / chat toolbar, so without this top-level apply the saved zoom
+     wouldn't take effect until one of those mounted (the bug where it only kicked
+     in after visiting General and switching back). */
+  useEffect(() => {
+    applyScale(loadScale());
+  }, []);
 
   /* Route messages coming from the extension host. */
   useEffect(() => {
@@ -85,6 +134,9 @@ export function App(): JSX.Element {
           setQueue(msg.data);
           setQueueCount(msg.data.length);
           break;
+        case "allQueues":
+          setQueueGroups(msg.data);
+          break;
         case "queueCount":
           setQueueCount(msg.count);
           break;
@@ -96,29 +148,16 @@ export function App(): JSX.Element {
           break;
         case "showReply": {
           setReply(msg.data);
-          const replyId = "reply-" + msg.data.timestamp;
-          setHistory((h) =>
-            h.some((it) => it.id === replyId)
-              ? h
-              : [
-                  ...h,
-                  {
-                    id: replyId,
-                    kind: "reply",
-                    index: h.length + 1,
-                    text: msg.data.content,
-                    time: formatTime(msg.data.timestamp),
-                  },
-                ],
-          );
+          appendToHistory(keyFor(selectedRef.current), {
+            id: "reply-" + msg.data.timestamp,
+            kind: "reply",
+            text: msg.data.content,
+            time: formatTime(msg.data.timestamp),
+          });
           break;
         }
         case "historyAppend":
-          setHistory((h) =>
-            h.some((it) => it.id === msg.item.id)
-              ? h
-              : [...h, { ...msg.item, index: h.length + 1 }],
-          );
+          appendToHistory(keyFor(selectedRef.current), msg.item);
           break;
         case "attachmentAdded":
           setAttachments((a) => [...a, msg.item]);
@@ -144,12 +183,23 @@ export function App(): JSX.Element {
         case "workflowExit":
           setWorkflowRunning(false);
           break;
+        case "debugLog":
+          setDebugLog((l) => {
+            const next = [...l, msg.entry];
+            return next.length > 600 ? next.slice(next.length - 600) : next;
+          });
+          break;
+        case "debugLogSnapshot":
+          setDebugLog(msg.entries);
+          break;
         case "agentList":
           setAgents(msg.agents);
           setSelectedAgentId(msg.selected);
           setAutoReconnect(msg.autoReconnect);
           if (msg.targetAgentCount != null) setTargetAgentCount(msg.targetAgentCount);
           if (msg.cdpConnected !== undefined) setCdpConnected(msg.cdpConnected);
+          setConnectingAgentId(msg.connectingAgentId ?? null);
+          setConnectingSince(msg.connectingSince ?? 0);
           break;
         case "agentSelected":
           setSelectedAgentId(msg.agentId);
@@ -165,16 +215,46 @@ export function App(): JSX.Element {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
+  /* Auto-select the first agent once, so the panel opens with one already active
+     (MCP routes to it). Skips if the host already restored a selection, and only
+     fires once so picking "All (shared)" later isn't overridden. Doesn't clear
+     history (unlike a manual switch) to preserve the restored chat view. */
+  const didAutoSelect = useRef(false);
+  useEffect(() => {
+    if (didAutoSelect.current) return;
+    if (selectedAgentId) {
+      didAutoSelect.current = true;
+      return;
+    }
+    if (agents.length === 0) return;
+    didAutoSelect.current = true;
+    const first = [...agents].sort(
+      (a, b) => (a.tileIndex ?? 0) - (b.tileIndex ?? 0),
+    )[0];
+    setSelectedAgentId(first.id);
+    post({ type: "selectAgent", agentId: first.id });
+  }, [agents, selectedAgentId]);
+
+  /* Keep the selection ref in sync for the (once-registered) message handler. */
+  useEffect(() => {
+    selectedRef.current = selectedAgentId;
+  }, [selectedAgentId]);
+
   /* When a reply arrives, acknowledge it so the host clears reply.json. */
   useEffect(() => {
     if (reply) post({ type: "ackReply", timestamp: reply.timestamp });
   }, [reply]);
 
-  /* Persist chat history so it survives webview/window reloads. */
+  /* Persist every agent's history (bounded per agent) so each conversation
+     survives webview/window reloads. */
   useEffect(() => {
     const prev = vscode.getState<PersistedState>() || {};
-    vscode.setState({ ...prev, history: history.slice(-MAX_PERSISTED_HISTORY) });
-  }, [history]);
+    const bounded: Histories = {};
+    for (const [k, items] of Object.entries(histories)) {
+      if (items.length) bounded[k] = items.slice(-MAX_PERSISTED_HISTORY);
+    }
+    vscode.setState({ ...prev, histories: bounded, history: undefined });
+  }, [histories]);
 
   const switchTab = useCallback((next: TabId) => {
     setTab(next);
@@ -182,67 +262,97 @@ export function App(): JSX.Element {
     if (next === "general") {
       post({ type: "fetchUsage" });
       post({ type: "getWorkflowState" });
+      post({ type: "getDebugLog" });
     }
   }, []);
 
-  /* Optimistically record a message the user just sent into the history,
-     since the extension host does not echo sends back as history items. */
-  const appendHistory = useCallback((item: Omit<HistoryItem, "index">) => {
-    setHistory((h) => [...h, { ...item, index: h.length + 1 }]);
+  /* Optimistically record a message the user just sent into the active agent's
+     history, since the host doesn't echo sends back as history items. */
+  const appendHistory = useCallback(
+    (item: Omit<HistoryItem, "index">) => {
+      appendToHistory(keyFor(selectedRef.current), item as HistoryItem);
+    },
+    [appendToHistory],
+  );
+
+  /* Clear just the active agent's conversation. */
+  const clearHistory = useCallback(() => {
+    const key = keyFor(selectedRef.current);
+    setHistories((all) => ({ ...all, [key]: [] }));
   }, []);
 
-  /* Wipe the chat history (the persist effect clears stored state too). */
-  const clearHistory = useCallback(() => setHistory([]), []);
-
-  /* Switch the target agent. Clearing history keeps each agent's view clean,
-     since replies/questions are scoped to the selected agent by the host. */
+  /* Switch the target agent. History is per-agent and preserved, so switching
+     simply shows that agent's own conversation. */
   const onSelectAgent = useCallback(
     (id: string | null) => {
       setSelectedAgentId(id);
-      setHistory([]);
       post({ type: "selectAgent", agentId: id ?? undefined });
     },
     []
   );
 
+  /* The active agent's conversation (derived from the per-agent map). */
+  const history = histories[keyFor(selectedAgentId)] ?? [];
+
+  /* Open a target's detail+chat page (null = General/shared). Selecting routes
+     MCP here so the detail's chat talks to this agent. */
+  const openDetail = useCallback(
+    (id: string | null) => {
+      onSelectAgent(id);
+      setAgentView("detail");
+    },
+    [onSelectAgent],
+  );
+
+  /* If the open agent is deleted/vanishes, fall back to the roster. Shared
+     (null) is always valid. */
+  useEffect(() => {
+    if (agentView !== "detail" || selectedAgentId === null) return;
+    if (!agents.some((a) => a.id === selectedAgentId)) setAgentView("list");
+  }, [agentView, selectedAgentId, agents]);
+
+  const detailAgent =
+    selectedAgentId !== null
+      ? agents.find((a) => a.id === selectedAgentId) ?? null
+      : null;
+
+  /* Tab badge reflects pending items across every agent's queue, not just the
+     routing target — the Queue tab now shows all of them. */
+  const totalQueued = queueGroups.reduce((n, g) => n + g.items.length, 0);
+  const queueBadge = queueGroups.length ? totalQueued : queueCount;
+  /* The General card/detail must show the SHARED ROOT queue specifically — not
+     `queueCount`, which tracks the currently-selected agent. Pull the root group
+     (empty agentId) straight from the per-agent snapshot so the shared count
+     never mirrors a selected agent's own queue. */
+  const sharedRootCount =
+    queueGroups.find((g) => !g.agentId)?.items.length ?? 0;
+
   return (
     <div className="app">
-      <Header version={version} onOpenConsole={() => post({ type: "openConsole" })} />
-
       {question && <QuestionPanel question={question} />}
 
       <div className="tab-bar">
-        <TabButton id="chat" current={tab} onClick={switchTab} label="Chat" />
-        <TabButton
-          id="queue"
-          current={tab}
-          onClick={switchTab}
-          label="Queue"
-          badge={queueCount}
-        />
         <TabButton
           id="agents"
           current={tab}
           onClick={switchTab}
           label="Agents"
-          badge={agents.filter((a) => a.connected).length}
+          badge={
+            agents.filter((a) => a.connected && a.id !== connectingAgentId)
+              .length
+          }
+        />
+        <TabButton
+          id="queue"
+          current={tab}
+          onClick={switchTab}
+          label="Queue"
+          badge={queueBadge}
         />
         <TabButton id="general" current={tab} onClick={switchTab} label="General" />
       </div>
 
-      <AgentPicker agents={agents} selected={selectedAgentId} onSelect={onSelectAgent} />
-
-      {tab === "chat" && (
-        <ChatTab
-          history={history}
-          attachments={attachments}
-          setAttachments={setAttachments}
-          appendHistory={appendHistory}
-          onClearHistory={clearHistory}
-        />
-      )}
-      {tab === "queue" && <QueueTab queue={queue} />}
-      {tab === "agents" && (
+      {tab === "agents" && agentView === "list" && (
         <AgentsTab
           agents={agents}
           selectedAgentId={selectedAgentId}
@@ -250,7 +360,35 @@ export function App(): JSX.Element {
           targetAgentCount={targetAgentCount}
           cdpConnected={cdpConnected}
           workflowRunning={workflowRunning}
+          connectingAgentId={connectingAgentId}
+          connectingSince={connectingSince}
+          sharedQueueCount={sharedRootCount}
           onSelectAgent={onSelectAgent}
+          onOpenDetail={openDetail}
+        />
+      )}
+      {tab === "agents" && agentView === "detail" && (
+        <AgentDetail
+          agent={detailAgent}
+          connectingAgentId={connectingAgentId}
+          workflowRunning={workflowRunning}
+          sharedQueueCount={sharedRootCount}
+          history={history}
+          attachments={attachments}
+          setAttachments={setAttachments}
+          appendHistory={appendHistory}
+          onClearHistory={clearHistory}
+          onBack={() => setAgentView("list")}
+          version={version}
+          onOpenConsole={() => post({ type: "openConsole" })}
+        />
+      )}
+      {tab === "queue" && (
+        <QueueTab
+          groups={queueGroups}
+          routingLabel={
+            selectedAgentId ? selectedAgentId.slice(0, 8) : "General · shared"
+          }
         />
       )}
       {tab === "general" && (
@@ -261,6 +399,13 @@ export function App(): JSX.Element {
           workflowRunning={workflowRunning}
           workflowOutput={workflowOutput}
           onClearWorkflowOutput={() => setWorkflowOutput([])}
+          debugLog={debugLog}
+          onClearDebugLog={() => {
+            setDebugLog([]);
+            post({ type: "clearDebugLog" });
+          }}
+          version={version}
+          onOpenConsole={() => post({ type: "openConsole" })}
         />
       )}
     </div>
@@ -286,46 +431,6 @@ function TabButton(props: {
   );
 }
 
-/** Top strip that lists live agents and lets the user pick which one to talk
- *  to. "All (shared)" routes to the legacy shared queue. */
-function AgentPicker(props: {
-  agents: LiveAgentInfo[];
-  selected: string | null;
-  onSelect: (id: string | null) => void;
-}): JSX.Element | null {
-  const { agents, selected, onSelect } = props;
-
-  // Hide entirely until at least one addressable agent shows up, so the legacy
-  // single-listener setup looks unchanged.
-  if (agents.length === 0 && !selected) {
-    return null;
-  }
-
-  const shortId = (id: string) => id.slice(0, 8);
-  const connectedCount = agents.filter((a) => a.connected).length;
-
-  return (
-    <div className="agent-picker">
-      <span className="agent-picker-label">Agent</span>
-      <select
-        className="agent-picker-select"
-        value={selected ?? ""}
-        onChange={(e) => onSelect(e.target.value || null)}
-      >
-        <option value="">All (shared)</option>
-        {agents.map((a) => (
-          <option key={a.id} value={a.id}>
-            {shortId(a.id)} · {a.connected ? a.state : "down"}
-            {a.queueCount ? ` · ${a.queueCount} queued` : ""}
-          </option>
-        ))}
-      </select>
-      <span className="agent-picker-count">
-        {connectedCount} live
-      </span>
-    </div>
-  );
-}
 
 function formatTime(iso: string): string {
   const d = new Date(iso);

@@ -6,6 +6,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { post } from "../vscode";
 import { renderMarkdown } from "../markdown";
 import type { Attachment, HistoryItem } from "../types";
+import { HeaderControls } from "./Header";
 
 export function ChatTab(props: {
   history: HistoryItem[];
@@ -13,6 +14,8 @@ export function ChatTab(props: {
   setAttachments: React.Dispatch<React.SetStateAction<Attachment[]>>;
   appendHistory: (item: Omit<HistoryItem, "index">) => void;
   onClearHistory: () => void;
+  version?: string;
+  onOpenConsole?: () => void;
 }): JSX.Element {
   return (
     <>
@@ -23,6 +26,8 @@ export function ChatTab(props: {
         appendHistory={props.appendHistory}
         onClearHistory={props.onClearHistory}
         canClear={props.history.length > 0}
+        version={props.version}
+        onOpenConsole={props.onOpenConsole}
       />
     </>
   );
@@ -118,6 +123,8 @@ function Composer(props: {
   appendHistory: (item: Omit<HistoryItem, "index">) => void;
   onClearHistory: () => void;
   canClear: boolean;
+  version?: string;
+  onOpenConsole?: () => void;
 }): JSX.Element {
   const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -185,32 +192,39 @@ function Composer(props: {
   const send = () => {
     const trimmed = text.trim();
     const time = nowTime();
+    const images = props.attachments.filter((a) => a.type === "image" && a.dataUrl);
+    const files = props.attachments.filter((a) => a.type !== "image");
 
-    if (trimmed) {
-      post({ type: "sendText", text: trimmed });
-      props.appendHistory({ id: makeId(), kind: "text", text: trimmed, time });
-    }
-
-    for (const a of props.attachments) {
-      if (a.type === "image" && a.dataUrl) {
-        post({ type: "sendPastedImage", dataUrl: a.dataUrl, caption: "" });
+    // A message with text + image(s) is sent as ONE message: the text rides along
+    // as the first image's caption, so it renders as a single combined bubble
+    // (thumbnail + text) instead of two separate items.
+    if (images.length > 0) {
+      images.forEach((a, i) => {
+        const caption = i === 0 ? trimmed : "";
+        post({ type: "sendPastedImage", dataUrl: a.dataUrl!, caption });
         props.appendHistory({
           id: makeId(),
           kind: "image",
           dataUrl: a.dataUrl,
           name: a.name,
+          caption: caption || undefined,
           time,
         });
-      } else {
-        post({ type: "resendFile", path: a.path });
-        props.appendHistory({
-          id: makeId(),
-          kind: "file",
-          name: a.name,
-          path: a.path,
-          time,
-        });
-      }
+      });
+    } else if (trimmed) {
+      post({ type: "sendText", text: trimmed });
+      props.appendHistory({ id: makeId(), kind: "text", text: trimmed, time });
+    }
+
+    for (const a of files) {
+      post({ type: "resendFile", path: a.path });
+      props.appendHistory({
+        id: makeId(),
+        kind: "file",
+        name: a.name,
+        path: a.path,
+        time,
+      });
     }
 
     setText("");
@@ -267,6 +281,12 @@ function Composer(props: {
           >
             +
           </button>
+          {props.onOpenConsole && (
+            <HeaderControls
+              version={props.version || ""}
+              onOpenConsole={props.onOpenConsole}
+            />
+          )}
         </div>
         <div className="compose-actions-right">
           {props.canClear && (

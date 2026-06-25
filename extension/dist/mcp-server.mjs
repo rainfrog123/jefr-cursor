@@ -31103,40 +31103,32 @@ async function robustWriteFile(file2, data) {
     throw lastErr;
   }
 }
-async function drainQueue(dir) {
+async function takeQueue(dir) {
   const peek = await readQueue(dir);
-  if (peek.length > 0) {
-    const locked = await acquireQueueLock(dir);
-    try {
-      const queue = await readQueue(dir);
-      if (queue.length > 0) {
-        await robustWriteFile(queueFile(dir), "[]");
-      }
-      return queue;
-    } finally {
-      if (locked) {
-        await releaseQueueLock(dir);
-      }
+  if (peek.length === 0)
+    return [];
+  const locked = await acquireQueueLock(dir);
+  try {
+    const queue = await readQueue(dir);
+    if (queue.length > 0) {
+      await robustWriteFile(queueFile(dir), "[]");
+    }
+    return queue;
+  } finally {
+    if (locked) {
+      await releaseQueueLock(dir);
     }
   }
-  if (dir !== DATA_DIR) {
-    const rootPeek = await readQueue(DATA_DIR);
-    if (rootPeek.length > 0) {
-      const locked = await acquireQueueLock(DATA_DIR);
-      try {
-        const queue = await readQueue(DATA_DIR);
-        if (queue.length > 0) {
-          await robustWriteFile(queueFile(DATA_DIR), "[]");
-        }
-        return queue;
-      } finally {
-        if (locked) {
-          await releaseQueueLock(DATA_DIR);
-        }
-      }
-    }
+}
+async function drainQueue(dir) {
+  const own = await takeQueue(dir);
+  if (dir === DATA_DIR) {
+    return own;
   }
-  return [];
+  const shared = await takeQueue(DATA_DIR);
+  if (shared.length === 0)
+    return own;
+  return own.concat(shared);
 }
 function sleepWithAbort(signal, ms) {
   if (signal.aborted)
@@ -31348,12 +31340,20 @@ server.tool(
         const queue = await drainQueue(dir);
         if (queue.length > 0) {
           const results = [];
-          for (const msg of queue) {
-            const processed = await processMessage(msg);
-            if (Array.isArray(processed))
-              results.push(...processed);
-            else
-              results.push(processed);
+          const multi = queue.length > 1;
+          for (let i = 0; i < queue.length; i++) {
+            const processed = await processMessage(queue[i]);
+            const parts = Array.isArray(processed) ? processed : [processed];
+            if (multi) {
+              const header = `[Message ${i + 1} of ${queue.length}]`;
+              const firstText = parts.find((p) => p.type === "text");
+              if (firstText)
+                firstText.text = `${header}
+${firstText.text}`;
+              else
+                parts.unshift({ type: "text", text: header });
+            }
+            results.push(...parts);
           }
           const suffix = systemSuffix(agent_id);
           const last = results[results.length - 1];
