@@ -3,3 +3,5 @@ Thumbs.db
 *.log
 node_modules/
 *.orig.bak
+__pycache__/
+*.pyc
