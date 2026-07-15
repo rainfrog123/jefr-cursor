@@ -27,7 +27,7 @@
  * chat/agents by endpoint. multi-agent-ssh stays the VPS install track.
  */
 
-const { Plugin, ItemView, PluginSettingTab, Setting, MarkdownRenderer, Notice, setIcon } = require("obsidian");
+const { Plugin, ItemView, PluginSettingTab, Setting, MarkdownRenderer, Notice, setIcon, Modal } = require("obsidian");
 
 const VIEW_TYPE_JEFR = "jefr-chat-view";
 
@@ -230,6 +230,48 @@ class JefrPlugin extends Plugin {
 }
 
 /* ------------------------------------------------------------------ */
+/* Question modal (compact mode — escapes the narrow side pane)        */
+/* ------------------------------------------------------------------ */
+
+class JefrQuestionModal extends Modal {
+  /**
+   * @param {import("obsidian").App} app
+   * @param {JefrView} view
+   * @param {*} q
+   */
+  constructor(app, view, q) {
+    super(app);
+    this.jefrView = view;
+    this.q = q;
+  }
+
+  onOpen() {
+    this.modalEl.addClass("jefr-qmodal");
+    this.titleEl.setText("Agent question");
+    this.jefrView.mountQuestionCard(this.contentEl, this.q, { inModal: true });
+    this.jefrView.bindQuestionKeys(this.q);
+    window.setTimeout(() => {
+      const first = this.contentEl.querySelector(".jefr-qopt, .jefr-qother");
+      if (first && typeof first.focus === "function") first.focus();
+    }, 20);
+  }
+
+  onClose() {
+    const view = this.jefrView;
+    view.removeQuestionKeyHandler();
+    // Programmatic clear sets questionModal = null before close(); user dismiss
+    // (Esc / X) still has the ref — keep the dock chip so they can reopen.
+    if (view.questionModal === this) {
+      view.questionModal = null;
+      view.questionMount = null;
+      if (view.currentQuestionId === this.q.id && view.pendingQuestion) {
+        view.renderQuestionChip(view.pendingQuestion);
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* The chat view                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -248,6 +290,9 @@ class JefrView extends ItemView {
     this.lastReplyTs = null;
     this.currentQuestionId = null;
     this.currentQuestionEndpointId = null;
+    this.pendingQuestion = null;
+    this.questionModal = null;
+    this.questionMount = null;
     this.selected = {}; // questionId -> string[]
     this.connStatus = "offline";
     this.attachments = []; // staged images: { id, name, dataUrl }
@@ -552,6 +597,13 @@ class JefrView extends ItemView {
       window.setTimeout(() => this.scrollPastHeader(), 30);
     } else {
       this.scrollToBottom();
+    }
+    // Re-present an open question in the layout that matches the new mode
+    // (wide modal in compact, in-pane card when expanded).
+    if (this.pendingQuestion && this.currentQuestionId) {
+      const q = this.pendingQuestion;
+      this.currentQuestionId = null;
+      this.renderQuestion(q);
     }
   }
 
@@ -1214,36 +1266,123 @@ class JefrView extends ItemView {
 
   renderQuestion(q) {
     if (!q || !q.questions || !q.questions.length) {
-      this.removeQuestionKeyHandler();
-      this.questionEl.empty();
-      this.currentQuestionId = null;
+      this.clearQuestionUi();
       return;
     }
     // Don't wipe/re-render an already-shown question when other state updates
     // (queue count, reply, etc.) arrive — that was clearing the visible card.
     if (q.id === this.currentQuestionId) return;
     this.currentQuestionId = q.id;
+    this.pendingQuestion = q;
     this.selected = {};
+    this.closeQuestionModal({ keepChip: false });
     this.questionEl.empty();
 
-    const card = this.questionEl.createDiv({ cls: "jefr-qcard" });
-    const head = card.createDiv({ cls: "jefr-qcard-head" });
-    head.createSpan({ cls: "jefr-qcard-title", text: "Agent question" });
-    head.createSpan({ cls: "jefr-qcard-badge", text: "Awaiting answer" });
+    const compact = !!this.plugin.settings.minimized;
+    if (compact) {
+      // Compact pane is too narrow for option lists — open a wide modal and
+      // leave a slim dock chip so the user can reopen if they dismiss it.
+      this.renderQuestionChip(q);
+      this.openQuestionModal(q);
+    } else {
+      this.mountQuestionCard(this.questionEl, q, { inModal: false });
+      this.bindQuestionKeys(q);
+      this.scrollToBottom();
+    }
+  }
+
+  /** Slim dock banner shown in compact mode while a question is pending. */
+  renderQuestionChip(q) {
+    this.questionEl.empty();
+    const chip = this.questionEl.createDiv({ cls: "jefr-qchip" });
+    const left = chip.createDiv({ cls: "jefr-qchip-left" });
+    left.createSpan({ cls: "jefr-qchip-title", text: "Agent question" });
+    left.createSpan({ cls: "jefr-qchip-badge", text: "Awaiting" });
+    const btn = chip.createEl("button", {
+      cls: "jefr-btn jefr-btn-send jefr-qchip-btn",
+      text: "Answer",
+    });
+    btn.onclick = () => this.openQuestionModal(q);
+  }
+
+  openQuestionModal(q) {
+    if (!q) return;
+    if (this.questionModal) {
+      const prev = this.questionModal;
+      // Null first so onClose does not treat this as a user dismiss.
+      this.questionModal = null;
+      prev.close();
+    }
+    const modal = new JefrQuestionModal(this.app, this, q);
+    this.questionModal = modal;
+    this.renderQuestionChip(q);
+    modal.open();
+  }
+
+  /**
+   * @param {{ keepChip?: boolean }} [opts]
+   * keepChip: leave the dock chip (user dismissed modal without answering).
+   */
+  closeQuestionModal(opts) {
+    const keepChip = !!(opts && opts.keepChip);
+    const modal = this.questionModal;
+    if (!modal) {
+      if (!keepChip) this.questionMount = null;
+      return;
+    }
+    this.questionModal = null;
+    modal.close();
+    if (!keepChip) this.questionMount = null;
+  }
+
+  clearQuestionUi() {
+    this.removeQuestionKeyHandler();
+    this.closeQuestionModal({ keepChip: false });
+    this.questionEl.empty();
+    this.currentQuestionId = null;
+    this.currentQuestionEndpointId = null;
+    this.pendingQuestion = null;
+    this.questionMount = null;
+  }
+
+  /**
+   * Build the question UI into `host` (in-pane card or modal body).
+   * @param {{ inModal?: boolean }} opts
+   */
+  mountQuestionCard(host, q, opts) {
+    const inModal = !!(opts && opts.inModal);
+    host.empty();
+    this.questionMount = host;
+
+    const card = host.createDiv({ cls: "jefr-qcard" + (inModal ? " jefr-qcard-modal" : "") });
+    if (!inModal) {
+      const head = card.createDiv({ cls: "jefr-qcard-head" });
+      head.createSpan({ cls: "jefr-qcard-title", text: "Agent question" });
+      head.createSpan({ cls: "jefr-qcard-badge", text: "Awaiting answer" });
+    } else {
+      const head = card.createDiv({ cls: "jefr-qcard-head jefr-qcard-head-modal" });
+      head.createSpan({ cls: "jefr-qcard-badge", text: "Awaiting answer" });
+    }
 
     const body = card.createDiv({ cls: "jefr-qcard-body" });
     for (const qi of q.questions) {
-      this.selected[qi.id] = [];
+      if (!this.selected[qi.id]) this.selected[qi.id] = [];
       const block = body.createDiv({ cls: "jefr-qblock" });
       block.createDiv({ cls: "jefr-qtext", text: qi.question });
-      const opts = block.createDiv({ cls: "jefr-qopts" });
+      const optsEl = block.createDiv({ cls: "jefr-qopts" });
       for (const opt of qi.options || []) {
-        const optEl = opts.createDiv({ cls: "jefr-qopt" + (qi.allow_multiple ? " jefr-multi" : "") });
+        const selected = (this.selected[qi.id] || []).indexOf(opt.id) > -1;
+        const optEl = optsEl.createDiv({
+          cls:
+            "jefr-qopt" +
+            (qi.allow_multiple ? " jefr-multi" : "") +
+            (selected ? " jefr-selected" : ""),
+        });
         optEl.createSpan({ cls: "jefr-qcheck" });
         optEl.createSpan({ cls: "jefr-qopt-label", text: opt.label });
-        optEl.onclick = () => this.toggleOption(qi, opt.id, optEl, opts);
+        optEl.onclick = () => this.toggleOption(qi, opt.id, optEl, optsEl);
       }
-      const other = block.createEl("input", {
+      block.createEl("input", {
         cls: "jefr-qother",
         attr: {
           type: "text",
@@ -1251,7 +1390,6 @@ class JefrView extends ItemView {
           "data-qid": qi.id,
         },
       });
-      void other;
     }
 
     const actions = card.createDiv({ cls: "jefr-qactions" });
@@ -1259,7 +1397,9 @@ class JefrView extends ItemView {
     cancel.onclick = () => this.cancelQuestion();
     const submit = actions.createEl("button", { cls: "jefr-btn jefr-btn-send", text: "Submit answer" });
     submit.onclick = () => this.submitQuestion(q);
+  }
 
+  bindQuestionKeys(q) {
     // Enter (anywhere except the main message box) submits the question; Shift+
     // Enter is left alone. Registered while the card is shown and torn down on
     // submit / cancel / replace so it never lingers or double-fires.
@@ -1274,8 +1414,6 @@ class JefrView extends ItemView {
     document.addEventListener("keydown", onKey, true);
     this._removeQuestionKey = () =>
       document.removeEventListener("keydown", onKey, true);
-
-    this.scrollToBottom();
   }
 
   removeQuestionKeyHandler() {
@@ -1309,9 +1447,10 @@ class JefrView extends ItemView {
       new Notice("jefr is offline.");
       return;
     }
+    const root = this.questionMount || this.questionEl;
     const answers = [];
     for (const qi of q.questions) {
-      const otherEl = this.questionEl.querySelector(`.jefr-qother[data-qid="${qi.id}"]`);
+      const otherEl = root.querySelector(`.jefr-qother[data-qid="${qi.id}"]`);
       answers.push({
         questionId: qi.id,
         selected: this.selected[qi.id] || [],
@@ -1320,10 +1459,7 @@ class JefrView extends ItemView {
     }
     sock.send(JSON.stringify({ type: "submitAnswer", data: { id: q.id, answers } }));
     this.addSystemNote("Answer submitted");
-    this.removeQuestionKeyHandler();
-    this.questionEl.empty();
-    this.currentQuestionId = null;
-    this.currentQuestionEndpointId = null;
+    this.clearQuestionUi();
   }
 
   cancelQuestion() {
@@ -1333,10 +1469,7 @@ class JefrView extends ItemView {
       c.ws.send(JSON.stringify({ type: "cancelQuestion" }));
     }
     this.addSystemNote("Question cancelled");
-    this.removeQuestionKeyHandler();
-    this.questionEl.empty();
-    this.currentQuestionId = null;
-    this.currentQuestionEndpointId = null;
+    this.clearQuestionUi();
   }
 
   /* ----------------------- Inbound state ------------------------- */
@@ -1410,10 +1543,7 @@ class JefrView extends ItemView {
       this.currentQuestionId &&
       this.currentQuestionEndpointId === epId
     ) {
-      this.removeQuestionKeyHandler();
-      this.questionEl.empty();
-      this.currentQuestionId = null;
-      this.currentQuestionEndpointId = null;
+      this.clearQuestionUi();
     }
 
     // Shared history — prefix ids with host so Local/VPS don't collide.

@@ -719,6 +719,75 @@
   padding: 0 14px 12px;
 }
 
+/* Compact-mode dock chip — question lives in a modal; this is the reopen cue. */
+.jefr-qchip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 8px 8px;
+  padding: 8px 10px;
+  border: 1px solid rgba(217, 119, 6, 0.4);
+  border-radius: var(--jefr-radius-sm);
+  background: var(--background-secondary);
+  box-shadow: 0 4px 12px rgba(217, 119, 6, 0.1);
+}
+.jefr-qchip-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.jefr-qchip-title {
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.jefr-qchip-badge {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--jefr-accent);
+  background: var(--jefr-accent-soft);
+  padding: 2px 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+.jefr-qchip-btn {
+  flex-shrink: 0;
+  padding: 4px 10px !important;
+  font-size: 11px !important;
+  min-height: 0 !important;
+}
+
+/* Wide modal for ask_question in compact mode (escapes the side-pane width). */
+.modal.jefr-qmodal {
+  width: min(560px, 92vw);
+  max-width: 92vw;
+}
+.modal.jefr-qmodal .modal-content {
+  padding-top: 4px;
+}
+.jefr-qcard.jefr-qcard-modal {
+  margin: 0;
+  border: none;
+  box-shadow: none;
+  background: transparent;
+  border-radius: 0;
+}
+.jefr-qcard-head-modal {
+  padding: 0 0 10px;
+  border-bottom: none;
+  justify-content: flex-start;
+}
+.jefr-qcard.jefr-qcard-modal .jefr-qcard-body {
+  padding: 0 0 12px;
+}
+.jefr-qcard.jefr-qcard-modal .jefr-qactions {
+  padding: 0;
+}
+
 /* ---------------- Composer ---------------- */
 
 /* Bottom dock: the header sits together with the composer as one integrated
