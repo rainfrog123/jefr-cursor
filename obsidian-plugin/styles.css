@@ -974,3 +974,32 @@
   max-height: none;
   resize: vertical;
 }
+
+/* Multi-host agent menu */
+.jefr-agent-host {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 4px;
+  margin-top: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  border-top: 1px solid var(--background-modifier-border);
+}
+.jefr-agent-host:first-child {
+  border-top: none;
+  margin-top: 0;
+}
+.jefr-agent-host-st {
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.85;
+}
+.jefr-agent-host-st-online { color: var(--text-success, #3ecf8e); }
+.jefr-agent-host-st-connecting { color: var(--text-warning, #d4a017); }
+.jefr-agent-host-st-offline { color: var(--text-faint); }

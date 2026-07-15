@@ -112,6 +112,7 @@ export function App(): JSX.Element {
   const [targetAgentCount, setTargetAgentCount] = useState(5);
   const [workflowModel, setWorkflowModel] = useState<string>(DEFAULT_WORKFLOW_MODEL);
   const [skipAutoPhase, setSkipAutoPhase] = useState(false);
+  const [singleAgentMode, setSingleAgentMode] = useState(false);
   const [workflowModels, setWorkflowModels] = useState<string[]>([
     ...FALLBACK_WORKFLOW_MODELS,
   ]);
@@ -218,6 +219,9 @@ export function App(): JSX.Element {
           if (msg.workflowModel) setWorkflowModel(msg.workflowModel);
           if (typeof msg.skipAutoPhase === "boolean") {
             setSkipAutoPhase(msg.skipAutoPhase);
+          }
+          if (typeof msg.singleAgentMode === "boolean") {
+            setSingleAgentMode(msg.singleAgentMode);
           }
           if (msg.cdpConnected !== undefined) setCdpConnected(msg.cdpConnected);
           setConnectingAgentId(msg.connectingAgentId ?? null);
@@ -387,6 +391,11 @@ export function App(): JSX.Element {
     post({ type: "setSkipAutoPhase", enabled });
   }, []);
 
+  const onSetSingleAgentMode = useCallback((enabled: boolean) => {
+    setSingleAgentMode(enabled);
+    post({ type: "setSingleAgentMode", enabled });
+  }, []);
+
   const onRefreshModels = useCallback(() => {
     setWorkflowModelsRefreshing(true);
     setWorkflowModelsError(null);
@@ -518,6 +527,8 @@ export function App(): JSX.Element {
           onModelChange={onSetWorkflowModel}
           skipAutoPhase={skipAutoPhase}
           onSkipAutoChange={onSetSkipAutoPhase}
+          singleAgentMode={singleAgentMode}
+          onSingleAgentChange={onSetSingleAgentMode}
           workflowModels={workflowModels}
           workflowModelsRefreshing={workflowModelsRefreshing}
           workflowModelsError={workflowModelsError}

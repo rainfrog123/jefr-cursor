@@ -13,6 +13,7 @@
  * Protocol (server -> client):
  *   { type: "init" | "stateUpdate", queue, queueCount, reply, question, workspace, wsClients, port, ... }
  *   { type: "queueUpdate", count }
+ *   { type: "responseLog", markdown, timestamp?, agentId? }
  *   { type: "pong" }
  * Protocol (client -> server):
  *   { type: "sendText", text }
@@ -20,15 +21,27 @@
  *   { type: "cancelQuestion" }
  *   { type: "ackReply" }
  *   { type: "ping" }
+ *
+ * Phase 2: this local Obsidian plugin can open multiple WebSockets at once
+ * (e.g. local Cursor :39517 + Remote-SSH forwarded VPS :39518) and route
+ * chat/agents by endpoint. multi-agent-ssh stays the VPS install track.
  */
 
 const { Plugin, ItemView, PluginSettingTab, Setting, MarkdownRenderer, Notice, setIcon } = require("obsidian");
 
 const VIEW_TYPE_JEFR = "jefr-chat-view";
 
+const DEFAULT_ENDPOINTS = [
+  { id: "local", label: "Local", host: "127.0.0.1", port: 39517, enabled: true },
+  { id: "ali_sg", label: "VPS", host: "127.0.0.1", port: 39518, enabled: true },
+];
+
 const DEFAULT_SETTINGS = {
+  // Legacy single-host fields (migrated into endpoints on load).
   host: "127.0.0.1",
   port: 39517,
+  endpoints: DEFAULT_ENDPOINTS.map((e) => Object.assign({}, e)),
+  activeEndpointId: "local",
   autoReconnect: true,
   maxHistory: 400,
   minimized: false,
@@ -38,13 +51,63 @@ const DEFAULT_SETTINGS = {
   logNotifyPath: "Tech/Meta/MCP Response Log.md",
 };
 
+/** Ensure settings have an endpoints[] list; map legacy host/port if needed. */
+function migrateSettings(raw) {
+  const s = Object.assign({}, DEFAULT_SETTINGS, raw || {});
+  if (!Array.isArray(s.endpoints) || s.endpoints.length === 0) {
+    const port = Number(s.port) || 39517;
+    s.endpoints = [
+      {
+        id: "local",
+        label: port === 39518 ? "VPS" : "Local",
+        host: (s.host || "127.0.0.1").trim() || "127.0.0.1",
+        port,
+        enabled: true,
+      },
+    ];
+    // If they were only on 39517, still offer the VPS forward slot.
+    if (port !== 39518) {
+      s.endpoints.push({
+        id: "ali_sg",
+        label: "VPS",
+        host: "127.0.0.1",
+        port: 39518,
+        enabled: true,
+      });
+    }
+  }
+  s.endpoints = s.endpoints.map((e, i) => ({
+    id: String((e && e.id) || "ep" + i).trim() || "ep" + i,
+    label: String((e && e.label) || e.id || "Endpoint").trim() || "Endpoint",
+    host: String((e && e.host) || "127.0.0.1").trim() || "127.0.0.1",
+    port: Number(e && e.port) > 0 ? Number(e.port) : 39517,
+    enabled: e && e.enabled === false ? false : true,
+  }));
+  if (!s.activeEndpointId || !s.endpoints.some((e) => e.id === s.activeEndpointId)) {
+    const firstOn = s.endpoints.find((e) => e.enabled) || s.endpoints[0];
+    s.activeEndpointId = firstOn ? firstOn.id : "local";
+  }
+  // Keep legacy fields in sync with the active endpoint (older code / display).
+  const active = s.endpoints.find((e) => e.id === s.activeEndpointId) || s.endpoints[0];
+  if (active) {
+    s.host = active.host;
+    s.port = active.port;
+  }
+  return s;
+}
+
+function endpointKey(endpointId, agentId) {
+  return String(endpointId || "") + "::" + (agentId ? String(agentId) : "");
+}
+
 /* ------------------------------------------------------------------ */
 /* Plugin entry                                                        */
 /* ------------------------------------------------------------------ */
 
 class JefrPlugin extends Plugin {
   async onload() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings = migrateSettings(await this.loadData());
+    await this.saveData(this.settings);
 
     this.registerView(VIEW_TYPE_JEFR, (leaf) => new JefrView(leaf, this));
 
@@ -144,7 +207,8 @@ class JefrPlugin extends Plugin {
     });
   }
 
-  async saveSettings() {
+    async saveSettings() {
+    this.settings = migrateSettings(this.settings);
     await this.saveData(this.settings);
     // Let any open view react to host/port changes.
     this.app.workspace.getLeavesOfType(VIEW_TYPE_JEFR).forEach((leaf) => {
@@ -174,15 +238,16 @@ class JefrView extends ItemView {
     super(leaf);
     this.plugin = plugin;
 
-    this.ws = null;
-    this.reconnectTimer = null;
-    this.pingTimer = null;
-    this.reconnectAttempts = 0;
-    this.manualClose = false;
+    // Multi-host: one connection record per endpoint id.
+    // { ep, ws, status, reconnectAttempts, reconnectTimer, pingTimer, awaitingPong,
+    //   agent, agents, selectedAgentId, queue, queueCount, workspace, question }
+    this.conns = {};
+    this.activeEndpointId = (plugin.settings && plugin.settings.activeEndpointId) || "local";
 
     // De-dupe / render bookkeeping.
     this.lastReplyTs = null;
     this.currentQuestionId = null;
+    this.currentQuestionEndpointId = null;
     this.selected = {}; // questionId -> string[]
     this.connStatus = "offline";
     this.attachments = []; // staged images: { id, name, dataUrl }
@@ -190,6 +255,21 @@ class JefrView extends ItemView {
     this.lastQueue = [];
     this.queueOpen = false;
     this.renderedIds = new Set(); // shared-history item ids already shown
+    this.manualClose = false;
+    // Merged route selection: endpointId + agentId (null agent = shared on that host)
+    this.selectedAgentId = null;
+    this.liveAgents = []; // merged list with hostId / hostLabel
+  }
+
+  /** WebSocket for the currently active (routing) endpoint. */
+  activeWs() {
+    const c = this.conns[this.activeEndpointId];
+    return c && c.ws ? c.ws : null;
+  }
+
+  enabledEndpoints() {
+    const list = (this.plugin.settings && this.plugin.settings.endpoints) || [];
+    return list.filter((e) => e && e.enabled !== false);
   }
 
   getViewType() {
@@ -206,19 +286,19 @@ class JefrView extends ItemView {
 
   async onOpen() {
     this.buildUI();
-    this.connect();
+    this.connectAll();
   }
 
   async onClose() {
     this.manualClose = true;
-    this.teardownSocket();
+    this.teardownAll();
   }
 
   onSettingsChanged() {
-    // Reconnect to the (possibly) new host/port.
-    this.teardownSocket();
-    this.reconnectAttempts = 0;
-    this.connect();
+    this.teardownAll();
+    this.activeEndpointId =
+      (this.plugin.settings && this.plugin.settings.activeEndpointId) || "local";
+    this.connectAll();
   }
 
   /* ----------------------------- UI ------------------------------ */
@@ -256,9 +336,8 @@ class JefrView extends ItemView {
     this.reconnectBtn = headerRight.createEl("button", { cls: "jefr-icon-btn jefr-reconnect-btn", attr: { "aria-label": "Reconnect" } });
     setIcon(this.reconnectBtn, "refresh-cw");
     this.reconnectBtn.onclick = () => {
-      this.teardownSocket();
-      this.reconnectAttempts = 0;
-      this.connect();
+      this.teardownAll();
+      this.connectAll();
     };
 
     // Collapsible panel listing the queued (pending) messages. Toggled by
@@ -493,12 +572,17 @@ class JefrView extends ItemView {
   /** Update the compact route label text/title from the current selection. */
   updateRouteLabel() {
     if (!this.routeNameEl) return;
+    const eps = this.enabledEndpoints();
+    const ep = eps.find((e) => e.id === this.activeEndpointId) || eps[0];
+    const hostLabel = ep ? ep.label : "Host";
     const sid = this.selectedAgentId ? String(this.selectedAgentId) : "";
     const shortId = sid ? sid.slice(0, 8) : "";
-    this.routeNameEl.setText(shortId || "All agents");
+    this.routeNameEl.setText(
+      shortId ? hostLabel + " · " + shortId : hostLabel + " · All",
+    );
     const agent = sid
       ? (Array.isArray(this.liveAgents) ? this.liveAgents : []).find(
-          (a) => a && String(a.id) === sid,
+          (a) => a && a.hostId === this.activeEndpointId && String(a.id) === sid,
         )
       : null;
     if (this.routeModelEl) {
@@ -511,8 +595,8 @@ class JefrView extends ItemView {
       this.routeLabel.setAttr(
         "title",
         sid
-          ? `Routes to agent ${sid}${modelHint} — click to change`
-          : "Routes to all agents (shared queue) — click to change",
+          ? `Routes to ${hostLabel} agent ${sid}${modelHint} — click to change`
+          : `Routes to ${hostLabel} shared queue — click to change`,
       );
     }
   }
@@ -523,13 +607,16 @@ class JefrView extends ItemView {
     else this.openAgentMenu();
   }
 
-  /** Stable signature of what the menu shows (ids + states + selection), so we
-   *  can skip rebuilding it when nothing meaningful changed. Order-independent. */
+  /** Stable signature of what the menu shows (ids + states + selection). */
   agentMenuSignature() {
     const parts = (Array.isArray(this.liveAgents) ? this.liveAgents : [])
-      .map((a) => `${a.id}:${a.state}:${a.model || ""}`)
+      .map((a) => `${a.hostId}/${a.id}:${a.state}:${a.model || ""}`)
       .sort();
-    return `${this.selectedAgentId || ""}|${parts.join(",")}`;
+    const connBits = Object.keys(this.conns)
+      .sort()
+      .map((id) => id + ":" + ((this.conns[id] && this.conns[id].status) || "off"))
+      .join(",");
+    return `${this.activeEndpointId}|${this.selectedAgentId || ""}|${parts.join(",")}|${connBits}`;
   }
 
   openAgentMenu() {
@@ -537,7 +624,6 @@ class JefrView extends ItemView {
     this._agentMenuSig = this.agentMenuSignature();
     this.renderAgentMenu();
     this.agentMenu.addClass("jefr-open");
-    // Dismiss on any outside click.
     this._agentMenuOutside = (e) => {
       const t = e.target;
       if (
@@ -566,69 +652,120 @@ class JefrView extends ItemView {
   renderAgentMenu() {
     if (!this.agentMenu) return;
     this.agentMenu.empty();
-    // Stable display order (by id) so rows never bump as heartbeats update.
-    const agents = (Array.isArray(this.liveAgents) ? this.liveAgents : [])
-      .slice()
-      .sort((a, b) => String(a.id).localeCompare(String(b.id)));
-    const sel = this.selectedAgentId ? String(this.selectedAgentId) : "";
+    const eps = this.enabledEndpoints();
+    const agents = Array.isArray(this.liveAgents) ? this.liveAgents : [];
 
-    // "All agents (shared)" — routes to the shared queue (no specific target).
-    const allRow = this.agentMenu.createDiv({
-      cls: "jefr-agent-opt" + (!sel ? " jefr-agent-opt-active" : ""),
-    });
-    allRow.createSpan({ cls: "jefr-agent-opt-dot" });
-    allRow.createSpan({ cls: "jefr-agent-opt-name", text: "All agents (shared)" });
-    allRow.onclick = () => this.selectAgentRemote(null);
-
-    if (!agents.length) {
-      this.agentMenu.createDiv({ cls: "jefr-agent-empty", text: "No live agents" });
-    }
-    for (const a of agents) {
-      const id = a && a.id ? String(a.id) : "";
-      if (!id) continue;
-      const row = this.agentMenu.createDiv({
-        cls: "jefr-agent-opt" + (id === sel ? " jefr-agent-opt-active" : ""),
+    for (const ep of eps) {
+      const conn = this.conns[ep.id];
+      const st = (conn && conn.status) || "offline";
+      const head = this.agentMenu.createDiv({ cls: "jefr-agent-host" });
+      head.createSpan({
+        cls: "jefr-agent-host-name",
+        text: ep.label + " · :" + ep.port,
       });
-      const busy = a.state === "working";
-      row.createSpan({ cls: "jefr-agent-opt-dot " + (busy ? "is-busy" : "is-listening") });
-      row.createSpan({ cls: "jefr-agent-opt-name jefr-agent-opt-id", text: id.slice(0, 8) });
-      const meta = [busy ? "busy" : "listening"];
-      if (a.model) meta.push(a.model);
-      if (typeof a.queueCount === "number" && a.queueCount > 0) {
-        meta.push(`${a.queueCount} queued`);
+      head.createSpan({
+        cls: "jefr-agent-host-st jefr-agent-host-st-" + st,
+        text: st === "online" ? "online" : st === "connecting" ? "…" : "off",
+      });
+
+      const allRow = this.agentMenu.createDiv({
+        cls:
+          "jefr-agent-opt" +
+          (this.activeEndpointId === ep.id && !this.selectedAgentId
+            ? " jefr-agent-opt-active"
+            : ""),
+      });
+      allRow.createSpan({ cls: "jefr-agent-opt-dot" });
+      allRow.createSpan({
+        cls: "jefr-agent-opt-name",
+        text: "All on " + ep.label + " (shared)",
+      });
+      allRow.onclick = () => this.selectRoute(ep.id, null);
+
+      const hostAgents = agents
+        .filter((a) => a && a.hostId === ep.id)
+        .slice()
+        .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      if (!hostAgents.length) {
+        this.agentMenu.createDiv({
+          cls: "jefr-agent-empty",
+          text: st === "online" ? "No live agents" : "Not connected",
+        });
       }
-      row.createSpan({ cls: "jefr-agent-opt-meta", text: meta.join(" · ") });
-      row.setAttr("title", a.model ? `${id} · ${a.model}` : id);
-      row.onclick = () => this.selectAgentRemote(id);
+      for (const a of hostAgents) {
+        const id = a && a.id ? String(a.id) : "";
+        if (!id) continue;
+        const active =
+          this.activeEndpointId === ep.id && String(this.selectedAgentId || "") === id;
+        const row = this.agentMenu.createDiv({
+          cls: "jefr-agent-opt" + (active ? " jefr-agent-opt-active" : ""),
+        });
+        const busy = a.state === "working";
+        row.createSpan({
+          cls: "jefr-agent-opt-dot " + (busy ? "is-busy" : "is-listening"),
+        });
+        row.createSpan({
+          cls: "jefr-agent-opt-name jefr-agent-opt-id",
+          text: id.slice(0, 8),
+        });
+        const meta = [busy ? "busy" : "listening"];
+        if (a.model) meta.push(a.model);
+        if (typeof a.queueCount === "number" && a.queueCount > 0) {
+          meta.push(`${a.queueCount} queued`);
+        }
+        row.createSpan({ cls: "jefr-agent-opt-meta", text: meta.join(" · ") });
+        row.setAttr("title", a.model ? `${ep.label} · ${id} · ${a.model}` : `${ep.label} · ${id}`);
+        row.onclick = () => this.selectRoute(ep.id, id);
+      }
     }
   }
 
-  selectAgentRemote(id) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "selectAgent", agentId: id || null }));
+  /** Switch active host + agent; notify that host's bridge. */
+  selectRoute(endpointId, agentId) {
+    this.activeEndpointId = endpointId;
+    this.selectedAgentId = agentId || null;
+    if (this.plugin.settings) {
+      this.plugin.settings.activeEndpointId = endpointId;
+      const ep = this.enabledEndpoints().find((e) => e.id === endpointId);
+      if (ep) {
+        this.plugin.settings.host = ep.host;
+        this.plugin.settings.port = ep.port;
+      }
+      void this.plugin.saveData(this.plugin.settings);
     }
-    // Optimistic update; the bridge will re-broadcast the authoritative state.
-    this.selectedAgentId = id || null;
+    const ws = this.activeWs();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "selectAgent", agentId: agentId || null }));
+    }
+    this.refreshAggregateStatus();
     this.updateRouteLabel();
     this.closeAgentMenu();
   }
 
-  /** Cycle the routed ("talking-to") agent by `dir` (+1 next, -1 prev) through the
-   *  same order the picker shows — ["All agents (shared)", ...live agents by id] —
-   *  wrapping around. Bound to Ctrl/Cmd+PageDown / PageUp. */
+  selectAgentRemote(id) {
+    this.selectRoute(this.activeEndpointId, id);
+  }
+
+  /** Cycle routed agent across all hosts (flat order). */
   cycleAgent(dir) {
-    const ids = (Array.isArray(this.liveAgents) ? this.liveAgents : [])
-      .map((a) => (a && a.id ? String(a.id) : ""))
-      .filter(Boolean)
-      .sort((a, b) => a.localeCompare(b));
-    const order = [null, ...ids]; // null = "All agents (shared)"
-    if (order.length <= 1) return; // nothing to switch between
-    const cur = this.selectedAgentId ? String(this.selectedAgentId) : null;
-    let idx = order.indexOf(cur);
+    const order = [];
+    for (const ep of this.enabledEndpoints()) {
+      order.push({ endpointId: ep.id, agentId: null });
+      const ids = (Array.isArray(this.liveAgents) ? this.liveAgents : [])
+        .filter((a) => a && a.hostId === ep.id && a.id)
+        .map((a) => String(a.id))
+        .sort((a, b) => a.localeCompare(b));
+      for (const id of ids) order.push({ endpointId: ep.id, agentId: id });
+    }
+    if (order.length <= 1) return;
+    const curEp = this.activeEndpointId;
+    const curAg = this.selectedAgentId ? String(this.selectedAgentId) : null;
+    let idx = order.findIndex(
+      (o) => o.endpointId === curEp && (o.agentId || null) === curAg,
+    );
     if (idx < 0) idx = 0;
     const next = order[(idx + dir + order.length) % order.length];
-    // The route label by the composer reflects the change — no toast needed.
-    this.selectAgentRemote(next);
+    this.selectRoute(next.endpointId, next.agentId);
   }
 
   renderEmptyState() {
@@ -645,13 +782,15 @@ class JefrView extends ItemView {
   updateSendState() {
     const hasText = this.input && this.input.value.trim().length > 0;
     const hasAttach = this.attachments.length > 0;
-    const online = this.connStatus === "online";
+    const ws = this.activeWs();
+    const online = !!(ws && ws.readyState === WebSocket.OPEN);
+    this.connStatus = online ? "online" : this.connStatus;
     if (this.sendBtn) this.sendBtn.disabled = (!hasText && !hasAttach) || !online;
     if (this.hint) {
       const agent = this.agentStatus;
       let hint;
       if (!online) {
-        hint = "Offline — waiting for Cursor…";
+        hint = "Offline — pick a connected host or start Cursor…";
       } else if (agent && agent.alive && agent.state === "working") {
         hint = "Agent busy — message will queue";
       } else if (agent && agent.alive) {
@@ -831,49 +970,121 @@ class JefrView extends ItemView {
 
   setStatus(status) {
     this.connStatus = status;
+    this.refreshAggregateStatus();
+  }
+
+  /** Roll up per-endpoint socket status into the header pill. */
+  refreshAggregateStatus() {
     if (!this.statusPill) return;
-    this.statusPill.removeClass("jefr-status-online", "jefr-status-offline", "jefr-status-connecting");
-    if (status === "online") {
+    const eps = this.enabledEndpoints();
+    let online = 0;
+    let connecting = 0;
+    const bits = [];
+    for (const ep of eps) {
+      const st = (this.conns[ep.id] && this.conns[ep.id].status) || "offline";
+      if (st === "online") online++;
+      else if (st === "connecting") connecting++;
+      bits.push(ep.label + ":" + st);
+    }
+    this.statusPill.removeClass(
+      "jefr-status-online",
+      "jefr-status-offline",
+      "jefr-status-connecting",
+    );
+    if (online > 0) {
+      this.connStatus = "online";
       this.statusPill.addClass("jefr-status-online");
-      this.statusPill.setText("Online");
-    } else if (status === "connecting") {
+      this.statusPill.setText(
+        eps.length > 1 ? `Online ${online}/${eps.length}` : "Online",
+      );
+    } else if (connecting > 0) {
+      this.connStatus = "connecting";
       this.statusPill.addClass("jefr-status-connecting");
       this.statusPill.setText("Connecting…");
     } else {
+      this.connStatus = "offline";
       this.statusPill.addClass("jefr-status-offline");
       this.statusPill.setText("Offline");
     }
-    // When the socket is down we have no idea about the agent, so show "unknown".
-    if (status !== "online") this.setAgentStatus(null);
+    this.statusPill.setAttr("title", bits.join(" · ") || "No endpoints");
+    // Agent pill is updated from handleState for the active host only
+    // (avoids the other host's pushes flipping Listening/Busy).
+    const active = this.conns[this.activeEndpointId];
+    if (this.workspaceLine) {
+      const ep = eps.find((e) => e.id === this.activeEndpointId);
+      const wsInfo = active && active.workspace;
+      const name = (wsInfo && wsInfo.name) || (ep && ep.label) || "";
+      const path = (wsInfo && wsInfo.path) || "";
+      this.workspaceLine.setText(name ? `${ep ? ep.label + " · " : ""}${name}` : ep ? ep.label : "");
+      this.workspaceLine.setAttr("title", path || (ep ? ep.host + ":" + ep.port : ""));
+    }
+    // Queue badge = active host queue
+    this.lastQueue = (active && active.queue) || [];
+    const count =
+      active && typeof active.queueCount === "number"
+        ? active.queueCount
+        : this.lastQueue.length;
+    if (this.queueBadge) {
+      this.queueBadge.setText(count > 0 ? `${count} queued` : "");
+      this.queueBadge.toggleClass("jefr-has-queue", count > 0);
+    }
     this.updateSendState();
   }
 
   setAgentStatus(agent) {
     this.agentStatus = agent || null;
-    if (!this.agentPill) return;
-    this.agentPill.removeClass("jefr-agent-ready", "jefr-agent-busy", "jefr-agent-idle");
+    // Debounce pill updates — multi-host state pushes + check_messages
+    // waiting↔working chatter was making Listening/Busy flicker constantly.
     const alive = !!(agent && agent.alive);
-    if (alive && agent.state === "working") {
-      this.agentPill.addClass("jefr-agent-busy");
-      this.agentPill.setText("Agent busy");
-      this.agentPill.setAttr("title", "An agent is alive but mid-task — messages will queue until it listens again");
-    } else if (alive) {
-      this.agentPill.addClass("jefr-agent-ready");
-      this.agentPill.setText("Agent listening");
-      this.agentPill.setAttr("title", "An agent is actively waiting — your message is picked up immediately");
+    const busy = alive && agent.state === "working";
+    const nextKey = !alive ? "idle" : busy ? "busy" : "ready";
+    if (nextKey === this._agentPillKey) return;
+    if (this._agentPillTimer) {
+      clearTimeout(this._agentPillTimer);
+      this._agentPillTimer = null;
+    }
+    const apply = () => {
+      this._agentPillTimer = null;
+      this._agentPillKey = nextKey;
+      if (!this.agentPill) return;
+      this.agentPill.removeClass("jefr-agent-ready", "jefr-agent-busy", "jefr-agent-idle");
+      if (nextKey === "busy") {
+        this.agentPill.addClass("jefr-agent-busy");
+        this.agentPill.setText("Agent busy");
+        this.agentPill.setAttr(
+          "title",
+          "An agent is alive but mid-task — messages will queue until it listens again",
+        );
+      } else if (nextKey === "ready") {
+        this.agentPill.addClass("jefr-agent-ready");
+        this.agentPill.setText("Agent listening");
+        this.agentPill.setAttr(
+          "title",
+          "An agent is actively waiting — your message is picked up immediately",
+        );
+      } else {
+        this.agentPill.addClass("jefr-agent-idle");
+        this.agentPill.setText("No agent");
+        this.agentPill.setAttr(
+          "title",
+          "No agent is running the loop — messages queue until one calls check_messages",
+        );
+      }
+      if (this.routeLabel) {
+        this.routeLabel.removeClass("jefr-route-ready", "jefr-route-busy", "jefr-route-idle");
+        if (nextKey === "busy") this.routeLabel.addClass("jefr-route-busy");
+        else if (nextKey === "ready") this.routeLabel.addClass("jefr-route-ready");
+        else this.routeLabel.addClass("jefr-route-idle");
+      }
+      this.updateSendState();
+    };
+    // Promote to busy / idle immediately; only delay busy→listening so brief
+    // gaps between check_messages calls don't flicker the pill.
+    if (nextKey === "ready" && this._agentPillKey === "busy") {
+      this._agentPillTimer = window.setTimeout(apply, 1200);
     } else {
-      this.agentPill.addClass("jefr-agent-idle");
-      this.agentPill.setText("No agent");
-      this.agentPill.setAttr("title", "No agent is running the loop — messages queue until one calls check_messages");
+      apply();
     }
-    // Mirror liveness onto the compact route label's dot.
-    if (this.routeLabel) {
-      this.routeLabel.removeClass("jefr-route-ready", "jefr-route-busy", "jefr-route-idle");
-      if (alive && agent.state === "working") this.routeLabel.addClass("jefr-route-busy");
-      else if (alive) this.routeLabel.addClass("jefr-route-ready");
-      else this.routeLabel.addClass("jefr-route-idle");
-    }
-    this.updateSendState();
   }
 
   /* --------------------------- Messaging ------------------------- */
@@ -972,14 +1183,13 @@ class JefrView extends ItemView {
     const text = this.input.value.trim();
     const attachments = this.attachments.slice();
     if (!text && attachments.length === 0) return;
-    if (this.connStatus !== "online" || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      new Notice("jefr is offline — open Cursor with the jefr extension running.");
+    const ws = this.activeWs();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      new Notice("jefr is offline on the selected host — check Local/VPS connection.");
       return;
     }
     try {
       if (attachments.length) {
-        // Combine text + all image(s) into ONE message (a single queue item) so
-        // the agent receives them together as one combined bubble.
         this.queueSend({
           type: "sendImages",
           dataUrls: attachments.map((a) => a.dataUrl),
@@ -988,8 +1198,6 @@ class JefrView extends ItemView {
       } else if (text) {
         this.queueSend({ type: "sendText", text });
       }
-      // Bubbles are rendered from the shared history broadcast (no optimistic add),
-      // so the same message shows identically across all front-ends.
     } catch (e) {
       new Notice("jefr: failed to send message.");
       return;
@@ -1092,10 +1300,12 @@ class JefrView extends ItemView {
   }
 
   submitQuestion(q) {
-    // Guard against a double-submit (e.g. Enter + button, or repeated Enter):
-    // once the active question is cleared, ignore further submits for it.
     if (!q || this.currentQuestionId !== q.id) return;
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    const ws = this.activeWs();
+    const epId = this.currentQuestionEndpointId || this.activeEndpointId;
+    const c = this.conns[epId];
+    const sock = (c && c.ws) || ws;
+    if (!sock || sock.readyState !== WebSocket.OPEN) {
       new Notice("jefr is offline.");
       return;
     }
@@ -1108,46 +1318,77 @@ class JefrView extends ItemView {
         other: otherEl ? otherEl.value.trim() : "",
       });
     }
-    this.ws.send(JSON.stringify({ type: "submitAnswer", data: { id: q.id, answers } }));
+    sock.send(JSON.stringify({ type: "submitAnswer", data: { id: q.id, answers } }));
     this.addSystemNote("Answer submitted");
     this.removeQuestionKeyHandler();
     this.questionEl.empty();
     this.currentQuestionId = null;
+    this.currentQuestionEndpointId = null;
   }
 
   cancelQuestion() {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "cancelQuestion" }));
+    const epId = this.currentQuestionEndpointId || this.activeEndpointId;
+    const c = this.conns[epId];
+    if (c && c.ws && c.ws.readyState === WebSocket.OPEN) {
+      c.ws.send(JSON.stringify({ type: "cancelQuestion" }));
     }
     this.addSystemNote("Question cancelled");
     this.removeQuestionKeyHandler();
     this.questionEl.empty();
     this.currentQuestionId = null;
+    this.currentQuestionEndpointId = null;
   }
 
   /* ----------------------- Inbound state ------------------------- */
 
-  handleState(d) {
-    // Real agent liveness (heartbeat), independent of the socket connection.
-    this.setAgentStatus(d.agent);
+  async handleResponseLog(m) {
+    const markdown = m && typeof m.markdown === "string" ? m.markdown : "";
+    if (!markdown.trim()) return;
+    const rel =
+      (this.plugin.settings.logNotifyPath || "").trim() ||
+      "Tech/Meta/MCP Response Log.md";
+    try {
+      await writeVaultMarkdown(this.app, rel, markdown);
+    } catch (e) {
+      console.error("[jefr] responseLog write failed", e);
+      new Notice(
+        "jefr: failed to write Response Log — " +
+          (e && e.message ? e.message : e),
+      );
+    }
+  }
 
-    // Connection / workspace
-    if (d.workspace) {
-      const name = d.workspace.name || "";
-      const p = d.workspace.path || "";
-      this.workspaceLine.setText(name ? `${name}` : "");
-      this.workspaceLine.setAttr("title", p);
+  handleState(d, endpointId) {
+    const epId = endpointId || this.activeEndpointId;
+    const conn = this.conns[epId];
+    if (!conn) return;
+
+    conn.agent = d.agent || null;
+    conn.agents = Array.isArray(d.agents) ? d.agents : [];
+    conn.selectedAgentId = d.selectedAgentId || null;
+    conn.queue = Array.isArray(d.queue) ? d.queue : [];
+    conn.queueCount =
+      typeof d.queueCount === "number" ? d.queueCount : conn.queue.length;
+    if (d.workspace) conn.workspace = d.workspace;
+    conn.question = d.question || null;
+
+    // Rebuild merged agent list for the picker.
+    this.rebuildLiveAgents();
+
+    // If this is the active host, mirror selection from bridge when it matches.
+    if (epId === this.activeEndpointId && d.selectedAgentId !== undefined) {
+      // Keep local host choice; only sync agent id from this host's bridge.
+      this.selectedAgentId = d.selectedAgentId || null;
     }
 
-    // Compact agent picker: which agent this message routes to. The bridge sends
-    // the live-agent list (`agents`) + current `selectedAgentId` (mirrors the
-    // panel's Agent Picker). Clicking the label opens a dropdown to switch.
-    this.liveAgents = Array.isArray(d.agents) ? d.agents : [];
-    this.selectedAgentId = d.selectedAgentId || null;
+    this.refreshAggregateStatus();
     this.updateRouteLabel();
-    // Only rebuild the open menu when the agent set / states / selection actually
-    // change — otherwise the 0.5s heartbeat push would re-render (and the
-    // ts-sorted order would reshuffle) every tick, making it flicker/bump.
+    // Drive agent pill only from the active host (debounce lives in setAgentStatus).
+    if (epId === this.activeEndpointId) {
+      this.setAgentStatus(conn.agent || null);
+    } else if (!this.conns[this.activeEndpointId] || this.conns[this.activeEndpointId].status !== "online") {
+      this.setAgentStatus(null);
+    }
     if (this.agentMenu && this.agentMenu.hasClass("jefr-open")) {
       const sig = this.agentMenuSignature();
       if (sig !== this._agentMenuSig) {
@@ -1156,32 +1397,36 @@ class JefrView extends ItemView {
       }
     }
 
-    // Queue badge + remember the queued items for the toggle panel.
-    this.lastQueue = Array.isArray(d.queue) ? d.queue : [];
-    const count = typeof d.queueCount === "number" ? d.queueCount : this.lastQueue.length;
-    if (this.queueBadge) {
-      this.queueBadge.setText(count > 0 ? `${count} queued` : "");
-      this.queueBadge.toggleClass("jefr-has-queue", count > 0);
-    }
-    if (count === 0 && this.queueOpen) this.closeQueuePanel();
-    else if (this.queueOpen) this.renderQueuePanel();
-
-    // Question
+    // Questions: prefer active host; otherwise show from any host that asks.
     if (d.question) {
-      this.renderQuestion(d.question);
-    } else if (this.currentQuestionId) {
+      if (epId === this.activeEndpointId || !this.currentQuestionId) {
+        this.currentQuestionEndpointId = epId;
+        if (epId !== this.activeEndpointId) {
+          this.activeEndpointId = epId;
+        }
+        this.renderQuestion(d.question);
+      }
+    } else if (
+      this.currentQuestionId &&
+      this.currentQuestionEndpointId === epId
+    ) {
       this.removeQuestionKeyHandler();
       this.questionEl.empty();
       this.currentQuestionId = null;
+      this.currentQuestionEndpointId = null;
     }
 
-    // Shared chat history (sends from any front-end)
-    if (Array.isArray(d.history)) this.renderSharedHistory(d.history);
+    // Shared history — prefix ids with host so Local/VPS don't collide.
+    if (Array.isArray(d.history)) {
+      const tagged = d.history.map((it) => {
+        if (!it || !it.id) return it;
+        return Object.assign({}, it, { id: epId + ":" + it.id });
+      });
+      this.renderSharedHistory(tagged);
+    }
 
-    // Progress only — actual reply bubbles now come through the shared history
-    // (kind: "reply"), so we don't render them from reply.json to avoid doubles.
     if (d.reply && d.reply.content) {
-      const ts = d.reply.timestamp || "";
+      const ts = epId + ":" + (d.reply.timestamp || "");
       if (ts !== this.lastReplyTs) {
         this.lastReplyTs = ts;
         if (typeof d.reply.percent === "number") {
@@ -1191,6 +1436,24 @@ class JefrView extends ItemView {
         }
       }
     }
+  }
+
+  rebuildLiveAgents() {
+    const out = [];
+    for (const ep of this.enabledEndpoints()) {
+      const conn = this.conns[ep.id];
+      const list = (conn && conn.agents) || [];
+      for (const a of list) {
+        if (!a || !a.id) continue;
+        out.push(
+          Object.assign({}, a, {
+            hostId: ep.id,
+            hostLabel: ep.label,
+          }),
+        );
+      }
+    }
+    this.liveAgents = out;
   }
 
   toggleQueuePanel() {
@@ -1294,36 +1557,32 @@ class JefrView extends ItemView {
 
   deleteQueueItem(id) {
     if (!id) return;
-    if (this.connStatus !== "online" || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    const ws = this.activeWs();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
       new Notice("jefr is offline — can't delete right now.");
       return;
     }
     try {
-      this.ws.send(JSON.stringify({ type: "deleteQueueItem", id }));
+      ws.send(JSON.stringify({ type: "deleteQueueItem", id }));
     } catch (e) {
       new Notice("jefr: failed to delete queued message.");
     }
   }
 
   clearQueueAll() {
-    if (this.connStatus !== "online" || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    const ws = this.activeWs();
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
       new Notice("jefr is offline — can't clear right now.");
       return;
     }
     try {
-      this.ws.send(JSON.stringify({ type: "clearQueue" }));
+      ws.send(JSON.stringify({ type: "clearQueue" }));
     } catch (e) {
       new Notice("jefr: failed to clear queue.");
     }
   }
 
-  /* ----- Reliable, acknowledged sends -----
-   * A WebSocket can stay readyState===OPEN for a while after the server has
-   * actually gone (e.g. Cursor reload), so ws.send() silently drops the frame
-   * and the message never reaches the queue. To make sends reliable we tag each
-   * with a client id, keep it "pending" until the server acks it, force a
-   * reconnect if no ack arrives, and re-send everything pending on reconnect.
-   * The server de-dupes by client id, so re-sends never double-queue. */
+  /* ----- Reliable sends on the active endpoint ----- */
 
   genCid() {
     this._cidSeq = (this._cidSeq || 0) + 1;
@@ -1334,7 +1593,11 @@ class JefrView extends ItemView {
     this.pending = this.pending || new Map();
     const cid = this.genCid();
     payload.cid = cid;
-    this.pending.set(cid, { payload, attempts: 0 });
+    this.pending.set(cid, {
+      payload,
+      attempts: 0,
+      endpointId: this.activeEndpointId,
+    });
     this.flushSend(cid);
   }
 
@@ -1343,8 +1606,6 @@ class JefrView extends ItemView {
     if (!entry) return;
     entry.attempts = (entry.attempts || 0) + 1;
     if (entry.attempts > 5) {
-      // Give up after repeated unacked attempts (e.g. a server too old to ack)
-      // so we never loop forever or pile up duplicates.
       this.pending.delete(cid);
       if (this._ackTimers && this._ackTimers.has(cid)) {
         clearTimeout(this._ackTimers.get(cid));
@@ -1353,29 +1614,34 @@ class JefrView extends ItemView {
       new Notice("jefr: couldn't confirm a message was delivered — try reloading Cursor.");
       return;
     }
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    const c = this.conns[entry.endpointId || this.activeEndpointId];
+    const ws = c && c.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) {
       try {
-        this.ws.send(JSON.stringify(entry.payload));
+        ws.send(JSON.stringify(entry.payload));
       } catch (e) {
-        /* will be retried via the ack watchdog / reconnect flush */
+        /* retry via watchdog */
       }
     }
-    // Ack watchdog: if the server doesn't confirm soon, the socket is likely a
-    // zombie — force a reconnect, which re-flushes everything still pending.
     this._ackTimers = this._ackTimers || new Map();
     if (this._ackTimers.has(cid)) return;
     const t = window.setTimeout(() => {
       this._ackTimers.delete(cid);
       if (this.pending && this.pending.has(cid)) {
-        this.recoverConnection();
+        this.recoverConnection(entry.endpointId);
       }
     }, 3000);
     this._ackTimers.set(cid, t);
   }
 
-  flushPending() {
+  flushPending(endpointId) {
     if (!this.pending || !this.pending.size) return;
-    for (const cid of Array.from(this.pending.keys())) this.flushSend(cid);
+    for (const cid of Array.from(this.pending.keys())) {
+      const entry = this.pending.get(cid);
+      if (!endpointId || (entry && entry.endpointId === endpointId)) {
+        this.flushSend(cid);
+      }
+    }
   }
 
   ackSend(cid) {
@@ -1386,16 +1652,18 @@ class JefrView extends ItemView {
     }
   }
 
-  recoverConnection() {
-    if (this._recovering) return;
-    this._recovering = true;
+  recoverConnection(endpointId) {
+    const id = endpointId || this.activeEndpointId;
+    const c = this.conns[id];
+    if (!c || c._recovering) return;
+    c._recovering = true;
     try {
-      if (this.ws) this.ws.close(); // onclose -> scheduleReconnect -> connect -> onopen -> flushPending
+      if (c.ws) c.ws.close();
     } catch (e) {
       /* ignore */
     }
     window.setTimeout(() => {
-      this._recovering = false;
+      if (c) c._recovering = false;
     }, 1500);
   }
 
@@ -1425,31 +1693,73 @@ class JefrView extends ItemView {
     if (this.progressFill) this.progressFill.style.width = "0%";
   }
 
-  /* --------------------------- Socket ---------------------------- */
+  /* --------------------------- Socket (multi-host) --------------- */
 
-  connect() {
-    if (this.ws) return;
+  connectAll() {
     this.manualClose = false;
-    const { host, port } = this.plugin.settings;
-    const url = `ws://${host}:${port}`;
-    this.setStatus("connecting");
+    const eps = this.enabledEndpoints();
+    if (!eps.length) {
+      this.refreshAggregateStatus();
+      return;
+    }
+    if (!eps.some((e) => e.id === this.activeEndpointId)) {
+      this.activeEndpointId = eps[0].id;
+    }
+    for (const ep of eps) this.connectOne(ep);
+    this.refreshAggregateStatus();
+    this.updateRouteLabel();
+  }
+
+  connectOne(ep) {
+    if (!ep || !ep.id) return;
+    let conn = this.conns[ep.id];
+    if (!conn) {
+      conn = {
+        ep,
+        ws: null,
+        status: "offline",
+        reconnectAttempts: 0,
+        reconnectTimer: null,
+        pingTimer: null,
+        awaitingPong: false,
+        agent: null,
+        agents: [],
+        selectedAgentId: null,
+        queue: [],
+        queueCount: 0,
+        workspace: null,
+        question: null,
+      };
+      this.conns[ep.id] = conn;
+    } else {
+      conn.ep = ep;
+    }
+    if (conn.ws) return;
+
+    const url = `ws://${ep.host}:${ep.port}`;
+    conn.status = "connecting";
+    this.refreshAggregateStatus();
 
     let ws;
     try {
       ws = new WebSocket(url);
     } catch (e) {
-      this.scheduleReconnect();
+      this.scheduleReconnect(ep.id);
       return;
     }
-    this.ws = ws;
+    conn.ws = ws;
+    const endpointId = ep.id;
 
     ws.onopen = () => {
-      this.reconnectAttempts = 0;
-      this.awaitingPong = false;
-      this.setStatus("online");
-      this.startPing();
-      // Re-send anything that wasn't acknowledged before the (re)connection.
-      this.flushPending();
+      const c = this.conns[endpointId];
+      if (!c || c.ws !== ws) return;
+      c.reconnectAttempts = 0;
+      c.awaitingPong = false;
+      c.status = "online";
+      this.startPing(endpointId);
+      this.flushPending(endpointId);
+      this.refreshAggregateStatus();
+      this.updateRouteLabel();
     };
 
     ws.onmessage = (ev) => {
@@ -1460,26 +1770,32 @@ class JefrView extends ItemView {
         return;
       }
       if (m.type === "init" || m.type === "stateUpdate") {
-        this.handleState(m);
+        this.handleState(m, endpointId);
+      } else if (m.type === "responseLog") {
+        void this.handleResponseLog(m);
       } else if (m.type === "queueUpdate") {
-        if (this.queueBadge) {
-          const c = m.count || 0;
-          this.queueBadge.setText(c > 0 ? `${c} queued` : "");
-          this.queueBadge.toggleClass("jefr-has-queue", c > 0);
+        const c = this.conns[endpointId];
+        if (c) {
+          c.queueCount = m.count || 0;
+          if (endpointId === this.activeEndpointId) this.refreshAggregateStatus();
         }
       } else if (m.type === "sendAck") {
         this.ackSend(m.cid);
       } else if (m.type === "pong") {
-        this.awaitingPong = false;
+        const c = this.conns[endpointId];
+        if (c) c.awaitingPong = false;
       }
     };
 
     ws.onclose = () => {
-      this.stopPing();
-      this.ws = null;
-      this.setStatus("offline");
+      const c = this.conns[endpointId];
+      if (!c) return;
+      this.stopPing(endpointId);
+      c.ws = null;
+      c.status = "offline";
+      this.refreshAggregateStatus();
       if (!this.manualClose && this.plugin.settings.autoReconnect) {
-        this.scheduleReconnect();
+        this.scheduleReconnect(endpointId);
       }
     };
 
@@ -1492,60 +1808,84 @@ class JefrView extends ItemView {
     };
   }
 
-  scheduleReconnect() {
-    if (this.reconnectTimer) return;
-    this.reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(1.5, this.reconnectAttempts - 1), 30000);
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
+  scheduleReconnect(endpointId) {
+    const c = this.conns[endpointId];
+    if (!c || c.reconnectTimer) return;
+    c.reconnectAttempts = (c.reconnectAttempts || 0) + 1;
+    const delay = Math.min(1000 * Math.pow(1.5, c.reconnectAttempts - 1), 30000);
+    c.reconnectTimer = setTimeout(() => {
+      c.reconnectTimer = null;
+      const ep =
+        this.enabledEndpoints().find((e) => e.id === endpointId) || c.ep;
+      if (ep && ep.enabled !== false) this.connectOne(ep);
     }, delay);
   }
 
-  startPing() {
-    this.stopPing();
-    this.awaitingPong = false;
-    this.pingTimer = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        if (this.awaitingPong) {
-          // Previous ping was never answered -> the socket is a zombie. Recover.
-          this.awaitingPong = false;
-          this.recoverConnection();
-          return;
-        }
-        try {
-          this.ws.send(JSON.stringify({ type: "ping" }));
-          this.awaitingPong = true;
-        } catch {
-          /* ignore */
-        }
+  startPing(endpointId) {
+    this.stopPing(endpointId);
+    const c = this.conns[endpointId];
+    if (!c) return;
+    c.awaitingPong = false;
+    c.pingTimer = setInterval(() => {
+      const conn = this.conns[endpointId];
+      if (!conn || !conn.ws || conn.ws.readyState !== WebSocket.OPEN) return;
+      if (conn.awaitingPong) {
+        conn.awaitingPong = false;
+        this.recoverConnection(endpointId);
+        return;
+      }
+      try {
+        conn.ws.send(JSON.stringify({ type: "ping" }));
+        conn.awaitingPong = true;
+      } catch {
+        /* ignore */
       }
     }, 12000);
   }
 
-  stopPing() {
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
+  stopPing(endpointId) {
+    const c = this.conns[endpointId];
+    if (c && c.pingTimer) {
+      clearInterval(c.pingTimer);
+      c.pingTimer = null;
     }
   }
 
-  teardownSocket() {
-    this.stopPing();
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
+  teardownAll() {
+    this.manualClose = true;
+    for (const id of Object.keys(this.conns)) {
+      this.teardownOne(id);
     }
-    if (this.ws) {
+    this.refreshAggregateStatus();
+  }
+
+  teardownOne(endpointId) {
+    const c = this.conns[endpointId];
+    if (!c) return;
+    this.stopPing(endpointId);
+    if (c.reconnectTimer) {
+      clearTimeout(c.reconnectTimer);
+      c.reconnectTimer = null;
+    }
+    if (c.ws) {
       try {
-        this.manualClose = true;
-        this.ws.close();
+        c.ws.close();
       } catch {
         /* ignore */
       }
-      this.ws = null;
+      c.ws = null;
     }
-    this.setStatus("offline");
+    c.status = "offline";
+  }
+
+  /** @deprecated */
+  connect() {
+    this.connectAll();
+  }
+
+  /** @deprecated */
+  teardownSocket() {
+    this.teardownAll();
   }
 }
 
@@ -1562,34 +1902,92 @@ class JefrSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h3", { text: "jefr connection" });
+    this.plugin.settings = migrateSettings(this.plugin.settings);
+
+    containerEl.createEl("h3", { text: "Endpoints (multi-host)" });
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "Obsidian runs locally and can talk to several jefr bridges at once (e.g. Local :39517 and VPS forward :39518). Pick the route in the chat picker.",
+    });
+
+    const endpoints = this.plugin.settings.endpoints || [];
+    endpoints.forEach((ep, idx) => {
+      new Setting(containerEl)
+        .setName(ep.label || ep.id || "Endpoint " + (idx + 1))
+        .setDesc("id: " + ep.id)
+        .addToggle((tg) =>
+          tg.setValue(ep.enabled !== false).onChange(async (v) => {
+            ep.enabled = v;
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+        )
+        .addText((t) =>
+          t
+            .setPlaceholder("Label")
+            .setValue(ep.label || "")
+            .onChange(async (v) => {
+              ep.label = (v || "").trim() || ep.id;
+              await this.plugin.saveSettings();
+            }),
+        )
+        .addText((t) =>
+          t
+            .setPlaceholder("127.0.0.1")
+            .setValue(ep.host || "127.0.0.1")
+            .onChange(async (v) => {
+              ep.host = (v || "").trim() || "127.0.0.1";
+              await this.plugin.saveSettings();
+            }),
+        )
+        .addText((t) =>
+          t
+            .setPlaceholder("39517")
+            .setValue(String(ep.port || 39517))
+            .onChange(async (v) => {
+              const n = parseInt(v, 10);
+              ep.port = Number.isFinite(n) && n > 0 ? n : 39517;
+              await this.plugin.saveSettings();
+            }),
+        );
+    });
 
     new Setting(containerEl)
-      .setName("Host")
-      .setDesc("Host of the jefr local server running inside Cursor (usually 127.0.0.1).")
-      .addText((t) =>
-        t
-          .setPlaceholder("127.0.0.1")
-          .setValue(this.plugin.settings.host)
-          .onChange(async (v) => {
-            this.plugin.settings.host = (v || "").trim() || "127.0.0.1";
-            await this.plugin.saveSettings();
-          })
+      .setName("Add endpoint")
+      .setDesc("Another ws://host:port bridge (usually another LocalForward port).")
+      .addButton((b) =>
+        b.setButtonText("Add").onClick(async () => {
+          const n = (this.plugin.settings.endpoints || []).length + 1;
+          this.plugin.settings.endpoints.push({
+            id: "ep" + n,
+            label: "Host " + n,
+            host: "127.0.0.1",
+            port: 39517 + n,
+            enabled: true,
+          });
+          await this.plugin.saveSettings();
+          this.display();
+        }),
       );
 
     new Setting(containerEl)
-      .setName("Port")
-      .setDesc("Port of the jefr local server. Default is 39517.")
-      .addText((t) =>
-        t
-          .setPlaceholder("39517")
-          .setValue(String(this.plugin.settings.port))
-          .onChange(async (v) => {
-            const n = parseInt(v, 10);
-            this.plugin.settings.port = Number.isFinite(n) && n > 0 ? n : 39517;
-            await this.plugin.saveSettings();
-          })
-      );
+      .setName("Default route")
+      .setDesc("Which endpoint is selected when the chat opens.")
+      .addDropdown((dd) => {
+        for (const ep of endpoints) {
+          dd.addOption(ep.id, `${ep.label} (:${ep.port})`);
+        }
+        dd.setValue(this.plugin.settings.activeEndpointId || endpoints[0]?.id || "local");
+        dd.onChange(async (v) => {
+          this.plugin.settings.activeEndpointId = v;
+          const ep = endpoints.find((e) => e.id === v);
+          if (ep) {
+            this.plugin.settings.host = ep.host;
+            this.plugin.settings.port = ep.port;
+          }
+          await this.plugin.saveSettings();
+        });
+      });
 
     new Setting(containerEl)
       .setName("Auto-reconnect")
@@ -1598,7 +1996,7 @@ class JefrSettingTab extends PluginSettingTab {
         tg.setValue(this.plugin.settings.autoReconnect).onChange(async (v) => {
           this.plugin.settings.autoReconnect = v;
           await this.plugin.saveSettings();
-        })
+        }),
       );
 
     new Setting(containerEl)
@@ -1612,7 +2010,7 @@ class JefrSettingTab extends PluginSettingTab {
             const n = parseInt(v, 10);
             this.plugin.settings.maxHistory = Number.isFinite(n) && n > 20 ? n : 400;
             await this.plugin.saveSettings();
-          })
+          }),
       );
 
     containerEl.createEl("h3", { text: "Notifications" });
@@ -1625,7 +2023,7 @@ class JefrSettingTab extends PluginSettingTab {
           this.plugin.settings.notifyOnLogRewrite = v;
           await this.plugin.saveSettings();
           if (v) ensureNotificationPermission();
-        })
+        }),
       );
 
     new Setting(containerEl)
@@ -1679,6 +2077,35 @@ async function ensureNotificationPermission() {
     return await Notification.requestPermission();
   } catch {
     return "default";
+  }
+}
+
+/** Overwrite (or create) a vault-relative markdown note. Used by responseLog. */
+async function writeVaultMarkdown(app, relPath, markdown) {
+  const path = String(relPath || "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "");
+  if (!path) throw new Error("empty path");
+  const folder = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+  if (folder) {
+    const parts = folder.split("/");
+    let cur = "";
+    for (const part of parts) {
+      cur = cur ? cur + "/" + part : part;
+      if (!app.vault.getAbstractFileByPath(cur)) {
+        try {
+          await app.vault.createFolder(cur);
+        } catch {
+          /* exists */
+        }
+      }
+    }
+  }
+  const existing = app.vault.getAbstractFileByPath(path);
+  if (existing) {
+    await app.vault.modify(existing, markdown);
+  } else {
+    await app.vault.create(path, markdown);
   }
 }
 

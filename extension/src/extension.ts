@@ -286,6 +286,7 @@ function pushAgentListFromCdp(): void {
     targetAgentCount,
     workflowModel: poolModel,
     skipAutoPhase,
+    singleAgentMode,
     cdpConnected: lastCdpStatus?.connected ?? false,
     connectingAgentId: workflowProc ? activeWorkflowAgentId ?? null : null,
     connectingSince: workflowProc ? workflowStartedAt : 0,
@@ -494,6 +495,10 @@ let workflowModelsRefreshing = false;
 /** Skip Auto stand-by phase on spawn (persisted). Off by default. */
 let skipAutoPhase = false;
 const SKIP_AUTO_KEY = "jefr.skipAutoPhase";
+/** Single-agent / shared-queue mode (persisted). Off by default — multi-agent
+ *  injects agent_id into the MCP prompt; on = omit id → General · shared. */
+let singleAgentMode = false;
+const SINGLE_AGENT_KEY = "jefr.singleAgentMode";
 
 /** Migrate legacy persisted labels (e.g. Opus 4.5) to a live picker row. */
 function normalizePoolModel(model: string | undefined): string {
@@ -506,6 +511,14 @@ function setSkipAutoPhase(enabled: boolean): void {
   if (skipAutoPhase === enabled) return;
   skipAutoPhase = enabled;
   void extensionContext?.globalState.update(SKIP_AUTO_KEY, enabled);
+  lastAgentListJson = undefined;
+  pushAgentList();
+}
+
+function setSingleAgentMode(enabled: boolean): void {
+  if (singleAgentMode === enabled) return;
+  singleAgentMode = enabled;
+  void extensionContext?.globalState.update(SINGLE_AGENT_KEY, enabled);
   lastAgentListJson = undefined;
   pushAgentList();
 }
@@ -739,7 +752,12 @@ function processAgentAddQueue(): void {
     return;
   }
   pendingAgentAdds--;
-  runWorkflow({ model: pendingAgentModel, keepTiles: true, skipAuto: skipAutoPhase });
+  runWorkflow({
+    model: pendingAgentModel,
+    keepTiles: true,
+    skipAuto: skipAutoPhase || singleAgentMode,
+    singleAgent: singleAgentMode,
+  });
 }
 
 // ── Self-healing pool ("Keep N connected") ──────────────────────────────────
@@ -891,7 +909,12 @@ async function maintainPool(): Promise<void> {
       " — re-priming in place",
   });
   tileStateManager.markReconnectAttempt(victim.agentId);
-  runWorkflow({ reconnect: true, agentId: victim.agentId, model: poolModel });
+  runWorkflow({
+    reconnect: true,
+    agentId: victim.agentId,
+    model: poolModel,
+    singleAgent: singleAgentMode,
+  });
 }
 
 /** Close every cut-off (dropped) tile on demand — no replacement is spawned.
@@ -1015,6 +1038,9 @@ interface WorkflowOptions {
   /** Skip phase 1 (Auto stand-by turn) and select --model immediately.
    *  Spawn only as a flag — reconnect always implies skip-auto in workflow.py. */
   skipAuto?: boolean;
+  /** Omit agent_id from the MCP prompt so the agent uses the shared General
+   *  queue. Applies to spawn and reconnect. */
+  singleAgent?: boolean;
 }
 
 /** Spawn the CDP workflow and stream its output back to the webview. */
@@ -1083,9 +1109,13 @@ function runWorkflow(opts: WorkflowOptions): void {
       args.push("--keep-tiles");
     }
     args.push("--model", model);
-    if (opts.skipAuto) {
+    // Single-agent implies skip-auto (workflow.py also forces this).
+    if (opts.skipAuto || opts.singleAgent) {
       args.push("--skip-auto");
     }
+  }
+  if (opts.singleAgent) {
+    args.push("--single-agent");
   }
   if (opts.opusPrompt && opts.opusPrompt.trim()) {
     args.push("--type-text", opts.opusPrompt);
@@ -1186,6 +1216,11 @@ function runWorkflow(opts: WorkflowOptions): void {
     }
     activeWorkflowAgentId = undefined;
     spawnBaselineAgentIds = undefined;
+    // Single-agent mode listens on the shared root queue — point the panel at
+    // General so sends land where check_messages (no agent_id) is waiting.
+    if (code === 0 && singleAgentMode && !opts.reconnect) {
+      selectAgent(undefined);
+    }
     lastAgentListJson = undefined;
     pushAgentList();
     // A fresh spawn nests a new pane via Ctrl+D, which leaves the tiling tree
@@ -1356,6 +1391,7 @@ export function activate(context: vscode.ExtensionContext): void {
     void context.globalState.update(WORKFLOW_MODEL_KEY, poolModel);
   }
   skipAutoPhase = context.globalState.get<boolean>(SKIP_AUTO_KEY, false) === true;
+  singleAgentMode = context.globalState.get<boolean>(SINGLE_AGENT_KEY, false) === true;
   {
     const saved = context.globalState.get<string[]>(KEEP_CONNECTED_KEY);
     keepConnectedAgents.clear();
@@ -1622,7 +1658,12 @@ function pushAgentListFromHeartbeats(cdpFallback = false): void {
         stream: "stdout",
         line: `[jefr] keep: agent ${target.slice(0, 8)} dropped — re-priming its tile`,
       });
-      runWorkflow({ reconnect: true, agentId: target, model: poolModel });
+      runWorkflow({
+        reconnect: true,
+        agentId: target,
+        model: poolModel,
+        singleAgent: singleAgentMode,
+      });
     }
   }
 
@@ -1648,6 +1689,7 @@ function pushAgentListFromHeartbeats(cdpFallback = false): void {
     targetAgentCount,
     workflowModel: poolModel,
     skipAutoPhase,
+    singleAgentMode,
     cdpConnected: cdpFallback ? (lastCdpStatus?.connected ?? false) : false,
     connectingAgentId: workflowProc ? activeWorkflowAgentId ?? null : null,
     connectingSince: workflowProc ? workflowStartedAt : 0,
@@ -2078,6 +2120,9 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
         case "setSkipAutoPhase":
           setSkipAutoPhase(!!msg.enabled);
           break;
+        case "setSingleAgentMode":
+          setSingleAgentMode(!!msg.enabled);
+          break;
         case "getWorkflowModels":
           pushWorkflowModels();
           break;
@@ -2112,7 +2157,12 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
               s.reconnectsSinceConnect++;
               s.lastReconnectAt = Date.now();
             }
-            runWorkflow({ reconnect: true, agentId: aid, model: poolModel });
+            runWorkflow({
+              reconnect: true,
+              agentId: aid,
+              model: poolModel,
+              singleAgent: singleAgentMode,
+            });
           }
           break;
         }
@@ -2124,7 +2174,8 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
           runWorkflow({
             model: (typeof msg.model === "string" && msg.model.trim()) || poolModel,
             keepTiles: true,
-            skipAuto: skipAutoPhase,
+            skipAuto: skipAutoPhase || singleAgentMode,
+            singleAgent: singleAgentMode,
           });
           break;
         }
@@ -2342,7 +2393,13 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
               // the UI can pass keepTiles:false to force the clean-collapse spawn.
               keepTiles: msg.keepTiles !== false,
               skipAuto:
-                typeof msg.skipAuto === "boolean" ? msg.skipAuto : skipAutoPhase,
+                typeof msg.skipAuto === "boolean"
+                  ? msg.skipAuto
+                  : skipAutoPhase || singleAgentMode,
+              singleAgent:
+                typeof msg.singleAgent === "boolean"
+                  ? msg.singleAgent
+                  : singleAgentMode,
             });
           } catch (e) {
             postWorkflow({
@@ -2366,6 +2423,7 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
               opusPrompt: msg.opusPrompt,
               maxSecs: msg.maxSecs,
               enterInterval: msg.enterInterval,
+              singleAgent: singleAgentMode,
             });
           } catch (e) {
             postWorkflow({

@@ -216,6 +216,8 @@ export type InboundMessage =
       workflowModel?: string;
       /** Skip Auto stand-by phase on spawn. Persisted host-side. */
       skipAutoPhase?: boolean;
+      /** Omit agent_id from MCP prompt (shared General queue). Persisted. */
+      singleAgentMode?: boolean;
       /** True when CDP real-time monitoring is active. */
       cdpConnected?: boolean;
       /** The single agent a running workflow is currently spawning / re-priming.
@@ -281,6 +283,8 @@ export type OutboundMessage =
       keepTiles?: boolean;
       /** Skip Auto stand-by phase and select the target model immediately. */
       skipAuto?: boolean;
+      /** Omit agent_id from the MCP prompt — shared General queue. */
+      singleAgent?: boolean;
     }
   | {
       type: "reconnectWorkflow";
@@ -299,6 +303,7 @@ export type OutboundMessage =
   | { type: "setTargetAgentCount"; count: number }
   | { type: "setWorkflowModel"; model: string }
   | { type: "setSkipAutoPhase"; enabled: boolean }
+  | { type: "setSingleAgentMode"; enabled: boolean }
   /** Re-read Cursor's live model picker via CDP (`cdp.py --models`). */
   | { type: "refreshWorkflowModels" }
   | { type: "getWorkflowModels" }

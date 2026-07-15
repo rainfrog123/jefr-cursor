@@ -1,37 +1,26 @@
 # jefr — Obsidian chat plugin
 
-A faithful port of the **jefr** Cursor side-panel input area, living inside Obsidian.
+Local Obsidian UI for jefr. Talks to Cursor jefr bridges over WebSocket.
 
-Send prompts to your Cursor AI agent, read its replies (rendered as Markdown), and answer its questions — all from a single Obsidian view. Everything you send here flows through the **same message queue** your Cursor agent reads via the jefr MCP server, and also shows up as chat bubbles in the **jefr panel inside Cursor**.
+## Multi-host (Phase 2)
 
-## How it works
+This plugin runs **on Windows Obsidian** (local). It can connect to **multiple** bridges at once:
 
-The jefr VS Code / Cursor extension runs a small local WebSocket server (default `ws://127.0.0.1:39517`). This plugin is a WebSocket client of that server and speaks the same protocol as the built-in Remote Console:
+| Endpoint | Typical port | Meaning |
+|----------|--------------|---------|
+| Local | `39517` | Local Cursor jefr |
+| VPS | `39518` | Remote SSH jefr via LocalForward |
 
-- **You send** → `sendText` → lands in the per-workspace queue the agent reads via `check_messages`, and echoes into the Cursor jefr panel history.
-- **Agent replies** → pushed to the plugin as `stateUpdate.reply` and rendered as a Markdown bubble.
-- **Agent asks a question** (`ask_question`) → rendered as an interactive card; your answer is sent back via `submitAnswer`.
+Settings → **jefr** → **Endpoints**. The chat route picker lists agents grouped by host.
 
-No file paths or workspace hashing to configure — the extension already points its server at the correct workspace data directory.
+`multi-agent-ssh` is the **VPS install** track. Do not put Obsidian multi-host logic on that branch — Obsidian stays on **`multi-agent-local`**.
 
 ## Install
 
-1. Copy this folder into your vault's plugins directory:
-   `<your-vault>/.obsidian/plugins/jefr-chat/`
-   It must contain `manifest.json`, `main.js`, and `styles.css`.
-2. In Obsidian: **Settings → Community plugins → Reload plugins**, then enable **jefr**.
-3. Make sure **Cursor is open** with the jefr extension running (it auto-starts the local server).
-4. Open the chat via the ribbon icon (speech bubbles) or the command palette: **"jefr: Open jefr chat"**.
+Symlink or copy this folder to `<vault>/.obsidian/plugins/jefr-chat/` (`manifest.json`, `main.js`, `styles.css`).
 
-## Settings
+Enable in Community plugins → reload.
 
-- **Host** — usually `127.0.0.1`.
-- **Port** — default `39517` (the jefr server's preferred port).
-- **Auto-reconnect** — reconnect automatically when Cursor restarts.
-- **Max messages kept** — how many bubbles to keep before trimming the oldest.
+## Protocol
 
-## Notes
-
-- The connection status pill (Online / Connecting / Offline) reflects the live WebSocket state.
-- This channel is **text-only** (matching the server's `sendText` API). Image/file attachments are not sent from Obsidian.
-- `isDesktopOnly` is set because the plugin opens a local network socket to Cursor.
+Same as the Cursor Remote Console WS (`sendText`, `selectAgent`, `stateUpdate`, `responseLog`, …).

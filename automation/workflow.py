@@ -11,6 +11,8 @@ Stages (spawn):
                  With --skip-auto: select the target model immediately, then
                  continue to MCP priming.
   5. type      — type the MCP prompt into the Send follow-up composer
+                 (injects agent_id for multi-agent routing; skipped with
+                 --single-agent so the agent uses the shared General queue)
   6. hold      — HOLD Enter until MCP connected (planning-clear then MCP-detect;
                  --max-secs default 6000s; Enter released on connect)
 
@@ -581,11 +583,19 @@ def response_state(ws, idx):
 # Enter hold / MCP prime
 # ---------------------------------------------------------------------------
 
-def hold_enter_until_mcp_connected(ws, idx, interval, max_secs, agent_id=None):
-    """One continuous Enter hold: planning clears, then MCP loop confirmed."""
+def hold_enter_until_mcp_connected(ws, idx, interval, max_secs, agent_id=None, single_agent=False):
+    """One continuous Enter hold: planning clears, then MCP loop confirmed.
+
+    With single_agent=True the agent listens on the shared root queue (no
+    agent_id in tool calls), so heartbeat checks use the root file even when
+    agent_id is known for tile focus.
+    """
     idx = _resolve_tile(ws, idx, agent_id)
     cap = f"{max_secs}s cap" if max_secs else "unlimited"
-    who = f"agent {agent_id}" if agent_id else f"tile {idx}"
+    if single_agent:
+        who = f"shared queue (tile {idx}" + (f", agent {agent_id}" if agent_id else "") + ")"
+    else:
+        who = f"agent {agent_id}" if agent_id else f"tile {idx}"
     print(f"hold Enter continuously until MCP connected on {who} ({cap})")
     real_focus(ws, idx)
     time.sleep(random.uniform(0.3, 0.7))
@@ -603,9 +613,12 @@ def hold_enter_until_mcp_connected(ws, idx, interval, max_secs, agent_id=None):
     # Prefer agentId so index shifts mid-hold don't drift to another tile.
     refocus_eval = agent_focus_eval(agent_id) if agent_id else tile_focus_eval(idx)
 
+    # Heartbeat routing: shared root in single-agent mode, else per-agent.
+    hb_id = None if single_agent else agent_id
     if agent_id:
+        # DOM MCP-running detect still keys off the tile's fiber id.
         stop_eval = combined_mcp_stop_eval_by_agent(agent_id)
-        stop_check = lambda: mcp_alive.is_connected(agent_id)
+        stop_check = lambda: mcp_alive.is_connected(hb_id)
     else:
         stop_eval = combined_mcp_stop_eval(idx)
         stop_check = lambda: mcp_alive.is_connected(None)
@@ -620,11 +633,10 @@ def hold_enter_until_mcp_connected(ws, idx, interval, max_secs, agent_id=None):
     )
 
     final = response_state(ws, idx)
-    hb_ok = (
-        verify_per_agent_heartbeat(agent_id, timeout=8.0)
-        if agent_id
-        else mcp_alive.is_connected(None)
-    )
+    if single_agent or not agent_id:
+        hb_ok = mcp_alive.is_connected(None)
+    else:
+        hb_ok = verify_per_agent_heartbeat(agent_id, timeout=8.0)
     if stop_reason in ("stop_eval", "stop_check"):
         hb_ok = True
     print(
@@ -635,18 +647,20 @@ def hold_enter_until_mcp_connected(ws, idx, interval, max_secs, agent_id=None):
     return hb_ok, stop_reason, idx
 
 
-def enter_until_response(ws, idx, interval, max_secs, agent_id=None):
+def enter_until_response(ws, idx, interval, max_secs, agent_id=None, single_agent=False):
     """Type prompt already done — hold Enter until MCP loop confirmed."""
     hold_cap = _mcp_hold_secs(max_secs)
     connected, _, idx = hold_enter_until_mcp_connected(
-        ws, idx, interval, hold_cap, agent_id=agent_id,
+        ws, idx, interval, hold_cap, agent_id=agent_id, single_agent=single_agent,
     )
-    if agent_id and not connected:
+    # Multi-agent only: nudge agent_id routing if the tile connected without
+    # writing a per-agent heartbeat. Single-agent mode intentionally omits id.
+    if agent_id and not single_agent and not connected:
         print("WARN: MCP loop not confirmed on per-agent heartbeat — re-nudging agent_id routing")
         idx = _resolve_tile(ws, idx, agent_id)
         type_in_composer(ws, idx, agent_id_reminder(agent_id))
         connected, _, _ = hold_enter_until_mcp_connected(
-            ws, idx, interval, hold_cap, agent_id=agent_id,
+            ws, idx, interval, hold_cap, agent_id=agent_id, single_agent=False,
         )
     snap(ws, "done")
     if not connected:
@@ -656,21 +670,33 @@ def enter_until_response(ws, idx, interval, max_secs, agent_id=None):
     return True
 
 
-def prime_mcp(ws, idx, type_text, interval, max_secs, agent_id=None, preferred_id=None):
-    """Resolve agent/tile, inject id into prompt, type, hold Enter until connected.
+def prime_mcp(ws, idx, type_text, interval, max_secs, agent_id=None, preferred_id=None,
+              single_agent=False):
+    """Resolve agent/tile, optionally inject id into prompt, type, hold Enter.
 
     Shared by spawn and reconnect. Returns (ok, agent_id, idx).
+
+    single_agent=True: leave agent_id out of the prompt so the agent uses the
+    shared root queue (General). Tile focus still uses the fiber id when known.
     """
     idx, agent_id = resolve_agent_and_tile(ws, idx, agent_id, preferred=preferred_id)
-    text = mcp_prompt_with_id(type_text, agent_id)
-    print(f"# agent_id: {agent_id}; tile: {idx}")
+    if single_agent:
+        text = type_text
+        print(f"# single-agent: shared queue (no agent_id in prompt); tile: {idx}")
+        if agent_id:
+            print(f"# tile agent_id (focus only): {agent_id}")
+    else:
+        text = mcp_prompt_with_id(type_text, agent_id)
+        print(f"# agent_id: {agent_id}; tile: {idx}")
     print(f"# mcp prompt: {text!r}")
     type_in_composer(ws, idx, text)
-    ok = enter_until_response(ws, idx, interval, max_secs, agent_id=agent_id)
+    ok = enter_until_response(
+        ws, idx, interval, max_secs, agent_id=agent_id, single_agent=single_agent,
+    )
     return ok, agent_id, idx
 
 
-def reconnect(ws, idx, type_text, interval, max_secs, agent_id=None):
+def reconnect(ws, idx, type_text, interval, max_secs, agent_id=None, single_agent=False):
     """Re-prime an EXISTING dropped tile in place (no Ctrl+D split)."""
     idx = _resolve_tile(ws, idx, agent_id)
     if agent_id:
@@ -678,7 +704,9 @@ def reconnect(ws, idx, type_text, interval, max_secs, agent_id=None):
     else:
         print(f"reconnect: targeting tile {idx}")
     type_in_composer(ws, idx, type_text)
-    return enter_until_response(ws, idx, interval, max_secs, agent_id=agent_id)
+    return enter_until_response(
+        ws, idx, interval, max_secs, agent_id=agent_id, single_agent=single_agent,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -728,19 +756,27 @@ def run_reconnect_flow(ws, args, type_text, elapsed):
     ok, agent_id, _ = prime_mcp(
         ws, idx, type_text, args.enter_interval, args.max_secs,
         agent_id=agent_id, preferred_id=args.agent_id,
+        single_agent=args.single_agent,
     )
     if not ok:
         fail("MCP connection not confirmed on reconnect", {"agent_id": agent_id})
-    print(f"workflow: reconnected MCP in {elapsed():.1f}s (agent {agent_id})")
+    route = "shared queue" if args.single_agent else f"agent {agent_id}"
+    print(f"workflow: reconnected MCP in {elapsed():.1f}s ({route})")
 
 
 def run_spawn_flow(ws, args, type_text, elapsed):
     """Spawn: prepare/split -> phase -> prime MCP."""
+    # Single-agent always skips Auto stand-by — go straight to target model + MCP.
+    skip_auto = bool(args.skip_auto or args.single_agent)
     prompt = args.prompt or auto_prompt()
-    if args.skip_auto:
+    if args.single_agent and not args.skip_auto:
+        print("# single-agent: implying skip-auto (no Auto stand-by phase)")
+    if skip_auto:
         print("# skip-auto: skipping Auto stand-by phase; selecting target model directly")
     else:
         print(f"# auto prompt: {prompt!r}")
+    if args.single_agent:
+        print("# single-agent: MCP prompt will omit agent_id (shared General queue)")
 
     if args.keep_tiles:
         print("keep-tiles: leaving existing agent tiles intact — accumulating a new agent")
@@ -749,19 +785,21 @@ def run_spawn_flow(ws, args, type_text, elapsed):
 
     idx = split(ws)
     print(f"[t+{elapsed():.1f}s] split done — new tile {idx}")
-    idx, agent_id = run_phase(ws, prompt, idx, args.model, skip_auto=args.skip_auto)
+    idx, agent_id = run_phase(ws, prompt, idx, args.model, skip_auto=skip_auto)
     print(
         f"[t+{elapsed():.1f}s] "
-        + ("skip-auto model select done" if args.skip_auto else "auto phase + model select done")
+        + ("skip-auto model select done" if skip_auto else "auto phase + model select done")
     )
 
     ok, agent_id, _ = prime_mcp(
         ws, idx, type_text, args.enter_interval, args.max_secs,
         agent_id=agent_id, preferred_id=args.agent_id,
+        single_agent=args.single_agent,
     )
     if not ok:
         fail("MCP connection not confirmed", {"agent_id": agent_id})
-    print(f"workflow: MCP connected in {elapsed():.1f}s (agent {agent_id})")
+    route = "shared queue" if args.single_agent else f"agent {agent_id}"
+    print(f"workflow: MCP connected in {elapsed():.1f}s ({route})")
 
 
 def main():
@@ -801,7 +839,16 @@ def main():
                          "injected into the MCP prompt so the agent passes it back "
                          "on every jefr call (auto-read from the tile's React fiber "
                          "if omitted). On --reconnect it selects which tile to "
-                         "re-prime (preferred over --tile / auto-detect).")
+                         "re-prime (preferred over --tile / auto-detect). "
+                         "Ignored for prompt injection when --single-agent is set.")
+    ap.add_argument("--single-agent", dest="single_agent", action="store_true",
+                    help="Single-agent / shared-queue mode: do NOT inject agent_id "
+                         "into the MCP prompt. The agent uses the shared General "
+                         "queue (omit agent_id on jefr tool calls). Heartbeat "
+                         "checks use the root agent-alive.json. Implies "
+                         "--skip-auto (no Auto stand-by — select --model then "
+                         "MCP-prime immediately). Tile focus still uses the "
+                         "fiber id when known.")
     args = ap.parse_args()
 
     t0 = time.time()

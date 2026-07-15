@@ -32,6 +32,9 @@ export function GeneralTab(props: {
   /** Skip Auto stand-by phase on spawn (persisted host-side). */
   skipAutoPhase: boolean;
   onSkipAutoChange: (enabled: boolean) => void;
+  /** Omit agent_id from MCP prompt — shared General queue (persisted). */
+  singleAgentMode: boolean;
+  onSingleAgentChange: (enabled: boolean) => void;
   /** Live / persisted picker rows from the host (CDP refresh). */
   workflowModels: string[];
   workflowModelsRefreshing?: boolean;
@@ -53,6 +56,8 @@ export function GeneralTab(props: {
     onModelChange,
     skipAutoPhase,
     onSkipAutoChange,
+    singleAgentMode,
+    onSingleAgentChange,
     workflowModels,
     workflowModelsRefreshing,
     workflowModelsError,
@@ -96,7 +101,8 @@ export function GeneralTab(props: {
       model: model.trim() || undefined,
       // Spawns always accumulate — reconnect/keep live on each dropped tile.
       keepTiles: true,
-      skipAuto: skipAutoPhase,
+      skipAuto: skipAutoPhase || singleAgentMode,
+      singleAgent: singleAgentMode,
     });
   };
 
@@ -165,15 +171,27 @@ export function GeneralTab(props: {
           )}
           <label
             className="workflow-opt"
-            title="Skip phase 1 (select Auto + stand-by). Select the target model immediately, then MCP-prime."
+            title="Skip phase 1 (select Auto + stand-by). Select the target model immediately, then MCP-prime. Implied by Single agent."
           >
             <input
               type="checkbox"
-              checked={skipAutoPhase}
-              disabled={workflowRunning}
+              checked={skipAutoPhase || singleAgentMode}
+              disabled={workflowRunning || singleAgentMode}
               onChange={(e) => onSkipAutoChange(e.target.checked)}
             />
             Skip Auto
+          </label>
+          <label
+            className="workflow-opt"
+            title="Single agent / shared queue: skip Auto stand-by, omit agent_id from the MCP prompt, and use General · shared (not a per-agent queue)."
+          >
+            <input
+              type="checkbox"
+              checked={singleAgentMode}
+              disabled={workflowRunning}
+              onChange={(e) => onSingleAgentChange(e.target.checked)}
+            />
+            Single agent
           </label>
         </div>
 

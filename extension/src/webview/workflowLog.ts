@@ -114,6 +114,24 @@ export function formatWorkflowLine(
   if (/^# skip-auto:/.test(t) || /^# reconnect: skip-auto/.test(t)) {
     return [{ stream, text: "Skip Auto — select target model directly", kind: "stage" }];
   }
+  if (/^# single-agent: implying skip-auto/.test(t)) {
+    return [
+      {
+        stream,
+        text: "Single agent — skip Auto (direct MCP)",
+        kind: "stage",
+      },
+    ];
+  }
+  if (/^# single-agent:/.test(t)) {
+    return [
+      {
+        stream,
+        text: "Single agent — shared General queue (no agent_id in prompt)",
+        kind: "stage",
+      },
+    ];
+  }
   if (/^# auto prompt:/.test(t)) {
     return [{ stream, text: "Phase 1 · Auto stand-by", kind: "stage" }];
   }
@@ -183,6 +201,16 @@ export function formatWorkflowLine(
   }
 
   if (/^workflow: MCP connected in /.test(t) || /^workflow: reconnected MCP in /.test(t)) {
+    const shared = t.match(/in\s+([\d.]+)s\s+\(shared queue\)/i);
+    if (shared) {
+      return [
+        {
+          stream,
+          text: `MCP connected in ${shared[1]}s · shared queue`,
+          kind: "ok",
+        },
+      ];
+    }
     const m = t.match(/in\s+([\d.]+)s\s+\(agent\s+([^)]+)\)/i);
     if (m) {
       return [

@@ -7394,6 +7394,7 @@ function pushAgentListFromCdp() {
     targetAgentCount,
     workflowModel: poolModel,
     skipAutoPhase,
+    singleAgentMode,
     cdpConnected: lastCdpStatus?.connected ?? false,
     connectingAgentId: workflowProc ? activeWorkflowAgentId ?? null : null,
     connectingSince: workflowProc ? workflowStartedAt : 0
@@ -7527,6 +7528,8 @@ var WORKFLOW_MODELS_KEY = "jefr.workflowModels";
 var workflowModelsRefreshing = false;
 var skipAutoPhase = false;
 var SKIP_AUTO_KEY = "jefr.skipAutoPhase";
+var singleAgentMode = false;
+var SINGLE_AGENT_KEY = "jefr.singleAgentMode";
 function normalizePoolModel(model) {
   const m = (model || "").trim();
   if (/^Opus 4\.5/i.test(m))
@@ -7538,6 +7541,14 @@ function setSkipAutoPhase(enabled) {
     return;
   skipAutoPhase = enabled;
   void extensionContext?.globalState.update(SKIP_AUTO_KEY, enabled);
+  lastAgentListJson = void 0;
+  pushAgentList();
+}
+function setSingleAgentMode(enabled) {
+  if (singleAgentMode === enabled)
+    return;
+  singleAgentMode = enabled;
+  void extensionContext?.globalState.update(SINGLE_AGENT_KEY, enabled);
   lastAgentListJson = void 0;
   pushAgentList();
 }
@@ -7728,7 +7739,12 @@ function processAgentAddQueue() {
     return;
   }
   pendingAgentAdds--;
-  runWorkflow({ model: pendingAgentModel, keepTiles: true, skipAuto: skipAutoPhase });
+  runWorkflow({
+    model: pendingAgentModel,
+    keepTiles: true,
+    skipAuto: skipAutoPhase || singleAgentMode,
+    singleAgent: singleAgentMode
+  });
 }
 var healingTile = false;
 function hideBillingBannersNow() {
@@ -7828,7 +7844,12 @@ async function maintainPool() {
     line: `[jefr] keep: agent ${victim.agentId.slice(0, 8)} dropped` + (victim.queueCount > 0 ? ` with ${victim.queueCount} queued` : "") + " \u2014 re-priming in place"
   });
   tileStateManager.markReconnectAttempt(victim.agentId);
-  runWorkflow({ reconnect: true, agentId: victim.agentId, model: poolModel });
+  runWorkflow({
+    reconnect: true,
+    agentId: victim.agentId,
+    model: poolModel,
+    singleAgent: singleAgentMode
+  });
 }
 async function closeDroppedTiles() {
   if (healingTile)
@@ -7963,9 +7984,12 @@ function runWorkflow(opts) {
       args.push("--keep-tiles");
     }
     args.push("--model", model);
-    if (opts.skipAuto) {
+    if (opts.skipAuto || opts.singleAgent) {
       args.push("--skip-auto");
     }
+  }
+  if (opts.singleAgent) {
+    args.push("--single-agent");
   }
   if (opts.opusPrompt && opts.opusPrompt.trim()) {
     args.push("--type-text", opts.opusPrompt);
@@ -8052,6 +8076,9 @@ function runWorkflow(opts) {
     }
     activeWorkflowAgentId = void 0;
     spawnBaselineAgentIds = void 0;
+    if (code === 0 && singleAgentMode && !opts.reconnect) {
+      selectAgent(void 0);
+    }
     lastAgentListJson = void 0;
     pushAgentList();
     if (cdpEnabled && !opts.reconnect && pendingAgentAdds <= 0) {
@@ -8137,6 +8164,7 @@ function activate(context) {
     void context.globalState.update(WORKFLOW_MODEL_KEY, poolModel);
   }
   skipAutoPhase = context.globalState.get(SKIP_AUTO_KEY, false) === true;
+  singleAgentMode = context.globalState.get(SINGLE_AGENT_KEY, false) === true;
   {
     const saved = context.globalState.get(KEEP_CONNECTED_KEY);
     keepConnectedAgents.clear();
@@ -8361,7 +8389,12 @@ function pushAgentListFromHeartbeats(cdpFallback = false) {
         stream: "stdout",
         line: `[jefr] keep: agent ${target.slice(0, 8)} dropped \u2014 re-priming its tile`
       });
-      runWorkflow({ reconnect: true, agentId: target, model: poolModel });
+      runWorkflow({
+        reconnect: true,
+        agentId: target,
+        model: poolModel,
+        singleAgent: singleAgentMode
+      });
     }
   }
   const droppedSet = new Set(dropped);
@@ -8383,6 +8416,7 @@ function pushAgentListFromHeartbeats(cdpFallback = false) {
     targetAgentCount,
     workflowModel: poolModel,
     skipAutoPhase,
+    singleAgentMode,
     cdpConnected: cdpFallback ? lastCdpStatus?.connected ?? false : false,
     connectingAgentId: workflowProc ? activeWorkflowAgentId ?? null : null,
     connectingSince: workflowProc ? workflowStartedAt : 0
@@ -8702,6 +8736,9 @@ var MessengerViewProvider = class {
         case "setSkipAutoPhase":
           setSkipAutoPhase(!!msg.enabled);
           break;
+        case "setSingleAgentMode":
+          setSingleAgentMode(!!msg.enabled);
+          break;
         case "getWorkflowModels":
           pushWorkflowModels();
           break;
@@ -8729,7 +8766,12 @@ var MessengerViewProvider = class {
               s.reconnectsSinceConnect++;
               s.lastReconnectAt = Date.now();
             }
-            runWorkflow({ reconnect: true, agentId: aid, model: poolModel });
+            runWorkflow({
+              reconnect: true,
+              agentId: aid,
+              model: poolModel,
+              singleAgent: singleAgentMode
+            });
           }
           break;
         }
@@ -8737,7 +8779,8 @@ var MessengerViewProvider = class {
           runWorkflow({
             model: typeof msg.model === "string" && msg.model.trim() || poolModel,
             keepTiles: true,
-            skipAuto: skipAutoPhase
+            skipAuto: skipAutoPhase || singleAgentMode,
+            singleAgent: singleAgentMode
           });
           break;
         }
@@ -8935,7 +8978,8 @@ var MessengerViewProvider = class {
               // Default to keeping existing tiles so spawns accumulate agents;
               // the UI can pass keepTiles:false to force the clean-collapse spawn.
               keepTiles: msg.keepTiles !== false,
-              skipAuto: typeof msg.skipAuto === "boolean" ? msg.skipAuto : skipAutoPhase
+              skipAuto: typeof msg.skipAuto === "boolean" ? msg.skipAuto : skipAutoPhase || singleAgentMode,
+              singleAgent: typeof msg.singleAgent === "boolean" ? msg.singleAgent : singleAgentMode
             });
           } catch (e) {
             postWorkflow({
@@ -8955,7 +8999,8 @@ var MessengerViewProvider = class {
               model: poolModel,
               opusPrompt: msg.opusPrompt,
               maxSecs: msg.maxSecs,
-              enterInterval: msg.enterInterval
+              enterInterval: msg.enterInterval,
+              singleAgent: singleAgentMode
             });
           } catch (e) {
             postWorkflow({
