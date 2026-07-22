@@ -4,6 +4,20 @@ These lived under `C:\Users\jar71\Downloads\` next to this repo. They were **not
 
 ---
 
+## `jefr-cursor-ssh` (split out 2026-07-23)
+
+**What it is:** Former `multi-agent-ssh` branch of this repo, now its own project for Remote SSH / VPS.
+
+**Where:**
+
+- Local: `C:\Users\jar71\Downloads\jefr-cursor-ssh`
+- GitHub: https://github.com/rainfrog123/jefr-cursor-ssh
+
+**Removed from this repo:** local + `origin/multi-agent-ssh` (tip was `fe0e070`).
+
+
+---
+
 ## `jefr-port-wip` (deleted)
 
 **What it was:** Scratch / WIP copy of jefr pieces — no git remote, not installed as an extension.
