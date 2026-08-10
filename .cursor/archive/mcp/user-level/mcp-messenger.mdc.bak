@@ -1,0 +1,48 @@
+---
+description: Automatically call Messenger MCP to check for pending messages
+globs: "**/*"
+alwaysApply: true
+---
+
+# MCP tool usage rules
+
+## Core loop
+1. After each conversation turn is **fully output**, the last step must call `check_messages` (server `user-jefr`, toolName `check_messages`). Applies to Agent/Plan/Debug/Ask modes with no exceptions.
+2. `check_messages` blocks until the user sends a new message; process it, reply, then call `check_messages` again — perpetual loop: reply → check_messages → receive → reply → check_messages.
+3. Never call `check_messages` at the start of a turn or before the reply is complete. Only exception: the user explicitly asks to end the conversation.
+4. After writing a plan (Plan), finishing analysis (Debug), or answering a question (Ask), do not end the turn — call `check_messages` and wait for user feedback.
+
+## reply field (mandatory)
+5. `check_messages` **must always** include a non-empty `reply` containing your complete response. Never call it with empty `{}`. The plugin panel only displays `reply` content — the Cursor chat window text is not visible there. Example: `{ "reply": "## Summary\nChanges complete..." }`
+
+## Formatting (panel renders a limited Markdown subset)
+6. Supported: headings (`#` through `######`), **bold**, *italic*, ~~strikethrough~~, inline code, fenced code blocks, ordered/unordered lists, and links `[text](url)`.
+7. Not supported — do NOT use: tables, blockquotes (`>`), images, and nested/indented lists. Use flat lists or short paragraphs instead.
+8. Newlines: a blank line starts a new paragraph; a single newline becomes a line break within the same paragraph.
+9. Keep replies concise — the panel is narrow. Prefer short paragraphs and tight lists over long blocks of text.
+
+## ask_question
+10. When the user must choose, confirm, or approve an action (pick a plan/framework, approve a change, etc.), call `ask_question` (server `user-jefr`). Do not use Cursor's built-in ask_user_question.
+11. Format: `{ "questions": [{ "question": "...", "options": [{ "id": "a", "label": "A" }, { "id": "b", "label": "B" }], "allow_multiple": false }] }`. Single-select: `allow_multiple: false`; multi-select: `true`; one array may mix both. Users can add custom text via the Other field — no extra option needed.
+12. After `ask_question` returns an answer, still call `check_messages` to keep listening.
+13. Do not use `ask_question` to ask "anything else?" at the end of every turn — end turns with `check_messages`. Use `ask_question` only when a real decision is needed.
+
+## send_progress
+14. During multi-step work, after each key step call `send_progress` (server `user-jefr`) with a summary; it returns immediately, then continue to the next step. Example: `{ "progress": "## Step 1 complete\nUpdated xxx..." }`. Include: what was done, current approach, next step. Use concise Markdown.
+
+## Human-readable output
+17. Write for a human reader. Use clear, natural, friendly language — full sentences and short paragraphs, not terse status fragments. Briefly explain the *why* behind what you did, not just *what* changed.
+18. Make every response as Markdown-friendly and readable as possible: descriptive headings, **bold** for key points, inline code for names/paths/commands, and tight lists. This applies to the `reply` field, `send_progress` messages, and the response-log file below. (Remember the panel's limits in rules 6–7; the log file in rule 19 is a normal Markdown file and may use the full syntax, including tables.)
+
+## Response file (mandatory)
+19. For **every** response, write your full reply to `C:\Users\jar71\obsidian\_Vault\MCP Response Log.md`, **replacing the entire file each time** (overwrite, do NOT append). The file always holds only your latest response.
+20. Make this file **rich, natural-language Markdown** — it is a normal Obsidian note, so use the full toolkit: Obsidian callouts (`> [!note]`, `> [!tip]`, `> [!warning]`, `> [!success]`, `> [!example]`, etc.), headings, **bold**/*italic*, inline code, fenced code blocks, tables, and lists. Write it like a clear explanation to a person, not a terse status dump.
+21. Write the file in the **same turn** as the reply — right before (or together with) the `check_messages` call — and never skip it. The panel `reply` (rules 6–7) stays within its limited subset; this file is the rich, fully-formatted version.
+22. **Exception — standby / hold-only turns:** Do NOT write the response log when the user says STAND BY, keep the connection open, or the turn is only a trivial ack with no substantive work. Never overwrite the Obsidian log with "Standing by" noise; the `check_messages` `reply` field is enough for those.
+
+## Misc
+23. Do not spawn subagents for parallel tasks.
+24. If `check_messages` or `ask_question` returns early due to client cancel, connection issues, or internal errors, and the user did not ask to end the chat, do not show internal `[system]` text to the user — call the tool again immediately.
+
+---
+**End of turn (mandatory)**: Only after the reply is **fully complete**, (1) write the full reply to `C:\Users\jar71\obsidian\_Vault\MCP Response Log.md`, **overwriting the whole file** with rich, natural-language Markdown (rules 19–21), **except standby / hold-only turns (rule 22)**; then (2) call the `user-jefr` MCP `check_messages` tool (via CallMcpTool, server `user-jefr`, toolName `check_messages`) with `arguments { "reply": "<your full reply>" }`. The `reply` field is always required and must contain your complete response — never call with empty `{}`. Never call it at the start of a turn or before the reply is done. Use `ask_question` only when the user must make a choice during the task (e.g. pick a framework or plan).

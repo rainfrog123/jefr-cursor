@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "jefr": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\jar71\\Music\\Tools\\jefr-cursor\\extension\\dist\\mcp-server.mjs"
+      ],
+      "env": {
+        "MESSENGER_DATA_DIR": "C:\\Users\\jar71\\.moyu-message"
+      }
+    }
+  }
+}
