@@ -1,6 +1,6 @@
-jefr cursor · Quick start (v1.0.5 · multi-agent-local)
+jefr cursor · Quick start (v1.0.6 · multi-agent-local)
 
-1. Install — drag jefr-cursor.vsix (or extension/jefr-cursor-1.0.5.vsix) into the Cursor Extensions panel
+1. Install — drag jefr-cursor.vsix (or extension/jefr-cursor-1.0.6.vsix) into the Cursor Extensions panel
 2. Restart Cursor — so MCP config and rules take effect
 3. Confirm MCP — Cursor Settings → Tools & MCP → enable "jefr cursor"
 4. Start chat — in Cursor's native chat, send: Hello (once, to start the loop)
