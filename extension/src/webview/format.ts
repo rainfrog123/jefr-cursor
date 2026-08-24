@@ -19,3 +19,14 @@ export function fmtConnect(ms: number): string {
   const s = Math.round(ms / 1000);
   return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
+
+/** Very short elapsed label for the activity feed: `3s` / `2m` / `1h`. */
+export function fmtAgo(ms: number): string {
+  if (ms < 1000) return "now";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
+}

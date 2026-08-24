@@ -79,9 +79,10 @@ export function AgentsTab(props: {
   // you like. "Fill" only tops up to the auto-baseline (targetAgentCount).
   const canAddOne = !workflowRunning;
   const canFill = agents.length < targetAgentCount && !workflowRunning;
-  const sorted = [...agents].sort(
-    (a, b) => (a.tileIndex ?? 0) - (b.tileIndex ?? 0),
-  );
+  // Stable pool order. Sorting by live tileIndex reshuffled the list whenever
+  // Cursor/CDP reordered panes or when the heartbeat fallback ranked by
+  // freshest ts. Prefer host order (already stable); tie-break by id only.
+  const sorted = [...agents].sort((a, b) => a.id.localeCompare(b.id));
   // Always render every agent, at least the baseline count of slots, and one
   // trailing empty slot so you can keep adding past the baseline.
   const slotCount = Math.max(targetAgentCount, agents.length + 1);
@@ -321,6 +322,18 @@ export function AgentsTab(props: {
                   {label}
                   {a.queueCount ? ` · ${a.queueCount} queued` : ""}
                 </span>
+                {a.activity?.summary && (
+                  <span
+                    className="agent-activity"
+                    title={
+                      a.activity.tools?.length
+                        ? `${a.activity.summary}\nTools: ${a.activity.tools.join(" → ")}`
+                        : a.activity.summary
+                    }
+                  >
+                    {a.activity.summary}
+                  </span>
+                )}
                 {connectingElapsed > 0 && (
                   <span className="agent-timing">
                     connecting {fmtDuration(connectingElapsed)}

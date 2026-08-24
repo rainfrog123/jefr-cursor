@@ -8,6 +8,14 @@
  * event-driven model based on real-time CDP data.
  */
 
+import {
+  activityFromDb,
+  getTranscriptActivity,
+  getTranscriptTurnEnd,
+  mergeLiveActivity,
+} from "./agentTranscript";
+import type { TranscriptActivity } from "./agentTranscript";
+import { composerAliveAt, getComposerActivity } from "./composerState";
 import type { TileInfo, TileState } from "./cdp-monitor";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -33,8 +41,46 @@ const MCP_GRACE_MS = 8_000;
  *  drop while the agent is mid-task. */
 const BUSY_GRACE_MS = 8_000;
 
+/** How long an agent keeps benefit of the doubt after the last INDEPENDENT proof
+ *  that it's doing something (live MCP card, busy tile, running tool card, or a
+ *  transcript that's still growing).
+ *
+ *  This exists because the drop signals below are mostly inferences, and the
+ *  thing they infer from is unreliable while an agent is working normally: the
+ *  MCP heartbeat is only refreshed while parked in check_messages (or for a
+ *  while after send_progress), so an agent that receives a message and then
+ *  works quietly has NO heartbeat at all. Add one poll where a CDP selector
+ *  misses the busy state and the tile reads as an abrupt server drop — the
+ *  "working agent shown as dropped" bug. Requiring a sustained absence of every
+ *  liveness signal makes that impossible without meaningfully delaying a real
+ *  drop, which stays dead for far longer than this. */
+const LIVENESS_GRACE_MS = 20_000;
+
+/** How long a tile must read continuously non-live before the UI is allowed to
+ *  label it dropped. `getDroppedAgents` has always had a confirm window for the
+ *  self-heal, but the badge in the panel had none — so a single unlucky poll
+ *  could flash "Dropped" on a healthy agent and then take it back. */
+const UI_DROP_CONFIRM_MS = 6_000;
+
 function isLiveState(state: TileState): boolean {
   return state !== "idle";
+}
+
+/** True when we've seen independent proof of life within the grace window.
+ *  Deliberately NOT derived from the MCP heartbeat: the server keeps a "working"
+ *  beat warm for minutes after a send_progress, so folding it in here would
+ *  resurrect the bug where a standby tile reads as Working long after its loop
+ *  ended. */
+function isRecentlyAlive(a: AgentState, now = Date.now()): boolean {
+  return a.lastAliveAt > 0 && now - a.lastAliveAt < LIVENESS_GRACE_MS;
+}
+
+/** Debounce for the UI's drop badges: the tile must have read non-live
+ *  continuously for UI_DROP_CONFIRM_MS. A genuinely dropped tile clears this
+ *  trivially — `droppedSince` is backdated when the drop was already complete on
+ *  discovery — while a healthy agent that blips for a poll or two never does. */
+function dropConfirmed(a: AgentState, now: number): boolean {
+  return a.droppedSince > 0 && now - a.droppedSince >= UI_DROP_CONFIRM_MS;
 }
 
 /** "Online" in the strict sense: actively parked in the MCP loop (held-open
@@ -48,19 +94,43 @@ function isConnectedState(state: TileState): boolean {
 /** A previously-connected tile whose MCP loop died ABRUPTLY — a "server drop"
  *  rather than a polite turn-end. There's no "Worked for…" stamp (that's the
  *  clean-cutoff case), so without this it would fall through to a plain "down"
- *  tile and never be reconnected. Confirmed by any of three signals:
- *    • mcpErrored    — a Cancelled/failed check_messages card (rendered drop).
- *    • queueCount>0  — messages stranded while the loop is no longer live (they
- *                      can't drain until something re-primes the loop).
- *    • !heartbeatAlive — the agent's heartbeat went stale. DOM-independent, so it
- *                      catches a drop even when the cancelled card has been
- *                      virtualized out of a long transcript. */
-function isServerDropped(a: AgentState): boolean {
+ *  tile and never be reconnected.
+ *
+ *  The signals fall into two tiers, and conflating them is what produced false
+ *  drops on healthy agents:
+ *
+ *  RENDERED — Cursor actually drew the death in the tile, and the CDP query
+ *  refuses to report it while the tile is generating / planning / running a
+ *  tool. Trustworthy on sight:
+ *    • mcpErrored    — a Cancelled/failed check_messages card, read from the
+ *                      card's own status attribute rather than its text.
+ *
+ *  INFERRED — absence of evidence, which is exactly what a busy agent also looks
+ *  like. Each of these is true for long stretches of perfectly normal work, so
+ *  they only count once every independent liveness signal has been quiet for
+ *  LIVENESS_GRACE_MS:
+ *    • !heartbeatAlive — the beat went stale. Only meaningful if we ever saw one:
+ *                      an agent that doesn't pass agent_id never writes a
+ *                      per-agent heartbeat, and "never existed" is not a death.
+ *    • queueCount>0  — messages stranded with no live loop to drain them. Also
+ *                      just what it looks like when the user sends something
+ *                      mid-turn.
+ *    • transcriptErrorEnd — a final `turn_ended` with status:error. Cursor only
+ *                      flushes the jsonl at turn boundaries, so early in a NEW
+ *                      turn this can still be the PREVIOUS turn's record.
+ *    • standbyCutoff — a regex for "standing by" over the tile's trailing text.
+ *                      A pattern match on a reply is not Cursor reporting a
+ *                      death: an agent that said it minutes ago and is working
+ *                      again still matches until the text scrolls out of range. */
+function isServerDropped(a: AgentState, now = Date.now()): boolean {
+  if (a.connectCount === 0 || isLiveState(a.state) || a.worked) return false;
+  if (a.mcpErrored) return true;
+  if (isRecentlyAlive(a, now)) return false;
   return (
-    a.connectCount > 0 &&
-    !isLiveState(a.state) &&
-    !a.worked &&
-    (a.mcpErrored || a.standbyCutoff || a.queueCount > 0 || !a.heartbeatAlive)
+    (a.heartbeatEverSeen && !a.heartbeatAlive) ||
+    a.queueCount > 0 ||
+    a.transcriptErrorEnd ||
+    a.standbyCutoff
   );
 }
 
@@ -89,6 +159,7 @@ function resolveState(
   mcpErrored: boolean,
   busyAlive: boolean,
   ended: boolean,
+  aliveRecently: boolean,
 ): TileState {
   // A live MCP card right now is the strongest signal.
   if (rawState === "mcp_connected") return "mcp_connected";
@@ -96,11 +167,33 @@ function resolveState(
   // agent is alive and mid-task. This wins over a stale cancelled card so an agent
   // that recovered and is working again is never misread as dropped.
   if (rawState === "generating" || rawState === "planning") return rawState;
+  // A fresh "waiting" heartbeat is CONCLUSIVE proof of life: the MCP server is
+  // blocked in check_messages for this agent right now (it beats every 2.5s and
+  // goes stale within 6s, so "fresh" can only mean "blocked moments ago"). Every
+  // "ended" signal below — a stale Cancelled card still newest while the new call
+  // re-arms, an old "Worked for…" stamp or standby text in the tail, a leftover
+  // transcript turn_ended — is necessarily history. Without this veto a parked,
+  // healthy agent whose tail ends with its own standby reply reads idle here and
+  // gets badged "Server dropped" (via standbyCutoff / queueCount) while it is
+  // literally listening. (A "working" heartbeat is only 3-min inertia and does
+  // NOT earn this veto — a real drop can happen inside that window.)
+  if (heartbeatState === "waiting") return "mcp_connected";
   // Not live now AND the last check_messages card is cancelled/failed = a real
   // drop. Overrides the MCP grace window AND the heartbeat's 3-min BUSY_WINDOW
   // inertia, both of which would otherwise keep a just-dropped tile reading live
   // (and so mask the drop) for minutes after it happened.
-  if (mcpErrored) return "idle";
+  //
+  // It must NOT override a recent busy observation, though. A Cancelled card
+  // from an earlier drop-and-recover stays in the scrollback, and the CDP query
+  // only suppresses it while the tile is visibly busy *this poll* — so during
+  // the sub-second gap between two tool calls this line used to fire on a
+  // perfectly healthy agent. The UI badge survived that (it waits for
+  // UI_DROP_CONFIRM_MS), but the resolved state still flipped to idle for a
+  // poll, which registered a disconnect: uptime reset to zero and the connect
+  // count ticked up. Deferring to the 8s busy window costs that much extra
+  // latency on a genuine drop — a dropped tile stops being busy, so the window
+  // lapses on its own — and keeps a working agent's stats intact.
+  if (mcpErrored && !busyAlive) return "idle";
   // Inside the grace window after a recent ping, hold the connection so the
   // planning/generating/idle blip between calls doesn't read as a disconnect.
   if (loopAlive) return "mcp_connected";
@@ -111,12 +204,16 @@ function resolveState(
   // (which masked the drop). During real work neither is set, so the grace/heartbeat
   // still smooth over the gaps between tool calls.
   if (busyAlive && !ended) return "generating";
-  // Only a blocked check_messages heartbeat ("waiting") may upgrade an idle CDP
-  // tile to connected. A lingering "working" heartbeat from the post-call inertia
-  // ticker must NOT keep a standby/dead tile reading as Working for minutes.
-  if (heartbeatState === "waiting" && rawState === "idle" && !ended) {
-    return "mcp_connected";
-  }
+  // Nothing in the DOM says busy, but something independent proved the agent was
+  // alive moments ago — a running tool card, or a transcript still being
+  // appended to. A CDP selector miss (virtualized tile, DOM churn, a tool card
+  // shape we don't recognise) is far more likely than an agent that produced
+  // fresh evidence of work and then instantly died, so keep it reading as busy.
+  // `ended` still vetoes: a turn with a real completion stamp is over.
+  if (aliveRecently && !ended) return "generating";
+  // (No "waiting" upgrade here — a fresh waiting heartbeat already returned
+  // conclusively above. A lingering "working" heartbeat from the post-call
+  // inertia ticker must NOT keep a standby/dead tile reading as Working.)
   return rawState;
 }
 
@@ -143,6 +240,12 @@ export interface AgentState {
    *  a tool). Drives the busy-grace window that keeps a working tile from
    *  flickering to idle between tool calls. */
   lastBusyAt: number;
+  /** Epoch ms of the last INDEPENDENT proof this agent was doing something: a
+   *  live MCP card, a busy tile, a running tool card, or a transcript that grew
+   *  without ending. Excludes the MCP heartbeat on purpose (see isRecentlyAlive).
+   *  Gates every inferred drop signal, so a quiet-but-working agent can't be
+   *  called dropped by absence of evidence alone. */
+  lastAliveAt: number;
   /** Total times this agent has connected to MCP. */
   connectCount: number;
   /** Times we've attempted to reconnect this agent. */
@@ -163,6 +266,11 @@ export interface AgentState {
    *  (no blocked check_messages) — the loop is cut even without a "Worked for…"
    *  stamp or a restored composer draft. */
   standbyCutoff: boolean;
+  /** Newest tool-card labels rendered in the tile — the only live, mid-turn view
+   *  of what this agent is doing (the transcript isn't flushed until turn end). */
+  liveTools: string[];
+  /** True while the newest tool card is still running. */
+  liveToolRunning: boolean;
   /** True when a jefr check_messages card is in a cancelled/failed state — the
    *  server-drop fingerprint: the held-open call died WITHOUT a clean turn-end,
    *  so there's no "Worked for…" stamp. Used to catch a drop that would otherwise
@@ -174,6 +282,17 @@ export interface AgentState {
    *  cancelled card out of the transcript: a previously-connected tile that is no
    *  longer live AND whose heartbeat has gone stale = its loop died. */
   heartbeatAlive: boolean;
+  /** True once this agent has written a per-agent heartbeat at least once. An
+   *  agent that never passes `agent_id` writes only the shared root beat, so its
+   *  per-agent file never appears — without this, "no heartbeat" would read as a
+   *  permanent drop for every such tile. */
+  heartbeatEverSeen: boolean;
+  /** True when the Cursor agent transcript's *last* record is turn_ended with a
+   *  non-success status (error / abort / auth / policy). Hard dead signal. */
+  transcriptErrorEnd: boolean;
+  /** True when the transcript's last record is turn_ended with status success —
+   *  clean turn finish (same role as a "Worked for…" stamp). */
+  transcriptCleanEnd: boolean;
   /** Epoch ms this agent was last seen in a tile. Drives the forget window so
    *  vanished tiles don't linger in the map forever. */
   lastSeen: number;
@@ -258,14 +377,75 @@ export class TileStateManager {
       const rawBusy = tile.state === "generating" || tile.state === "planning";
       const lastBusyAt = rawBusy ? now : existing?.lastBusyAt ?? 0;
       const busyAlive = lastBusyAt > 0 && now - lastBusyAt < BUSY_GRACE_MS;
+      const heartbeatAlive = heartbeatStates.has(id);
+      const heartbeatEverSeen = heartbeatAlive || !!existing?.heartbeatEverSeen;
+      // Transcript turn_ended is only a *confirming* death signal. Fresh MCP
+      // heartbeat or a visibly busy tile (generating / planning / live MCP card)
+      // means the agent is still working — don't flip to dropped mid-turn.
+      // (False positive we hit: leftover turn_ended + busy agent ⇒ "Dropped".)
+      const turnEnd = id.startsWith("tile:")
+        ? { ended: false as const, mtimeMs: undefined }
+        : getTranscriptTurnEnd(id);
+      // A transcript that grew without ending the turn means Cursor is still
+      // checkpointing this agent's work — proof of life that survives any
+      // DOM/selector problem. Stamped with the file's own mtime rather than the
+      // time we noticed it, so the grace window measures from when the agent
+      // actually did something.
+      const transcriptAliveAt =
+        !turnEnd.ended && turnEnd.mtimeMs !== undefined ? turnEnd.mtimeMs : 0;
+      const domAliveNow = rawMcp || rawBusy || !!tile.liveToolRunning;
+      // Cursor's own record of the conversation. Unlike everything above it
+      // keeps updating while the agent works quietly and with no Agents window
+      // open, so it covers the exact gap that produced false drops. Returns 0
+      // when the store isn't readable — never treated as evidence of death.
+      const composerAliveAtMs = composerAliveAt(id);
+      const lastAliveAt = Math.max(
+        domAliveNow ? now : 0,
+        transcriptAliveAt,
+        composerAliveAtMs,
+        existing?.lastAliveAt ?? 0,
+      );
+      const aliveRecently =
+        lastAliveAt > 0 && now - lastAliveAt < LIVENESS_GRACE_MS;
+      // Two extra guards beyond the original busy/heartbeat checks:
+      //   • `busyAlive` instead of `rawBusy` — a turn_ended left over from the
+      //     previous turn must not win during the sub-second gap between two
+      //     tool calls, which is exactly when rawBusy is false.
+      //   • the record must not predate our last proof of life. If the agent was
+      //     demonstrably working AFTER the file was last written, then what's in
+      //     the file describes an older turn, not this one.
+      const transcriptConfirmed =
+        turnEnd.ended &&
+        !heartbeatAlive &&
+        !busyAlive &&
+        !rawMcp &&
+        !aliveRecently &&
+        (turnEnd.mtimeMs ?? 0) >= lastAliveAt;
+      const transcriptCleanEnd =
+        transcriptConfirmed && turnEnd.status === "success";
+      const transcriptErrorEnd =
+        transcriptConfirmed && turnEnd.status !== "success";
+      const turnOver =
+        tile.worked ||
+        tile.draftPending ||
+        tile.standbyCutoff ||
+        transcriptConfirmed;
       const state = resolveState(
         tile.state,
         heartbeatStates.get(id),
         loopAlive,
-        tile.mcpErrored,
+        tile.mcpErrored || transcriptErrorEnd,
         busyAlive,
-        tile.worked || tile.draftPending || tile.standbyCutoff,
+        turnOver,
+        aliveRecently,
       );
+      // Clean transcript end counts as a "Worked for…" equivalent. The error end
+      // still forces the state to idle, but it is NOT folded into the stored
+      // `mcpErrored`: that field means "Cursor rendered a cancelled card", which
+      // isServerDropped trusts on sight, and an inferred transcript verdict has
+      // not earned that. It stays available as its own, grace-gated signal.
+      const worked = tile.worked || transcriptCleanEnd;
+      const mcpErrored = tile.mcpErrored;
       if (!existing) {
         // New agent discovered
         const newState: AgentState = {
@@ -278,21 +458,28 @@ export class TileStateManager {
           connectedSince: isConnectedState(state) ? now : 0,
           lastMcpAt,
           lastBusyAt,
+          lastAliveAt,
           // A "Worked for…" completion stamp proves the tile already ran a full
           // MCP turn, so even if we never caught it live (it finished before our
           // first poll, or was adopted via Refresh after the turn ended) it has
           // connected at least once. Seed connectCount so the present stamp can
           // classify it as a re-primeable "Dropped" tile instead of falling
           // through to a plain, unreconnectable "Down".
-          connectCount: isConnectedState(state) || tile.worked ? 1 : 0,
+          connectCount:
+            isConnectedState(state) || worked || transcriptConfirmed ? 1 : 0,
           reconnectCount: 0,
           reconnectStreak: 0,
           lastReconnectAt: 0,
-          worked: tile.worked,
+          worked,
           draftPending: tile.draftPending,
           standbyCutoff: tile.standbyCutoff,
-          mcpErrored: tile.mcpErrored,
-          heartbeatAlive: heartbeatStates.has(id),
+          liveTools: tile.liveTools ?? [],
+          liveToolRunning: tile.liveToolRunning ?? false,
+          mcpErrored,
+          heartbeatAlive,
+          heartbeatEverSeen,
+          transcriptErrorEnd,
+          transcriptCleanEnd,
           lastSeen: now,
           lastConnectedMs: 0,
           droppedSince: 0,
@@ -316,13 +503,19 @@ export class TileStateManager {
         existing.tileIndex = tile.index;
         existing.model = tile.model;
         existing.queueCount = queueCounts.get(id) || 0;
-        existing.worked = tile.worked;
+        existing.worked = worked;
         existing.draftPending = tile.draftPending;
         existing.standbyCutoff = tile.standbyCutoff;
-        existing.mcpErrored = tile.mcpErrored;
-        existing.heartbeatAlive = heartbeatStates.has(id);
+        existing.liveTools = tile.liveTools ?? [];
+        existing.liveToolRunning = tile.liveToolRunning ?? false;
+        existing.mcpErrored = mcpErrored;
+        existing.heartbeatAlive = heartbeatAlive;
+        existing.heartbeatEverSeen = heartbeatEverSeen;
+        existing.transcriptErrorEnd = transcriptErrorEnd;
+        existing.transcriptCleanEnd = transcriptCleanEnd;
         existing.lastMcpAt = lastMcpAt;
         existing.lastBusyAt = lastBusyAt;
+        existing.lastAliveAt = lastAliveAt;
         existing.lastSeen = now;
 
         if (prevState !== state) {
@@ -380,7 +573,7 @@ export class TileStateManager {
         // classifications (gated on connectCount > 0) stay suppressed and the
         // cleanly cut-off tile is mis-shown as plain "Down" and skipped by
         // auto-reconnect.
-        if (existing.connectCount === 0 && tile.worked) {
+        if (existing.connectCount === 0 && (worked || transcriptConfirmed)) {
           existing.connectCount = 1;
         }
 
@@ -422,6 +615,7 @@ export class TileStateManager {
         agent.connectedSince = 0;
         agent.lastMcpAt = 0;
         agent.lastBusyAt = 0;
+        agent.lastAliveAt = 0;
         agent.worked = false;
         agent.draftPending = false;
         agent.standbyCutoff = false;
@@ -496,7 +690,7 @@ export class TileStateManager {
       // Not currently live (MCP loop, working heartbeat, generating, or planning)
       !isLiveState(a.state) &&
       // A clean cut-out (completion stamp) OR an abrupt server drop.
-      (a.worked || a.draftPending || isServerDropped(a)) &&
+      (a.worked || a.draftPending || a.transcriptCleanEnd || isServerDropped(a)) &&
       // CONFIRM window: only act on a tile that has stayed dropped for at least
       // `confirmMs` (0 = act immediately, used by the manual "Close dropped").
       (confirmMs <= 0 ||
@@ -548,8 +742,16 @@ export class TileStateManager {
 
   /** Convert agent state to the view format expected by the webview. */
   toAgentViews(): AgentView[] {
+    const now = Date.now();
+    // Stable order: first-seen, then id. Do NOT sort by live tileIndex — Cursor
+    // pane order and CDP discovery order flap, which made the Agents pool list
+    // reshuffle every poll.
     return this.getAgents()
       .filter((a) => a.tileIndex >= 0) // Only show visible agents
+      .sort(
+        (a, b) =>
+          a.firstSeen - b.firstSeen || a.agentId.localeCompare(b.agentId),
+      )
       .map((a) => ({
         id: a.agentId,
         // "connected" = a live state AND the tile has actually reached the MCP
@@ -564,11 +766,18 @@ export class TileStateManager {
         state: a.state as AgentView["state"],
         // A clean cut-out: previously connected, now idle, "Worked for..."
         // stamp present. Lets the UI show a distinct reconnectable state.
-        dropped: a.connectCount > 0 && !isLiveState(a.state) && (a.worked || a.draftPending),
+        dropped:
+          dropConfirmed(a, now) &&
+          a.connectCount > 0 &&
+          !isLiveState(a.state) &&
+          (a.worked || a.draftPending || a.transcriptCleanEnd),
         // An abrupt server drop (no clean stamp) — surfaced separately so the UI
         // can flag it distinctly from a polite cut-off. Synthetic slot ids can't
         // be re-primed, so never mark them.
-        serverDropped: !a.agentId.startsWith("tile:") && isServerDropped(a),
+        serverDropped:
+          dropConfirmed(a, now) &&
+          !a.agentId.startsWith("tile:") &&
+          isServerDropped(a, now),
         queueCount: a.queueCount,
         connectCount: a.connectCount,
         reconnectCount: a.reconnectCount,
@@ -579,6 +788,21 @@ export class TileStateManager {
         lastConnectedMs: a.lastConnectedMs,
         model: a.model,
         tileIndex: a.tileIndex,
+        // Three tiers, best first:
+        //   1. live tile cards  — instant, but only while the Agents window is up
+        //   2. Cursor's bubbles — always available, about 30s behind
+        //   3. the transcript   — only ever describes finished turns
+        // The transcript is last because it isn't flushed mid-turn, so for a
+        // long-running agent it would otherwise describe the *previous* turn.
+        activity: mergeLiveActivity(
+          a.agentId,
+          a.liveTools,
+          a.liveToolRunning,
+          activityFromDb(
+            getComposerActivity(a.agentId),
+            getTranscriptActivity(a.agentId),
+          ),
+        ),
       }));
   }
 }
@@ -607,4 +831,6 @@ export interface AgentView {
   lastConnectedMs: number;
   model: string;
   tileIndex: number;
+  /** Live "what is this agent doing?" from the Cursor transcript tail. */
+  activity?: TranscriptActivity;
 }

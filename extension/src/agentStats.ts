@@ -36,6 +36,21 @@ export interface ReconcileOpts {
   forgetMs: number;
   /** Max auto-reconnect attempts between successful landings before giving up. */
   maxReconnects: number;
+  /**
+   * Epoch ms of the last INDEPENDENT proof this agent was doing something, from
+   * a source that doesn't depend on the MCP heartbeat — in practice Cursor's own
+   * `composerData` record. Return 0 for "no information".
+   *
+   * This exists because the heartbeat is only refreshed while an agent is parked
+   * in check_messages (or just after send_progress). An agent that takes a
+   * message and then works quietly refreshes nothing, goes stale in 6s, and used
+   * to be classified as dropped — which, with Keep enabled, re-primed its tile
+   * **while it was mid-task**. Injected as a callback so this module stays pure
+   * and directly testable.
+   */
+  externalAliveAt?: (id: string) => number;
+  /** How recent `externalAliveAt` must be to veto a drop. */
+  externalAliveGraceMs?: number;
 }
 
 export interface AgentView extends RosterEntry {
@@ -96,9 +111,19 @@ export function reconcile(
       s.connectedSince = 0;
     }
 
+    // Independent proof of work, from outside the heartbeat. A busy agent stops
+    // heartbeating, so without this every quiet working stretch looks like death.
+    const extAt = opts.externalAliveAt ? opts.externalAliveAt(r.id) : 0;
+    const extGrace = opts.externalAliveGraceMs ?? 0;
+    const busyElsewhere = extAt > 0 && extGrace > 0 && now - extAt < extGrace;
+
     // Best estimate of when this agent was last alive: its heartbeat timestamp
-    // (survives extension restarts) or the last time we saw it fresh.
-    const lastAlive = r.ts > 0 ? Math.max(r.ts, s.lastSeen) : s.lastSeen;
+    // (survives extension restarts), the last time we saw it fresh, or Cursor's
+    // own record of the conversation advancing.
+    const lastAlive = Math.max(
+      r.ts > 0 ? Math.max(r.ts, s.lastSeen) : s.lastSeen,
+      extAt,
+    );
 
     // Tombstone: disconnected and either never had a heartbeat or has been gone
     // longer than the forget window. Drop it from the roster and report it for
@@ -111,7 +136,10 @@ export function reconcile(
     views.push({
       id: r.id,
       connected: r.connected,
-      state: r.state,
+      // A stale heartbeat while Cursor is still advancing the conversation means
+      // the agent is WORKING, not idle. Reporting it accurately is what stops the
+      // panel showing a busy agent as down.
+      state: !r.connected && busyElsewhere ? "working" : r.state,
       queueCount: r.queueCount,
       connectCount: s.connectCount,
       reconnectCount: s.reconnectCount,
@@ -120,8 +148,12 @@ export function reconcile(
 
     // Eligible for auto-reconnect: recently dropped, has connected before, and
     // hasn't exhausted the attempt cap since its last successful landing.
+    // `busyElsewhere` vetoes it — re-priming a tile that is mid-task would
+    // interrupt real work, which is far worse than reconnecting a few seconds
+    // late once the agent genuinely does go quiet.
     if (
       !r.connected &&
+      !busyElsewhere &&
       s.connectCount > 0 &&
       s.reconnectsSinceConnect < opts.maxReconnects
     ) {

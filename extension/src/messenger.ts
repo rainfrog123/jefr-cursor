@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { isTranscriptDeadConfirmed } from "./agentTranscript";
 
 // ── Shared types ────────────────────────────────────────────────────────────
 
@@ -313,20 +314,31 @@ export function getAgentStatus(): AgentStatus {
 /** Read heartbeat for a specific agent (or the shared root when blank). */
 export function getAgentStatusFor(agentId?: string): AgentStatus {
   const file = path.join(agentDirFor(agentId), "agent-alive.json");
+  let heartbeatAlive = false;
+  let state: AgentLivenessState = "idle";
   try {
-    if (!fs.existsSync(file)) {
-      return { alive: false, state: "idle" };
+    if (fs.existsSync(file)) {
+      const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+      const ts = typeof data.ts === "number" ? data.ts : 0;
+      if (Date.now() - ts < AGENT_STALE_MS) {
+        heartbeatAlive = true;
+        state = data.state === "working" ? "working" : "waiting";
+      }
     }
-    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
-    const ts = typeof data.ts === "number" ? data.ts : 0;
-    if (Date.now() - ts >= AGENT_STALE_MS) {
-      return { alive: false, state: "idle" };
-    }
-    const state: AgentLivenessState = data.state === "working" ? "working" : "waiting";
-    return { alive: true, state };
   } catch {
+    // treat as no heartbeat
+  }
+
+  // Transcript `turn_ended` only confirms death when the MCP heartbeat is also
+  // gone. A fresh heartbeat means the loop is still up (or a new turn already
+  // re-entered check_messages) — don't flip the tile to dropped mid-work.
+  if (agentId && isTranscriptDeadConfirmed(agentId, heartbeatAlive)) {
     return { alive: false, state: "idle" };
   }
+  if (heartbeatAlive) {
+    return { alive: true, state };
+  }
+  return { alive: false, state: "idle" };
 }
 
 // ── Shared chat history (sends from any front-end; rendered by all) ──────────
@@ -926,13 +938,16 @@ export function listLiveAgents(maxAgeMs = AGENT_STALE_MS): LiveAgent[] {
       if (Date.now() - ts > maxAgeMs) {
         continue;
       }
+      // Fresh heartbeat wins over a leftover transcript turn_ended — the agent
+      // is in the MCP loop (or mid-reentry). Death is confirmed elsewhere when
+      // BOTH transcript ended AND heartbeat went stale.
       const state: AgentLivenessState = data.state === "working" ? "working" : "waiting";
       out.push({ id, state, ts, queueCount: getQueueCountFor(id) });
     } catch {
       // skip unreadable/partial heartbeat
     }
   }
-  out.sort((a, b) => b.ts - a.ts);
+  out.sort((a, b) => a.id.localeCompare(b.id));
   return out;
 }
 
@@ -975,7 +990,12 @@ export function scanAllAgents(maxAgeMs = AGENT_STALE_MS): AgentRosterEntry[] {
     } catch {
       // no/partial heartbeat — treat as disconnected
     }
-    const connected = ts > 0 && Date.now() - ts <= maxAgeMs;
+    // Fresh heartbeat ⇒ connected. A leftover transcript turn_ended must NOT
+    // force disconnect while the MCP loop is still heartbeating (false "dropped"
+    // while the agent is mid-work). Confirm death only when HB is stale too.
+    const hbFresh = ts > 0 && Date.now() - ts <= maxAgeMs;
+    const connected =
+      hbFresh && !isTranscriptDeadConfirmed(id, hbFresh);
     out.push({
       id,
       connected,
@@ -984,7 +1004,7 @@ export function scanAllAgents(maxAgeMs = AGENT_STALE_MS): AgentRosterEntry[] {
       queueCount: getQueueCountFor(id),
     });
   }
-  out.sort((a, b) => b.ts - a.ts);
+  out.sort((a, b) => a.id.localeCompare(b.id));
   return out;
 }
 

@@ -34,7 +34,7 @@ The plugin installs `.cursor/rules/mcp-messenger.mdc` into workspaces. The Engli
 
 **Remote SSH / VPS** variant lives in a separate repo:
 
-- Local: `C:\Users\jar71\Downloads\jefr-cursor-ssh`
+- Local: `C:\Users\jar71\Music\Tools\jefr-cursor-ssh`
 - GitHub: https://github.com/rainfrog123/jefr-cursor-ssh
 
 This repo’s `multi-agent-local` branch is the local-only line. The old `multi-agent-ssh` branch was removed after the split.

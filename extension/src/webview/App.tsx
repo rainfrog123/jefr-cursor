@@ -112,7 +112,8 @@ export function App(): JSX.Element {
   const [targetAgentCount, setTargetAgentCount] = useState(5);
   const [workflowModel, setWorkflowModel] = useState<string>(DEFAULT_WORKFLOW_MODEL);
   const [skipAutoPhase, setSkipAutoPhase] = useState(false);
-  const [singleAgentMode, setSingleAgentMode] = useState(false);
+  /** Pass agent_id on spawn — off by default (shared General queue). */
+  const [passAgentId, setPassAgentId] = useState(false);
   const [workflowModels, setWorkflowModels] = useState<string[]>([
     ...FALLBACK_WORKFLOW_MODELS,
   ]);
@@ -220,8 +221,10 @@ export function App(): JSX.Element {
           if (typeof msg.skipAutoPhase === "boolean") {
             setSkipAutoPhase(msg.skipAutoPhase);
           }
-          if (typeof msg.singleAgentMode === "boolean") {
-            setSingleAgentMode(msg.singleAgentMode);
+          if (typeof msg.passAgentId === "boolean") {
+            setPassAgentId(msg.passAgentId);
+          } else if (typeof msg.singleAgentMode === "boolean") {
+            setPassAgentId(!msg.singleAgentMode);
           }
           if (msg.cdpConnected !== undefined) setCdpConnected(msg.cdpConnected);
           setConnectingAgentId(msg.connectingAgentId ?? null);
@@ -312,9 +315,7 @@ export function App(): JSX.Element {
     }
     if (agents.length === 0) return;
     didAutoSelect.current = true;
-    const first = [...agents].sort(
-      (a, b) => (a.tileIndex ?? 0) - (b.tileIndex ?? 0),
-    )[0];
+    const first = [...agents].sort((a, b) => a.id.localeCompare(b.id))[0];
     setSelectedAgentId(first.id);
     post({ type: "selectAgent", agentId: first.id });
   }, [agents, selectedAgentId]);
@@ -391,9 +392,9 @@ export function App(): JSX.Element {
     post({ type: "setSkipAutoPhase", enabled });
   }, []);
 
-  const onSetSingleAgentMode = useCallback((enabled: boolean) => {
-    setSingleAgentMode(enabled);
-    post({ type: "setSingleAgentMode", enabled });
+  const onSetPassAgentId = useCallback((enabled: boolean) => {
+    setPassAgentId(enabled);
+    post({ type: "setPassAgentId", enabled });
   }, []);
 
   const onRefreshModels = useCallback(() => {
@@ -495,6 +496,7 @@ export function App(): JSX.Element {
       {tab === "agents" && agentView === "detail" && (
         <AgentDetail
           agent={detailAgent}
+          agents={agents}
           connectingAgentId={connectingAgentId}
           workflowRunning={workflowRunning}
           sharedQueueCount={sharedRootCount}
@@ -527,8 +529,8 @@ export function App(): JSX.Element {
           onModelChange={onSetWorkflowModel}
           skipAutoPhase={skipAutoPhase}
           onSkipAutoChange={onSetSkipAutoPhase}
-          singleAgentMode={singleAgentMode}
-          onSingleAgentChange={onSetSingleAgentMode}
+          passAgentId={passAgentId}
+          onPassAgentIdChange={onSetPassAgentId}
           workflowModels={workflowModels}
           workflowModelsRefreshing={workflowModelsRefreshing}
           workflowModelsError={workflowModelsError}

@@ -10,7 +10,7 @@ These lived under `C:\Users\jar71\Downloads\` next to this repo. They were **not
 
 **Where:**
 
-- Local: `C:\Users\jar71\Downloads\jefr-cursor-ssh`
+- Local: `C:\Users\jar71\Music\Tools\jefr-cursor-ssh`
 - GitHub: https://github.com/rainfrog123/jefr-cursor-ssh
 
 **Removed from this repo:** local + `origin/multi-agent-ssh` (tip was `fe0e070`).

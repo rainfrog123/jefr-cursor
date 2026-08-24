@@ -31372,6 +31372,7 @@ ${firstText.text}`;
           }
           await appendServerLog("info", `check_messages delivered ${queue.length} queued item(s)`);
           lastInteractionTs = Date.now();
+          live.lastBusyTs = Date.now();
           return { content: results };
         }
         if (Date.now() - waitStart >= MAX_WAIT_MS) {

@@ -5,3 +5,6 @@ node_modules/
 *.orig.bak
 __pycache__/
 *.pyc
+
+# Synced copy for VSIX packaging (source of truth is /automation)
+extension/automation/

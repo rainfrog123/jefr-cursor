@@ -49,6 +49,23 @@ export interface TileInfo {
   /** True when this tile shows the "Payment failed … Manage Billing" banner — the
    *  account's billing is blocked, so the tile can't run. Auto-closed on sight. */
   billingBlocked: boolean;
+  /**
+   * Labels of the most recent tool cards rendered in this tile, oldest → newest.
+   *
+   * This is the ONLY live, mid-turn view of what an agent is doing. Cursor does
+   * not flush the `.jsonl` transcript until a turn ends — a jefr agent parked in
+   * the perpetual MCP loop can run for hours with nothing written to disk — so
+   * the transcript can only ever describe *previous* turns. The tile DOM renders
+   * each tool card as it happens, which is what the panel needs.
+   *
+   * Empty when the selectors don't match (Cursor's DOM is private and drifts
+   * between builds); callers must degrade to the transcript, never assume this.
+   */
+  liveTools: string[];
+  /** True when the newest tool card is still running. */
+  liveToolRunning: boolean;
+  /** Live status-bar / follow-up text, e.g. "Worked for 3m 12s". */
+  statusText: string;
 }
 
 export interface CdpStatus {
@@ -892,22 +909,29 @@ export class CdpMonitor extends EventEmitter {
 
     const mcpRunning = mcpRunningIn(t);
     const toolWorking = toolWorkingIn(t);
+    // Visibly busy this poll — the strongest life signal. Every "ended" signal
+    // below is gated on its absence: a live MCP card, generation, planning, or a
+    // running tool means any cancelled card / stamp / standby text is stale.
+    const busyNow = mcpRunning || generating || planning || toolWorking;
     // A cancelled-card drop only counts when the tile isn't otherwise busy — an
     // agent that recovered and is generating / running a tool again must not read
     // as dropped from a stale "Cancelled" card left up the transcript.
-    const mcpErrored =
-      !mcpRunning && !generating && !planning && !toolWorking && mcpErroredIn(t);
+    const mcpErrored = !busyNow && mcpErroredIn(t);
 
-    // "Worked for ..." completion stamp = the turn ended (MCP cut out). Prefer the
-    // live status/followup area; fall back to the recent tail. We do NOT scan the
-    // whole transcript, so an old stamp from a prior turn won't mark a live tile.
+    // "Worked for ..." completion stamp = the turn ended (MCP cut out). Trust the
+    // live status/followup area directly. The tail fallback only counts when the
+    // stamp sits at the very END of the visible text: during a new turn the
+    // previous turn's stamp is still inside the last 400 chars (above the fresh
+    // content), and an unanchored match flipped working agents to "Dropped".
     const statusText = [
       ...[...t.querySelectorAll('.glass-chat-status-bar__segment-label')].map(e => e.textContent || ''),
       t.querySelector('.agent-panel-followup-status-area')?.textContent || '',
     ].join(' ').replace(/\\s+/g, ' ').trim();
     const full = (t.innerText || '').replace(/\\s+/g, ' ');
     const tail = full.length > 400 ? full.slice(-400) : full;
-    const worked = /worked for\\s+[\\dhms ]+/i.test(statusText) || /worked for\\s+[\\dhms ]+/i.test(tail);
+    const worked =
+      !busyNow &&
+      (/worked for\\s+[\\dhms ]+/i.test(statusText) || /worked for\\s+[\\dhms ]+\\s*$/i.test(tail));
 
     // Restored-draft signal: when a held-open turn dies, Cursor puts the un-sent
     // prompt back into the composer. A tile sitting idle with the injected spawn
@@ -921,18 +945,53 @@ export class CdpMonitor extends EventEmitter {
       || t.querySelector('.tiptap.ProseMirror');
     const draftText = ((draftEl && draftEl.textContent) || '').trim();
     const draftPending =
-      !generating && !planning && !mcpRunning && !toolWorking &&
+      !busyNow &&
       draftText.length > 0 &&
       /keep the mcp connection|stand by|check\\s*messages|agent_id|invoke the mcp|call the mcp directly/i.test(draftText);
 
     // Standby-in-transcript: the agent replied "standing by / waiting" and stopped
     // re-calling check_messages. Catches the drop even when the composer is empty
     // and there's no "Worked for…" stamp — the case that kept reading as Working.
+    // Anchored to the END of the visible text: once a new turn starts, fresh
+    // content follows the standby reply and pushes it out of this window — an
+    // unanchored match kept flagging working agents as "Server dropped".
     const standbyCutoff =
-      !generating && !planning && !mcpRunning && !toolWorking &&
-      /standing\\s+by|waiting for your next instruction/i.test(tail);
+      !busyNow &&
+      /standing\\s+by|waiting for your next (instruction|message)/i.test(tail.slice(-200));
 
     const model = modelOf(t);
+
+    // Live tool-card feed — what this agent is doing RIGHT NOW. Cursor buffers
+    // the .jsonl transcript until a turn ends, so for a long-running agent this
+    // DOM read is the only source of in-turn activity. Best-effort by design:
+    // wrapped so a selector change degrades to an empty list instead of taking
+    // down the whole tile query.
+    let liveTools = [];
+    let liveToolRunning = false;
+    try {
+      const cards = [...t.querySelectorAll('[data-message-kind="tool"]')];
+      const recent = cards.slice(-10);
+      for (const m of recent) {
+        // Card text starts with its status word ("Ran"/"Running"/"Cancelled"),
+        // then the action. Strip the status so the label reads as the action.
+        let txt = (m.textContent || '').replace(/\\s+/g, ' ').trim();
+        txt = txt.replace(/^(ran|running|cancelled|canceled|failed|errored|aborted|rejected|pending|queued)\\s*/i, '');
+        if (!txt) continue;
+        liveTools.push(txt.slice(0, 120));
+      }
+      const last = cards[cards.length - 1];
+      if (last) {
+        const st = (last.getAttribute('data-tool-status') || '').toLowerCase();
+        const cls = typeof last.className === 'string' ? last.className : '';
+        liveToolRunning =
+          /run|load|pend|progress|stream|active/.test(st) ||
+          /with-stop/.test(cls) ||
+          !!last.querySelector('[class*="shimmer"],[class*="spinner"],.codicon-modifier-spin,[data-state="stop"]');
+      }
+    } catch (e) {
+      liveTools = [];
+      liveToolRunning = false;
+    }
 
     // Billing-blocked banner: "Payment failed … Manage Billing" (a .ui-short-tray
     // with a Manage Billing button). Scoped to short tray/button text so a chat
@@ -969,6 +1028,9 @@ export class CdpMonitor extends EventEmitter {
       draftPending,
       standbyCutoff,
       billingBlocked,
+      liveTools,
+      liveToolRunning,
+      statusText: statusText.slice(0, 160),
     };
     });
 })()

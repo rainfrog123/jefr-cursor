@@ -1,0 +1,17 @@
+# Keep VSIX lean; automation/ is synced in and must ship.
+.vscode/**
+.vscode-test/**
+node_modules/**
+src/**
+mcp-server/**
+scripts/**
+**/*.ts
+**/*.tsx
+**/*.map
+**/*.vsix
+**/*.bak
+**/*.orig.bak
+validate_*.mjs
+package-lock.json
+preview-console.html
+HOW_IT_WORKS.md

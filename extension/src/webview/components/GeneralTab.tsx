@@ -32,9 +32,9 @@ export function GeneralTab(props: {
   /** Skip Auto stand-by phase on spawn (persisted host-side). */
   skipAutoPhase: boolean;
   onSkipAutoChange: (enabled: boolean) => void;
-  /** Omit agent_id from MCP prompt — shared General queue (persisted). */
-  singleAgentMode: boolean;
-  onSingleAgentChange: (enabled: boolean) => void;
+  /** Inject agent_id into the MCP prompt (persisted). Off = shared General queue. */
+  passAgentId: boolean;
+  onPassAgentIdChange: (enabled: boolean) => void;
   /** Live / persisted picker rows from the host (CDP refresh). */
   workflowModels: string[];
   workflowModelsRefreshing?: boolean;
@@ -56,8 +56,8 @@ export function GeneralTab(props: {
     onModelChange,
     skipAutoPhase,
     onSkipAutoChange,
-    singleAgentMode,
-    onSingleAgentChange,
+    passAgentId,
+    onPassAgentIdChange,
     workflowModels,
     workflowModelsRefreshing,
     workflowModelsError,
@@ -101,8 +101,9 @@ export function GeneralTab(props: {
       model: model.trim() || undefined,
       // Spawns always accumulate — reconnect/keep live on each dropped tile.
       keepTiles: true,
-      skipAuto: skipAutoPhase || singleAgentMode,
-      singleAgent: singleAgentMode,
+      // Shared queue (Pass agent_id off) implies Skip Auto.
+      skipAuto: skipAutoPhase || !passAgentId,
+      singleAgent: !passAgentId,
     });
   };
 
@@ -171,27 +172,27 @@ export function GeneralTab(props: {
           )}
           <label
             className="workflow-opt"
-            title="Skip phase 1 (select Auto + stand-by). Select the target model immediately, then MCP-prime. Implied by Single agent."
+            title="Skip phase 1 (select Auto + stand-by). Select the target model immediately, then MCP-prime. Implied when Pass agent_id is off."
           >
             <input
               type="checkbox"
-              checked={skipAutoPhase || singleAgentMode}
-              disabled={workflowRunning || singleAgentMode}
+              checked={skipAutoPhase || !passAgentId}
+              disabled={workflowRunning || !passAgentId}
               onChange={(e) => onSkipAutoChange(e.target.checked)}
             />
             Skip Auto
           </label>
           <label
             className="workflow-opt"
-            title="Single agent / shared queue: skip Auto stand-by, omit agent_id from the MCP prompt, and use General · shared (not a per-agent queue)."
+            title="When on, spawn/reconnect appends: You are jefr agent <id>; pass agent_id:'<id>' on every jefr MCP call. Off = shared General queue (omit agent_id)."
           >
             <input
               type="checkbox"
-              checked={singleAgentMode}
+              checked={passAgentId}
               disabled={workflowRunning}
-              onChange={(e) => onSingleAgentChange(e.target.checked)}
+              onChange={(e) => onPassAgentIdChange(e.target.checked)}
             />
-            Single agent
+            Pass agent_id
           </label>
         </div>
 

@@ -601,6 +601,19 @@ server.tool(
 
           await appendServerLog("info", `check_messages delivered ${queue.length} queued item(s)`);
           lastInteractionTs = Date.now();
+          // Handing real messages to the agent means it is about to WORK, and
+          // work is exactly when nothing else refreshes this heartbeat: the
+          // ticker below only keeps an agent warm while `lastBusyTs` is recent,
+          // and until now that was set by `send_progress` alone. An agent that
+          // took a message and then just worked — no progress calls — went
+          // stale in 6s and the panel showed it as dropped mid-task, which with
+          // Keep enabled could re-prime a tile that was busy doing real work.
+          //
+          // This is NOT the case the `finally` block below warns about. That one
+          // is a wait that ended with nothing delivered (timeout or cancel), and
+          // must not buy inertia. A confirmed delivery is the opposite: proof
+          // that a task just started.
+          live.lastBusyTs = Date.now();
           return { content: results };
         }
 

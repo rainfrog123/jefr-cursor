@@ -84,6 +84,55 @@ import {
 } from "./agentStats";
 import { getCdpMonitor, stopCdpMonitor, type CdpStatus } from "./cdp-monitor";
 import { TileStateManager, type AgentView } from "./tile-state";
+import {
+  clearTranscriptCache,
+  getTranscriptActivity,
+  setTranscriptWorkspaceRoots,
+  stopTranscriptWatchers,
+  syncTranscriptWatchers,
+} from "./agentTranscript";
+import type { TranscriptActivity } from "./agentTranscript";
+import { composerAliveAt, isComposerStateAvailable } from "./composerState";
+
+/**
+ * How recently Cursor's own conversation record must have advanced for an agent
+ * to count as alive despite a stale MCP heartbeat.
+ *
+ * Sized from measurement: across 20 agents, live ones checkpointed within
+ * 29–131s while dead ones were 4,191s+ — a ~30x gap. Five minutes sits well
+ * inside it, so it tolerates a slow checkpoint without ever rescuing a corpse.
+ */
+const COMPOSER_ALIVE_GRACE_MS = 5 * 60_000;
+
+/** Prefer a fresh jefr reply/progress line when the transcript tail is still on
+ *  GetMcpTools / Listening — so the Agents list shows what the agent said it's
+ *  doing without watching the Cursor tile. */
+function liveActivityFor(agentId: string): TranscriptActivity | undefined {
+  const tr = getTranscriptActivity(agentId);
+  const reply = readReplyFor(agentId);
+  const content = reply?.content?.replace(/\s+/g, " ").trim();
+  if (!content) return tr;
+  const boring =
+    !tr ||
+    /^(Listening \(MCP\)|Checking MCP tools|No transcript activity yet)/i.test(
+      tr.summary,
+    );
+  if (!boring) return tr;
+  // Keep the transcript's own feed/step data — only the headline is replaced,
+  // because what the agent *told* the panel beats a bookkeeping tool call.
+  return {
+    summary: content.slice(0, 140),
+    tools: tr?.tools ?? [],
+    steps: tr?.steps ?? [],
+    stepCount: tr?.stepCount ?? 0,
+    stepCountPartial: tr?.stepCountPartial ?? false,
+    since: tr?.since,
+    ended: tr?.ended ?? false,
+    endStatus: tr?.endStatus,
+    error: tr?.error,
+    mtimeMs: tr?.mtimeMs,
+  };
+}
 
 // ── Module state ────────────────────────────────────────────────────────────
 
@@ -275,10 +324,17 @@ function pushAgentListFromCdp(): void {
   resolveSpawnConnectingId(agents);
   recordConnectTime(agents);
   lastPushedAgentIds = new Set(agents.map((a) => a.id));
+  // Push again as soon as Cursor flushes a transcript checkpoint, instead of
+  // waiting up to a full poll. The poll below is still the floor.
+  syncTranscriptWatchers(
+    agents.map((a) => a.id),
+    () => pushAgentList(),
+  );
 
   const payload = {
     agents: agents.map((a) => ({
       ...a,
+      activity: liveActivityFor(a.id),
       connectMs: agentConnectMs.get(a.id),
       keepConnected: keepConnectedAgents.has(a.id),
     })),
@@ -286,6 +342,7 @@ function pushAgentListFromCdp(): void {
     targetAgentCount,
     workflowModel: poolModel,
     skipAutoPhase,
+    passAgentId: passAgentIdEnabled(),
     singleAgentMode,
     cdpConnected: lastCdpStatus?.connected ?? false,
     connectingAgentId: workflowProc ? activeWorkflowAgentId ?? null : null,
@@ -426,14 +483,16 @@ function maybeRecordWorkflowConnect(line: string): void {
   pushAgentList();
 }
 
-/** Resolve automation/workflow.py relative to this extension install (repo layout:
- *  jefr-cursor/extension/dist/extension.js → jefr-cursor/automation/workflow.py). */
-function bundledWorkflowScript(): string {
-  return path.join(__dirname, "..", "..", "automation", "workflow.py");
-}
-
-function bundledCdpScript(): string {
-  return path.join(__dirname, "..", "..", "automation", "cdp.py");
+/**
+ * Candidate locations for automation scripts.
+ *   1. VSIX / installed layout: extension/dist → extension/automation/
+ *   2. Repo / F5 layout:       extension/dist → jefr-cursor/automation/
+ */
+function bundledAutomationCandidates(filename: string): string[] {
+  return [
+    path.join(__dirname, "..", "automation", filename),
+    path.join(__dirname, "..", "..", "automation", filename),
+  ];
 }
 
 /** Cached workflow script path (recomputed when workspace folders change). */
@@ -441,10 +500,11 @@ let resolvedWorkflowScript: string | undefined;
 let resolvedWorkflowScriptFor: string | undefined;
 
 /**
- * Resolve workflow.py. Only these locations are considered:
- *   1. jefr-cursor/automation/ bundled next to this extension
- *   2. automation/workflow.py in each open workspace folder
- * Returns null when neither exists.
+ * Resolve workflow.py. Locations considered (first hit wins):
+ *   1. automation/ bundled inside the extension (VSIX)
+ *   2. jefr-cursor/automation/ next to the extension (repo checkout)
+ *   3. automation/workflow.py in each open workspace folder
+ * Returns null when none exist.
  * Spawn and reconnect both use this script (--reconnect implies skip-auto).
  */
 function resolveWorkflowScript(): string | null {
@@ -454,7 +514,7 @@ function resolveWorkflowScript(): string | null {
   if (resolvedWorkflowScript !== undefined && resolvedWorkflowScriptFor === wsKey) {
     return resolvedWorkflowScript || null;
   }
-  const candidates: string[] = [bundledWorkflowScript()];
+  const candidates: string[] = [...bundledAutomationCandidates("workflow.py")];
   for (const folder of vscode.workspace.workspaceFolders || []) {
     candidates.push(path.join(folder.uri.fsPath, "automation", "workflow.py"));
   }
@@ -465,7 +525,7 @@ function resolveWorkflowScript(): string | null {
 
 /** Resolve cdp.py — same search order as workflow.py. */
 function resolveCdpScript(): string | null {
-  const candidates: string[] = [bundledCdpScript()];
+  const candidates: string[] = [...bundledAutomationCandidates("cdp.py")];
   for (const folder of vscode.workspace.workspaceFolders || []) {
     candidates.push(path.join(folder.uri.fsPath, "automation", "cdp.py"));
   }
@@ -495,10 +555,20 @@ let workflowModelsRefreshing = false;
 /** Skip Auto stand-by phase on spawn (persisted). Off by default. */
 let skipAutoPhase = false;
 const SKIP_AUTO_KEY = "jefr.skipAutoPhase";
-/** Single-agent / shared-queue mode (persisted). Off by default — multi-agent
- *  injects agent_id into the MCP prompt; on = omit id → General · shared. */
-let singleAgentMode = false;
+/** Single-agent / shared-queue mode (persisted). On by default — Pass agent_id
+ *  is off until the user opts in; shared queue omits agent_id from the MCP prompt.
+ *  When false, spawn injects agent_id for per-agent routing. */
+let singleAgentMode = true;
 const SINGLE_AGENT_KEY = "jefr.singleAgentMode";
+const PASS_AGENT_ID_KEY = "jefr.passAgentId";
+
+function passAgentIdEnabled(): boolean {
+  return !singleAgentMode;
+}
+
+function setPassAgentId(enabled: boolean): void {
+  setSingleAgentMode(!enabled);
+}
 
 /** Migrate legacy persisted labels (e.g. Opus 4.5) to a live picker row. */
 function normalizePoolModel(model: string | undefined): string {
@@ -519,6 +589,7 @@ function setSingleAgentMode(enabled: boolean): void {
   if (singleAgentMode === enabled) return;
   singleAgentMode = enabled;
   void extensionContext?.globalState.update(SINGLE_AGENT_KEY, enabled);
+  void extensionContext?.globalState.update(PASS_AGENT_ID_KEY, !enabled);
   lastAgentListJson = undefined;
   pushAgentList();
 }
@@ -579,7 +650,7 @@ function refreshWorkflowModelsFromPicker(): void {
   }
   if (!script) {
     pushWorkflowModels({
-      error: "cdp.py not found — open the jefr-cursor workspace.",
+      error: "cdp.py not found — reinstall the extension (package includes automation/) or open the jefr-cursor workspace.",
     });
     dlog("refresh models: cdp.py not found", "error");
     return;
@@ -1071,12 +1142,12 @@ function runWorkflow(opts: WorkflowOptions): void {
       type: "workflowOutput",
       stream: "stderr",
       line:
-        "[jefr] Workflow script not found. Open the jefr-cursor workspace " +
-        "(automation/workflow.py) or install the extension from that repo.",
-    });
-    postWorkflow({ type: "workflowExit", code: null });
-    return;
-  }
+        "[jefr] Workflow script not found. Reinstall the extension " +
+        "(package includes automation/workflow.py) or open the jefr-cursor workspace.",
+      });
+      postWorkflow({ type: "workflowExit", code: null });
+      return;
+    }
   if (!fs.existsSync(script)) {
     postWorkflow({
       type: "workflowOutput",
@@ -1370,6 +1441,16 @@ function readMcpDataDir(
 export function activate(context: vscode.ExtensionContext): void {
   extensionVersion = context.extension.packageJSON?.version || "0.0.0";
   extensionContext = context;
+  syncTranscriptWorkspaceRoots();
+  // Say once whether the strongest liveness signal is usable on this host, so a
+  // silent fallback to the old heartbeat-only behaviour is visible in the log
+  // rather than being mistaken for the fix not working.
+  dlog(
+    isComposerStateAvailable()
+      ? "liveness: reading Cursor composer state (node:sqlite OK)"
+      : "liveness: Cursor composer state unavailable — falling back to heartbeat/CDP only",
+    isComposerStateAvailable() ? "info" : "warn",
+  );
   // Restore the persisted pool target (slot count + keep-N baseline).
   targetAgentCount = Math.max(
     MIN_TARGET_AGENT_COUNT,
@@ -1391,7 +1472,17 @@ export function activate(context: vscode.ExtensionContext): void {
     void context.globalState.update(WORKFLOW_MODEL_KEY, poolModel);
   }
   skipAutoPhase = context.globalState.get<boolean>(SKIP_AUTO_KEY, false) === true;
-  singleAgentMode = context.globalState.get<boolean>(SINGLE_AGENT_KEY, false) === true;
+  // Prefer jefr.passAgentId when present. Else migrate from jefr.singleAgentMode.
+  // Neither key → Pass agent_id OFF (shared queue / singleAgentMode true).
+  {
+    const storedPass = context.globalState.get<boolean | undefined>(PASS_AGENT_ID_KEY);
+    if (typeof storedPass === "boolean") {
+      singleAgentMode = !storedPass;
+    } else {
+      const storedSingle = context.globalState.get<boolean | undefined>(SINGLE_AGENT_KEY);
+      singleAgentMode = typeof storedSingle === "boolean" ? storedSingle === true : true;
+    }
+  }
   {
     const saved = context.globalState.get<string[]>(KEEP_CONNECTED_KEY);
     keepConnectedAgents.clear();
@@ -1529,6 +1620,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders((event) => {
+      syncTranscriptWorkspaceRoots();
       if (event.added.length > 0) {
         autoSetupMcp(event.added);
       }
@@ -1564,6 +1656,7 @@ export function deactivate(): void {
   stopWorkflow();
   stopLocalServer();
   stopCdpMonitor(); // Stop CDP monitoring
+  stopTranscriptWatchers();
 }
 
 // ── Local polling: mirror file state into the webview ───────────────────────
@@ -1628,6 +1721,12 @@ function pushAgentListFromHeartbeats(cdpFallback = false): void {
   const { views: agents, dropped, prune } = reconcile(roster, agentStats, now, {
     forgetMs: AGENT_FORGET_MS,
     maxReconnects: MAX_RECONNECT_ATTEMPTS,
+    // This is the path used when CDP can't see any tiles (Agents window closed),
+    // so it has no DOM signal at all — heartbeat only. Cursor's own conversation
+    // record is what keeps a quietly-working agent from being called dropped and
+    // having its tile re-primed mid-task.
+    externalAliveAt: composerAliveAt,
+    externalAliveGraceMs: COMPOSER_ALIVE_GRACE_MS,
   });
 
   for (const id of prune) {
@@ -1672,6 +1771,7 @@ function pushAgentListFromHeartbeats(cdpFallback = false): void {
     ...a,
     dropped: !a.connected && droppedSet.has(a.id),
     keepConnected: keepConnectedAgents.has(a.id),
+    activity: liveActivityFor(a.id),
   }));
 
   writeCdpStatusFile(agents);
@@ -1689,6 +1789,7 @@ function pushAgentListFromHeartbeats(cdpFallback = false): void {
     targetAgentCount,
     workflowModel: poolModel,
     skipAutoPhase,
+    passAgentId: passAgentIdEnabled(),
     singleAgentMode,
     cdpConnected: cdpFallback ? (lastCdpStatus?.connected ?? false) : false,
     connectingAgentId: workflowProc ? activeWorkflowAgentId ?? null : null,
@@ -1847,6 +1948,13 @@ function getWorkspaceName(): string {
     return folders[0].name;
   }
   return "default";
+}
+
+/** Prefer the open workspace(s) when resolving Cursor agent transcripts. */
+function syncTranscriptWorkspaceRoots(): void {
+  const roots = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+  setTranscriptWorkspaceRoots(roots);
+  clearTranscriptCache();
 }
 
 function getWorkspacePath(): string | undefined {
@@ -2119,6 +2227,9 @@ class MessengerViewProvider implements vscode.WebviewViewProvider {
           break;
         case "setSkipAutoPhase":
           setSkipAutoPhase(!!msg.enabled);
+          break;
+        case "setPassAgentId":
+          setPassAgentId(!!msg.enabled);
           break;
         case "setSingleAgentMode":
           setSingleAgentMode(!!msg.enabled);

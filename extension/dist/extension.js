@@ -2323,7 +2323,7 @@ var require_websocket = __commonJS({
     var tls = require("tls");
     var { randomBytes, createHash: createHash3 } = require("crypto");
     var { Duplex, Readable } = require("stream");
-    var { URL } = require("url");
+    var { URL: URL2 } = require("url");
     var PerMessageDeflate2 = require_permessage_deflate();
     var Receiver2 = require_receiver();
     var Sender2 = require_sender();
@@ -2841,11 +2841,11 @@ var require_websocket = __commonJS({
         );
       }
       let parsedUrl;
-      if (address instanceof URL) {
+      if (address instanceof URL2) {
         parsedUrl = address;
       } else {
         try {
-          parsedUrl = new URL(address);
+          parsedUrl = new URL2(address);
         } catch {
           throw new SyntaxError(`Invalid URL: ${address}`);
         }
@@ -2984,7 +2984,7 @@ var require_websocket = __commonJS({
           req.abort();
           let addr;
           try {
-            addr = new URL(location, address);
+            addr = new URL2(location, address);
           } catch (e) {
             const err = new SyntaxError(`Invalid URL: ${location}`);
             emitErrorAndClose(websocket, err);
@@ -3809,39 +3809,499 @@ __export(extension_exports, {
 });
 module.exports = __toCommonJS(extension_exports);
 var vscode = __toESM(require("vscode"));
-var path3 = __toESM(require("path"));
-var fs3 = __toESM(require("fs"));
-var os3 = __toESM(require("os"));
+var path5 = __toESM(require("path"));
+var fs5 = __toESM(require("fs"));
+var os5 = __toESM(require("os"));
 var crypto2 = __toESM(require("crypto"));
 var import_child_process = require("child_process");
 
 // src/messenger.ts
+var fs2 = __toESM(require("fs"));
+var path2 = __toESM(require("path"));
+var os2 = __toESM(require("os"));
+
+// src/agentTranscript.ts
 var fs = __toESM(require("fs"));
-var path = __toESM(require("path"));
 var os = __toESM(require("os"));
-var ROOT_DATA_DIR = path.join(os.homedir(), ".moyu-message");
+var path = __toESM(require("path"));
+var preferredRoots = [];
+function setTranscriptWorkspaceRoots(roots) {
+  preferredRoots = roots.filter(Boolean);
+}
+function workspacePathToProjectSlug(fsPath) {
+  let s = fsPath.replace(/\\/g, "/").replace(/\/+$/, "");
+  s = s.replace(/^([A-Za-z]):/, (_, d) => d.toLowerCase());
+  return s.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+function cursorProjectsRoot() {
+  return path.join(os.homedir(), ".cursor", "projects");
+}
+function transcriptFileFor(projectDir, agentId) {
+  return path.join(projectDir, "agent-transcripts", agentId, `${agentId}.jsonl`);
+}
+function findTranscriptPath(agentId) {
+  if (!agentId || agentId.startsWith("tile:"))
+    return void 0;
+  const projects = cursorProjectsRoot();
+  for (const root of preferredRoots) {
+    const slug = workspacePathToProjectSlug(root);
+    const candidate = transcriptFileFor(path.join(projects, slug), agentId);
+    if (fs.existsSync(candidate))
+      return candidate;
+  }
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(projects);
+  } catch {
+    return void 0;
+  }
+  for (const slug of dirs) {
+    const candidate = transcriptFileFor(path.join(projects, slug), agentId);
+    if (fs.existsSync(candidate))
+      return candidate;
+  }
+  return void 0;
+}
+var cache = /* @__PURE__ */ new Map();
+function readLastJsonlRecord(file) {
+  let st;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    return null;
+  }
+  if (st.size === 0)
+    return null;
+  const fd = fs.openSync(file, "r");
+  try {
+    const start = Math.max(0, st.size - 16384);
+    const len = st.size - start;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    const text = buf.toString("utf8");
+    const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    const candidates = start > 0 ? lines.slice(1) : lines;
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      try {
+        return JSON.parse(candidates[i]);
+      } catch {
+      }
+    }
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+function classifyStatus(raw) {
+  const s = typeof raw === "string" ? raw.toLowerCase() : "";
+  if (s === "success" || s === "ok" || s === "completed")
+    return "success";
+  if (s === "error" || s === "failed" || s === "aborted" || s === "cancelled") {
+    return "error";
+  }
+  return "other";
+}
+function getTranscriptTurnEnd(agentId) {
+  const file = findTranscriptPath(agentId);
+  if (!file)
+    return { ended: false };
+  let st;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    return { ended: false };
+  }
+  const prev = cache.get(agentId);
+  if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
+    return prev.result;
+  }
+  const last = readLastJsonlRecord(file);
+  let result = {
+    ended: false,
+    path: file,
+    mtimeMs: st.mtimeMs
+  };
+  if (last && typeof last === "object" && last.type === "turn_ended") {
+    const rec = last;
+    const status = classifyStatus(rec.status);
+    result = {
+      ended: true,
+      status,
+      rawStatus: typeof rec.status === "string" ? rec.status : void 0,
+      error: typeof rec.error === "string" ? rec.error : void 0,
+      path: file,
+      mtimeMs: st.mtimeMs
+    };
+  }
+  cache.set(agentId, { mtimeMs: st.mtimeMs, size: st.size, result });
+  return result;
+}
+function isTranscriptTurnDead(agentId) {
+  return getTranscriptTurnEnd(agentId).ended;
+}
+function isTranscriptDeadConfirmed(agentId, heartbeatAlive) {
+  return !heartbeatAlive && isTranscriptTurnDead(agentId);
+}
+var activityCache = /* @__PURE__ */ new Map();
+var stepLedger = /* @__PURE__ */ new Map();
+function alignOverlap(prev, next) {
+  const max = Math.min(prev.length, next.length);
+  for (let o = max; o > 0; o--) {
+    let ok = true;
+    for (let i = 0; i < o; i++) {
+      if (prev[prev.length - o + i].sig !== next[i]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok)
+      return o;
+  }
+  return 0;
+}
+var MAX_FEED_STEPS = 24;
+function basenamePath(p) {
+  const s = p.replace(/\\/g, "/");
+  const i = s.lastIndexOf("/");
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+function summarizeTool(name, input) {
+  const inp = input || {};
+  switch (name) {
+    case "Read":
+      return typeof inp.path === "string" ? `Reading ${basenamePath(inp.path)}` : "Reading a file";
+    case "Write":
+      return typeof inp.path === "string" ? `Writing ${basenamePath(inp.path)}` : "Writing a file";
+    case "StrReplace":
+      return typeof inp.path === "string" ? `Editing ${basenamePath(inp.path)}` : "Editing a file";
+    case "Shell": {
+      const cmd = typeof inp.command === "string" ? inp.command.replace(/\s+/g, " ").trim() : "";
+      return cmd ? `Shell: ${cmd.slice(0, 80)}` : "Running a shell command";
+    }
+    case "Grep":
+      return typeof inp.pattern === "string" ? `Searching: ${inp.pattern.slice(0, 60)}` : "Searching code";
+    case "Glob":
+      return typeof inp.glob_pattern === "string" ? `Glob: ${String(inp.glob_pattern).slice(0, 60)}` : "Finding files";
+    case "CallMcpTool": {
+      const tool = typeof inp.toolName === "string" ? inp.toolName : "";
+      if (/check_messages/i.test(tool))
+        return "Listening (MCP)";
+      if (/send_progress/i.test(tool))
+        return "Sending progress";
+      if (/ask_question/i.test(tool))
+        return "Asking a question";
+      return tool ? `MCP: ${tool}` : "Calling MCP";
+    }
+    case "GetMcpTools":
+      return "Checking MCP tools";
+    case "WebSearch":
+      return typeof inp.search_term === "string" ? `Web search: ${String(inp.search_term).slice(0, 60)}` : "Web search";
+    default:
+      return name || "Working";
+  }
+}
+function cleanAssistantText(text) {
+  return text.replace(/```[\s\S]*?```/g, " ").replace(/\s+/g, " ").trim();
+}
+function readRecentJsonlRecords(file, maxRecords = 30) {
+  let st;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    return [];
+  }
+  if (st.size === 0)
+    return [];
+  const fd = fs.openSync(file, "r");
+  try {
+    const start = Math.max(0, st.size - 512e3);
+    const len = st.size - start;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    const text = buf.toString("utf8");
+    const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    const candidates = start > 0 ? lines.slice(1) : lines;
+    const out = [];
+    for (let i = Math.max(0, candidates.length - maxRecords); i < candidates.length; i++) {
+      try {
+        out.push(JSON.parse(candidates[i]));
+      } catch {
+      }
+    }
+    return out;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+function getTranscriptActivity(agentId) {
+  if (!agentId || agentId.startsWith("tile:"))
+    return void 0;
+  const file = findTranscriptPath(agentId);
+  if (!file)
+    return void 0;
+  let st;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    return void 0;
+  }
+  const prev = activityCache.get(agentId);
+  if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
+    return prev.activity;
+  }
+  const records = readRecentJsonlRecords(file, 400);
+  const sigs = [];
+  const labels = [];
+  const toolNames = [];
+  let ended = false;
+  let endStatus;
+  let error;
+  let stepsThisTurn = 0;
+  let sawTurnBoundary = false;
+  let occurrence = 0;
+  const push = (label, tool) => {
+    if (labels.length > 0 && labels[labels.length - 1] === label)
+      return;
+    sigs.push(`${occurrence++}|${tool ?? "text"}|${label}`);
+    labels.push(label);
+    toolNames.push(tool);
+  };
+  for (const raw of records) {
+    const rec = raw;
+    if (rec?.type === "turn_ended") {
+      ended = true;
+      endStatus = classifyStatus(rec.status);
+      error = typeof rec.error === "string" ? rec.error : void 0;
+      stepsThisTurn = 0;
+      sawTurnBoundary = true;
+      push(
+        endStatus === "error" ? `Turn ended: ${(error || "error").slice(0, 100)}` : "Turn ended",
+        void 0
+      );
+      continue;
+    }
+    if (rec?.role === "user") {
+      ended = false;
+      endStatus = void 0;
+      error = void 0;
+      stepsThisTurn = 0;
+      sawTurnBoundary = true;
+      continue;
+    }
+    if (rec?.role !== "assistant")
+      continue;
+    const content = rec.message?.content;
+    if (!Array.isArray(content))
+      continue;
+    ended = false;
+    for (const part of content) {
+      if (part?.type === "tool_use" && part.name) {
+        stepsThisTurn++;
+        push(summarizeTool(part.name, part.input), part.name);
+      } else if (part?.type === "text" && part.text) {
+        const t = cleanAssistantText(part.text);
+        if (t)
+          push(t.slice(0, 140), void 0);
+      }
+    }
+  }
+  const ledger = stepLedger.get(agentId) ?? [];
+  const overlap = alignOverlap(ledger, sigs);
+  const now = Date.now();
+  const steps = sigs.map((sig, i) => {
+    if (i < overlap) {
+      return { ...ledger[ledger.length - overlap + i], sig };
+    }
+    return { sig, label: labels[i], tool: toolNames[i], firstSeen: now };
+  });
+  stepLedger.set(agentId, steps.slice(-MAX_FEED_STEPS * 2));
+  const feed = steps.slice(-MAX_FEED_STEPS);
+  const newest = steps[steps.length - 1];
+  const summary = newest?.label || (ended ? "Turn ended" : "No transcript activity yet");
+  const activity = {
+    summary,
+    tools: toolNames.filter((t) => !!t).slice(-6),
+    steps: feed,
+    stepCount: stepsThisTurn,
+    stepCountPartial: !sawTurnBoundary,
+    since: newest?.firstSeen,
+    source: "transcript",
+    ended,
+    endStatus,
+    error,
+    mtimeMs: st.mtimeMs
+  };
+  activityCache.set(agentId, { mtimeMs: st.mtimeMs, size: st.size, activity });
+  return activity;
+}
+var liveLedger = /* @__PURE__ */ new Map();
+function normalizeCardLabel(raw) {
+  const s = raw.replace(/\s+/g, " ").trim();
+  const m = /^([A-Za-z ]{2,24}?)\s+(?:in\s+\w+\s*)?(.*)$/.exec(s);
+  if (m) {
+    const verb = m[1].toLowerCase().replace(/\s+/g, "");
+    const rest = m[2].trim();
+    if (verb === "readfile" || verb === "read")
+      return rest ? `Reading ${rest}` : "Reading a file";
+    if (verb === "writefile" || verb === "write")
+      return rest ? `Writing ${rest}` : "Writing a file";
+    if (verb === "edited" || verb === "edit")
+      return rest ? `Editing ${rest}` : "Editing a file";
+    if (verb === "checkmessages")
+      return "Listening (MCP)";
+    if (verb === "sendprogress")
+      return "Sending progress";
+    if (verb === "askquestion")
+      return "Asking a question";
+  }
+  return s;
+}
+function activityFromDb(db2, base) {
+  if (!db2 || db2.steps.length === 0)
+    return base;
+  const steps = db2.steps.map((s) => ({
+    sig: s.bubbleId,
+    label: s.label,
+    tool: s.tool || void 0,
+    firstSeen: s.firstSeen
+  }));
+  const newest = steps[steps.length - 1];
+  return {
+    summary: newest?.label || base?.summary || "Working",
+    tools: db2.steps.map((s) => s.tool).filter(Boolean).slice(-6),
+    steps: steps.slice(-MAX_FEED_STEPS),
+    stepCount: steps.length,
+    stepCountPartial: true,
+    since: newest?.firstSeen,
+    source: "db",
+    // A bubble Cursor still marks as running proves the turn is live.
+    ended: db2.running ? false : base?.ended ?? false,
+    endStatus: db2.running ? void 0 : base?.endStatus,
+    error: db2.running ? void 0 : base?.error,
+    mtimeMs: base?.mtimeMs
+  };
+}
+function mergeLiveActivity(agentId, liveTools, liveToolRunning, base) {
+  if (!liveTools || liveTools.length === 0) {
+    liveLedger.delete(agentId);
+    return base;
+  }
+  const labels = liveTools.map(normalizeCardLabel).filter(Boolean);
+  const sigs = labels.map((l, i) => `${i}|card|${l}`);
+  const ledger = liveLedger.get(agentId) ?? [];
+  const overlap = alignOverlap(ledger, sigs);
+  const now = Date.now();
+  const steps = sigs.map(
+    (sig, i) => i < overlap ? { ...ledger[ledger.length - overlap + i], sig } : { sig, label: labels[i], tool: void 0, firstSeen: now }
+  );
+  liveLedger.set(agentId, steps.slice(-MAX_FEED_STEPS * 2));
+  const newest = steps[steps.length - 1];
+  return {
+    summary: newest?.label || base?.summary || "Working",
+    tools: base?.tools ?? [],
+    steps: steps.slice(-MAX_FEED_STEPS),
+    stepCount: steps.length,
+    // The tile only keeps the recent cards mounted, so this is a floor.
+    stepCountPartial: true,
+    since: newest?.firstSeen,
+    source: "dom",
+    // A visible running card means the turn is live, whatever the transcript says.
+    ended: liveToolRunning ? false : base?.ended ?? false,
+    endStatus: liveToolRunning ? void 0 : base?.endStatus,
+    error: liveToolRunning ? void 0 : base?.error,
+    mtimeMs: base?.mtimeMs
+  };
+}
+var watchers = /* @__PURE__ */ new Map();
+var watchDebounce;
+var watchCallback;
+function fireWatch() {
+  if (watchDebounce)
+    clearTimeout(watchDebounce);
+  watchDebounce = setTimeout(() => {
+    watchDebounce = void 0;
+    try {
+      watchCallback?.();
+    } catch {
+    }
+  }, 120);
+}
+function syncTranscriptWatchers(agentIds, onChange) {
+  watchCallback = onChange;
+  const wanted = new Set(agentIds.filter((id) => id && !id.startsWith("tile:")));
+  for (const [id, w] of watchers) {
+    if (!wanted.has(id)) {
+      try {
+        w.close();
+      } catch {
+      }
+      watchers.delete(id);
+    }
+  }
+  for (const id of wanted) {
+    if (watchers.has(id))
+      continue;
+    const file = findTranscriptPath(id);
+    if (!file)
+      continue;
+    try {
+      const w = fs.watch(file, { persistent: false }, () => fireWatch());
+      w.on("error", () => {
+        try {
+          w.close();
+        } catch {
+        }
+        watchers.delete(id);
+      });
+      watchers.set(id, w);
+    } catch {
+    }
+  }
+}
+function stopTranscriptWatchers() {
+  if (watchDebounce) {
+    clearTimeout(watchDebounce);
+    watchDebounce = void 0;
+  }
+  for (const w of watchers.values()) {
+    try {
+      w.close();
+    } catch {
+    }
+  }
+  watchers.clear();
+  watchCallback = void 0;
+}
+function clearTranscriptCache() {
+  cache.clear();
+  activityCache.clear();
+  stepLedger.clear();
+}
+
+// src/messenger.ts
+var ROOT_DATA_DIR = path2.join(os2.homedir(), ".moyu-message");
 var dataDir = process.env.MESSENGER_DATA_DIR || ROOT_DATA_DIR;
-var QUEUE_FILE = path.join(dataDir, "queue.json");
-var QUESTION_FILE = path.join(dataDir, "question.json");
-var ANSWER_FILE = path.join(dataDir, "answer.json");
-var REPLY_FILE = path.join(dataDir, "reply.json");
-var CARD_FILE = path.join(dataDir, "card.json");
-var INJECTED_TOKEN_FILE = path.join(dataDir, "injected-token.json");
-var HISTORY_FILE = path.join(dataDir, "history.json");
-var HEARTBEAT_FILE = path.join(dataDir, "agent-alive.json");
-var QUEUE_LOCK_DIR = path.join(dataDir, "queue.lock");
+var QUEUE_FILE = path2.join(dataDir, "queue.json");
+var QUESTION_FILE = path2.join(dataDir, "question.json");
+var ANSWER_FILE = path2.join(dataDir, "answer.json");
+var REPLY_FILE = path2.join(dataDir, "reply.json");
+var CARD_FILE = path2.join(dataDir, "card.json");
+var INJECTED_TOKEN_FILE = path2.join(dataDir, "injected-token.json");
+var HISTORY_FILE = path2.join(dataDir, "history.json");
+var HEARTBEAT_FILE = path2.join(dataDir, "agent-alive.json");
+var QUEUE_LOCK_DIR = path2.join(dataDir, "queue.lock");
 var RULES_FILE_NAME = "mcp-messenger.mdc";
 var LEGACY_RULES_FILE_NAME = "system.mdc";
 function selectedAgentFile() {
-  return path.join(dataDir, "selected-agent.json");
+  return path2.join(dataDir, "selected-agent.json");
 }
 function readSelectedAgentId() {
   const file = selectedAgentFile();
-  if (!fs.existsSync(file)) {
+  if (!fs2.existsSync(file)) {
     return void 0;
   }
   try {
-    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    const data = JSON.parse(fs2.readFileSync(file, "utf-8"));
     const id = typeof data.agentId === "string" ? sanitizeAgentId(data.agentId) : "";
     return id || void 0;
   } catch {
@@ -3853,12 +4313,12 @@ function writeSelectedAgentId(agentId) {
   const file = selectedAgentFile();
   if (!agentId) {
     try {
-      fs.unlinkSync(file);
+      fs2.unlinkSync(file);
     } catch {
     }
     return;
   }
-  fs.writeFileSync(
+  fs2.writeFileSync(
     file,
     JSON.stringify({ agentId: sanitizeAgentId(agentId), timestamp: (/* @__PURE__ */ new Date()).toISOString() }),
     "utf-8"
@@ -3866,15 +4326,15 @@ function writeSelectedAgentId(agentId) {
 }
 function setDataDir(dir) {
   dataDir = dir;
-  QUEUE_FILE = path.join(dir, "queue.json");
-  QUESTION_FILE = path.join(dir, "question.json");
-  ANSWER_FILE = path.join(dir, "answer.json");
-  REPLY_FILE = path.join(dir, "reply.json");
-  CARD_FILE = path.join(dir, "card.json");
-  INJECTED_TOKEN_FILE = path.join(dir, "injected-token.json");
-  HISTORY_FILE = path.join(dir, "history.json");
-  HEARTBEAT_FILE = path.join(dir, "agent-alive.json");
-  QUEUE_LOCK_DIR = path.join(dir, "queue.lock");
+  QUEUE_FILE = path2.join(dir, "queue.json");
+  QUESTION_FILE = path2.join(dir, "question.json");
+  ANSWER_FILE = path2.join(dir, "answer.json");
+  REPLY_FILE = path2.join(dir, "reply.json");
+  CARD_FILE = path2.join(dir, "card.json");
+  INJECTED_TOKEN_FILE = path2.join(dir, "injected-token.json");
+  HISTORY_FILE = path2.join(dir, "history.json");
+  HEARTBEAT_FILE = path2.join(dir, "agent-alive.json");
+  QUEUE_LOCK_DIR = path2.join(dir, "queue.lock");
 }
 function sleepSync(ms) {
   try {
@@ -3889,14 +4349,14 @@ function acquireQueueLock(timeoutMs = 2e3) {
   const start = Date.now();
   for (; ; ) {
     try {
-      fs.mkdirSync(QUEUE_LOCK_DIR);
+      fs2.mkdirSync(QUEUE_LOCK_DIR);
       return true;
     } catch {
       try {
-        const st = fs.statSync(QUEUE_LOCK_DIR);
+        const st = fs2.statSync(QUEUE_LOCK_DIR);
         if (Date.now() - st.mtimeMs > 5e3) {
           try {
-            fs.rmdirSync(QUEUE_LOCK_DIR);
+            fs2.rmdirSync(QUEUE_LOCK_DIR);
           } catch {
           }
           continue;
@@ -3913,7 +4373,7 @@ function acquireQueueLock(timeoutMs = 2e3) {
 }
 function releaseQueueLock() {
   try {
-    fs.rmdirSync(QUEUE_LOCK_DIR);
+    fs2.rmdirSync(QUEUE_LOCK_DIR);
   } catch {
   }
 }
@@ -3932,7 +4392,7 @@ function robustWriteFile(file, data) {
   let lastErr;
   for (let i = 0; i < 10; i++) {
     try {
-      fs.writeFileSync(file, data, "utf-8");
+      fs2.writeFileSync(file, data, "utf-8");
       return;
     } catch (e) {
       lastErr = e;
@@ -3949,30 +4409,36 @@ function robustWriteFile(file, data) {
 }
 var AGENT_STALE_MS = 6e3;
 function getAgentStatusFor(agentId) {
-  const file = path.join(agentDirFor(agentId), "agent-alive.json");
+  const file = path2.join(agentDirFor(agentId), "agent-alive.json");
+  let heartbeatAlive = false;
+  let state = "idle";
   try {
-    if (!fs.existsSync(file)) {
-      return { alive: false, state: "idle" };
+    if (fs2.existsSync(file)) {
+      const data = JSON.parse(fs2.readFileSync(file, "utf-8"));
+      const ts = typeof data.ts === "number" ? data.ts : 0;
+      if (Date.now() - ts < AGENT_STALE_MS) {
+        heartbeatAlive = true;
+        state = data.state === "working" ? "working" : "waiting";
+      }
     }
-    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
-    const ts = typeof data.ts === "number" ? data.ts : 0;
-    if (Date.now() - ts >= AGENT_STALE_MS) {
-      return { alive: false, state: "idle" };
-    }
-    const state = data.state === "working" ? "working" : "waiting";
-    return { alive: true, state };
   } catch {
+  }
+  if (agentId && isTranscriptDeadConfirmed(agentId, heartbeatAlive)) {
     return { alive: false, state: "idle" };
   }
+  if (heartbeatAlive) {
+    return { alive: true, state };
+  }
+  return { alive: false, state: "idle" };
 }
 var HISTORY_CAP = 150;
 function readSharedHistory() {
   ensureDir();
-  if (!fs.existsSync(HISTORY_FILE)) {
+  if (!fs2.existsSync(HISTORY_FILE)) {
     return [];
   }
   try {
-    const data = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf-8"));
+    const data = JSON.parse(fs2.readFileSync(HISTORY_FILE, "utf-8"));
     return Array.isArray(data) ? data : [];
   } catch {
     return [];
@@ -3989,7 +4455,7 @@ function appendSharedHistory(item) {
       hist.splice(0, hist.length - HISTORY_CAP);
     }
     ensureDir();
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(hist, null, 2), "utf-8");
+    fs2.writeFileSync(HISTORY_FILE, JSON.stringify(hist, null, 2), "utf-8");
   } catch {
   }
 }
@@ -4009,16 +4475,16 @@ function migrateFromRootDir() {
   if (dataDir === ROOT_DATA_DIR) {
     return;
   }
-  const rootCardFile = path.join(ROOT_DATA_DIR, "card.json");
-  if (fs.existsSync(rootCardFile) && !fs.existsSync(CARD_FILE)) {
+  const rootCardFile = path2.join(ROOT_DATA_DIR, "card.json");
+  if (fs2.existsSync(rootCardFile) && !fs2.existsSync(CARD_FILE)) {
     ensureDir();
-    fs.copyFileSync(rootCardFile, CARD_FILE);
+    fs2.copyFileSync(rootCardFile, CARD_FILE);
   }
 }
 var REMOTE_API_ENABLED = false;
 function ensureDir() {
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
+  if (!fs2.existsSync(dataDir)) {
+    fs2.mkdirSync(dataDir, { recursive: true });
   }
 }
 function makeId() {
@@ -4026,11 +4492,11 @@ function makeId() {
 }
 function readQueue() {
   ensureDir();
-  if (!fs.existsSync(QUEUE_FILE)) {
+  if (!fs2.existsSync(QUEUE_FILE)) {
     return [];
   }
   try {
-    const data = JSON.parse(fs.readFileSync(QUEUE_FILE, "utf-8"));
+    const data = JSON.parse(fs2.readFileSync(QUEUE_FILE, "utf-8"));
     return Array.isArray(data) ? data : [];
   } catch {
     return [];
@@ -4075,11 +4541,11 @@ function sendFile(filePath) {
   });
 }
 function readQuestion() {
-  if (!fs.existsSync(QUESTION_FILE)) {
+  if (!fs2.existsSync(QUESTION_FILE)) {
     return null;
   }
   try {
-    const data = JSON.parse(fs.readFileSync(QUESTION_FILE, "utf-8"));
+    const data = JSON.parse(fs2.readFileSync(QUESTION_FILE, "utf-8"));
     return data && data.id && data.questions ? data : null;
   } catch {
     return null;
@@ -4087,14 +4553,14 @@ function readQuestion() {
 }
 function writeAnswer(answer) {
   ensureDir();
-  fs.writeFileSync(ANSWER_FILE, JSON.stringify(answer, null, 2), "utf-8");
+  fs2.writeFileSync(ANSWER_FILE, JSON.stringify(answer, null, 2), "utf-8");
 }
 function readReply() {
-  if (!fs.existsSync(REPLY_FILE)) {
+  if (!fs2.existsSync(REPLY_FILE)) {
     return null;
   }
   try {
-    const data = JSON.parse(fs.readFileSync(REPLY_FILE, "utf-8"));
+    const data = JSON.parse(fs2.readFileSync(REPLY_FILE, "utf-8"));
     return data && data.content ? data : null;
   } catch {
     return null;
@@ -4109,7 +4575,7 @@ function sanitizeAgentId(agentId) {
 }
 function agentDirFor(agentId) {
   const id = sanitizeAgentId(agentId);
-  return id ? path.join(dataDir, AGENTS_SUBDIR, id) : dataDir;
+  return id ? path2.join(dataDir, AGENTS_SUBDIR, id) : dataDir;
 }
 function forgetAgentDir(agentId) {
   const id = sanitizeAgentId(agentId);
@@ -4117,7 +4583,7 @@ function forgetAgentDir(agentId) {
     return;
   }
   try {
-    fs.rmSync(path.join(dataDir, AGENTS_SUBDIR, id), {
+    fs2.rmSync(path2.join(dataDir, AGENTS_SUBDIR, id), {
       recursive: true,
       force: true
     });
@@ -4125,22 +4591,22 @@ function forgetAgentDir(agentId) {
   }
 }
 function ensureDirAt(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+  if (!fs2.existsSync(dir)) {
+    fs2.mkdirSync(dir, { recursive: true });
   }
 }
 function acquireLockIn(lockDir, timeoutMs = 2e3) {
   const start = Date.now();
   for (; ; ) {
     try {
-      fs.mkdirSync(lockDir);
+      fs2.mkdirSync(lockDir);
       return true;
     } catch {
       try {
-        const st = fs.statSync(lockDir);
+        const st = fs2.statSync(lockDir);
         if (Date.now() - st.mtimeMs > 5e3) {
           try {
-            fs.rmdirSync(lockDir);
+            fs2.rmdirSync(lockDir);
           } catch {
           }
           continue;
@@ -4157,25 +4623,25 @@ function acquireLockIn(lockDir, timeoutMs = 2e3) {
 }
 function withLockIn(dir, fn) {
   ensureDirAt(dir);
-  const lockDir = path.join(dir, "queue.lock");
+  const lockDir = path2.join(dir, "queue.lock");
   const locked = acquireLockIn(lockDir);
   try {
     return fn();
   } finally {
     if (locked) {
       try {
-        fs.rmdirSync(lockDir);
+        fs2.rmdirSync(lockDir);
       } catch {
       }
     }
   }
 }
 function readJsonArrayAt(file) {
-  if (!fs.existsSync(file)) {
+  if (!fs2.existsSync(file)) {
     return [];
   }
   try {
-    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    const data = JSON.parse(fs2.readFileSync(file, "utf-8"));
     return Array.isArray(data) ? data : [];
   } catch {
     return [];
@@ -4184,12 +4650,12 @@ function readJsonArrayAt(file) {
 function readQueueFor(agentId) {
   const dir = agentDirFor(agentId);
   ensureDirAt(dir);
-  return readJsonArrayAt(path.join(dir, "queue.json"));
+  return readJsonArrayAt(path2.join(dir, "queue.json"));
 }
 function writeQueueFor(items, agentId) {
   const dir = agentDirFor(agentId);
   ensureDirAt(dir);
-  robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(items, null, 2));
+  robustWriteFile(path2.join(dir, "queue.json"), JSON.stringify(items, null, 2));
 }
 function getQueueCountFor(agentId) {
   return readQueueFor(agentId).length;
@@ -4203,9 +4669,9 @@ function sendTextTo(agentId, text) {
   };
   const dir = agentDirFor(agentId);
   withLockIn(dir, () => {
-    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    const queue = readJsonArrayAt(path2.join(dir, "queue.json"));
     queue.push(item);
-    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+    robustWriteFile(path2.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
   });
   appendSharedHistory({ id: item.id, kind: "text", text, timestamp: item.timestamp });
   return item;
@@ -4221,9 +4687,9 @@ function sendImageTo(agentId, filePath, caption, dataUrl) {
   };
   const dir = agentDirFor(agentId);
   withLockIn(dir, () => {
-    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    const queue = readJsonArrayAt(path2.join(dir, "queue.json"));
     queue.push(item);
-    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+    robustWriteFile(path2.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
   });
   return item;
 }
@@ -4241,31 +4707,31 @@ function sendImagesTo(agentId, images, caption) {
   };
   const dir = agentDirFor(agentId);
   withLockIn(dir, () => {
-    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    const queue = readJsonArrayAt(path2.join(dir, "queue.json"));
     queue.push(item);
-    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+    robustWriteFile(path2.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
   });
   return item;
 }
 function sendFileTo(agentId, filePath) {
   const dir = agentDirFor(agentId);
   withLockIn(dir, () => {
-    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    const queue = readJsonArrayAt(path2.join(dir, "queue.json"));
     queue.push({
       id: makeId(),
       type: "file",
       path: filePath,
       timestamp: (/* @__PURE__ */ new Date()).toISOString()
     });
-    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+    robustWriteFile(path2.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
   });
 }
 function deleteQueueItemFor(id, agentId) {
   const dir = agentDirFor(agentId);
   withLockIn(dir, () => {
-    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    const queue = readJsonArrayAt(path2.join(dir, "queue.json"));
     robustWriteFile(
-      path.join(dir, "queue.json"),
+      path2.join(dir, "queue.json"),
       JSON.stringify(queue.filter((it) => it.id !== id), null, 2)
     );
   });
@@ -4276,10 +4742,10 @@ function clearQueueFor(agentId) {
 }
 function listAgentDirIds() {
   try {
-    const base = path.join(dataDir, AGENTS_SUBDIR);
-    return fs.readdirSync(base).filter((id) => {
+    const base = path2.join(dataDir, AGENTS_SUBDIR);
+    return fs2.readdirSync(base).filter((id) => {
       try {
-        return fs.statSync(path.join(base, id)).isDirectory();
+        return fs2.statSync(path2.join(base, id)).isDirectory();
       } catch {
         return false;
       }
@@ -4291,10 +4757,10 @@ function listAgentDirIds() {
 function clearAllQueues() {
   clearQueueFor(void 0);
   try {
-    const base = path.join(dataDir, AGENTS_SUBDIR);
-    for (const id of fs.readdirSync(base)) {
+    const base = path2.join(dataDir, AGENTS_SUBDIR);
+    for (const id of fs2.readdirSync(base)) {
       try {
-        if (fs.statSync(path.join(base, id)).isDirectory())
+        if (fs2.statSync(path2.join(base, id)).isDirectory())
           clearQueueFor(id);
       } catch {
       }
@@ -4305,7 +4771,7 @@ function clearAllQueues() {
 function updateQueueItemFor(id, updates, agentId) {
   const dir = agentDirFor(agentId);
   withLockIn(dir, () => {
-    const queue = readJsonArrayAt(path.join(dir, "queue.json"));
+    const queue = readJsonArrayAt(path2.join(dir, "queue.json"));
     const idx = queue.findIndex((it) => it.id === id);
     if (idx === -1) {
       return;
@@ -4313,16 +4779,16 @@ function updateQueueItemFor(id, updates, agentId) {
     if (updates.content !== void 0 && queue[idx].type === "text") {
       queue[idx].content = updates.content;
     }
-    robustWriteFile(path.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
+    robustWriteFile(path2.join(dir, "queue.json"), JSON.stringify(queue, null, 2));
   });
 }
 function readReplyFor(agentId) {
-  const file = path.join(agentDirFor(agentId), "reply.json");
-  if (!fs.existsSync(file)) {
+  const file = path2.join(agentDirFor(agentId), "reply.json");
+  if (!fs2.existsSync(file)) {
     return null;
   }
   try {
-    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    const data = JSON.parse(fs2.readFileSync(file, "utf-8"));
     return data && data.content ? data : null;
   } catch {
     return null;
@@ -4330,17 +4796,17 @@ function readReplyFor(agentId) {
 }
 function clearReplyFor(agentId) {
   try {
-    fs.unlinkSync(path.join(agentDirFor(agentId), "reply.json"));
+    fs2.unlinkSync(path2.join(agentDirFor(agentId), "reply.json"));
   } catch {
   }
 }
 function readQuestionFor(agentId) {
-  const file = path.join(agentDirFor(agentId), "question.json");
-  if (!fs.existsSync(file)) {
+  const file = path2.join(agentDirFor(agentId), "question.json");
+  if (!fs2.existsSync(file)) {
     return null;
   }
   try {
-    const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    const data = JSON.parse(fs2.readFileSync(file, "utf-8"));
     return data && data.id && data.questions ? data : null;
   } catch {
     return null;
@@ -4349,7 +4815,7 @@ function readQuestionFor(agentId) {
 function writeAnswerFor(answer, agentId) {
   const dir = agentDirFor(agentId);
   ensureDirAt(dir);
-  fs.writeFileSync(path.join(dir, "answer.json"), JSON.stringify(answer, null, 2), "utf-8");
+  fs2.writeFileSync(path2.join(dir, "answer.json"), JSON.stringify(answer, null, 2), "utf-8");
 }
 function cancelQuestionFor(agentId) {
   const q = readQuestionFor(agentId);
@@ -4364,18 +4830,18 @@ function cancelQuestionFor(agentId) {
   writeAnswerFor({ id: q.id, answers }, agentId);
 }
 function listLiveAgents(maxAgeMs = AGENT_STALE_MS) {
-  const root = path.join(dataDir, AGENTS_SUBDIR);
+  const root = path2.join(dataDir, AGENTS_SUBDIR);
   let ids = [];
   try {
-    ids = fs.readdirSync(root);
+    ids = fs2.readdirSync(root);
   } catch {
     return [];
   }
   const out = [];
   for (const id of ids) {
-    const beat = path.join(root, id, "agent-alive.json");
+    const beat = path2.join(root, id, "agent-alive.json");
     try {
-      const data = JSON.parse(fs.readFileSync(beat, "utf-8"));
+      const data = JSON.parse(fs2.readFileSync(beat, "utf-8"));
       const ts = typeof data.ts === "number" ? data.ts : 0;
       if (Date.now() - ts > maxAgeMs) {
         continue;
@@ -4385,22 +4851,22 @@ function listLiveAgents(maxAgeMs = AGENT_STALE_MS) {
     } catch {
     }
   }
-  out.sort((a, b) => b.ts - a.ts);
+  out.sort((a, b) => a.id.localeCompare(b.id));
   return out;
 }
 function scanAllAgents(maxAgeMs = AGENT_STALE_MS) {
-  const root = path.join(dataDir, AGENTS_SUBDIR);
+  const root = path2.join(dataDir, AGENTS_SUBDIR);
   let ids = [];
   try {
-    ids = fs.readdirSync(root);
+    ids = fs2.readdirSync(root);
   } catch {
     return [];
   }
   const out = [];
   for (const id of ids) {
-    const dir = path.join(root, id);
+    const dir = path2.join(root, id);
     try {
-      if (!fs.statSync(dir).isDirectory()) {
+      if (!fs2.statSync(dir).isDirectory()) {
         continue;
       }
     } catch {
@@ -4409,12 +4875,13 @@ function scanAllAgents(maxAgeMs = AGENT_STALE_MS) {
     let ts = 0;
     let beatState = "idle";
     try {
-      const data = JSON.parse(fs.readFileSync(path.join(dir, "agent-alive.json"), "utf-8"));
+      const data = JSON.parse(fs2.readFileSync(path2.join(dir, "agent-alive.json"), "utf-8"));
       ts = typeof data.ts === "number" ? data.ts : 0;
       beatState = data.state === "working" ? "working" : "waiting";
     } catch {
     }
-    const connected = ts > 0 && Date.now() - ts <= maxAgeMs;
+    const hbFresh = ts > 0 && Date.now() - ts <= maxAgeMs;
+    const connected = hbFresh && !isTranscriptDeadConfirmed(id, hbFresh);
     out.push({
       id,
       connected,
@@ -4423,16 +4890,16 @@ function scanAllAgents(maxAgeMs = AGENT_STALE_MS) {
       queueCount: getQueueCountFor(id)
     });
   }
-  out.sort((a, b) => b.ts - a.ts);
+  out.sort((a, b) => a.id.localeCompare(b.id));
   return out;
 }
 function readCardState() {
   ensureDir();
-  if (!fs.existsSync(CARD_FILE)) {
+  if (!fs2.existsSync(CARD_FILE)) {
     return null;
   }
   try {
-    const data = JSON.parse(fs.readFileSync(CARD_FILE, "utf-8"));
+    const data = JSON.parse(fs2.readFileSync(CARD_FILE, "utf-8"));
     return data && data.code ? data : null;
   } catch {
     return null;
@@ -4440,7 +4907,7 @@ function readCardState() {
 }
 function clearCardState() {
   try {
-    fs.unlinkSync(CARD_FILE);
+    fs2.unlinkSync(CARD_FILE);
   } catch {
   }
 }
@@ -4538,23 +5005,23 @@ async function pollRemoteAnswer(cardCode, questionId) {
 function getCursorConfigDir() {
   switch (process.platform) {
     case "win32":
-      return path.join(
-        process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
+      return path2.join(
+        process.env.APPDATA || path2.join(os2.homedir(), "AppData", "Roaming"),
         "Cursor"
       );
     case "darwin":
-      return path.join(os.homedir(), "Library", "Application Support", "Cursor");
+      return path2.join(os2.homedir(), "Library", "Application Support", "Cursor");
     default:
-      return path.join(os.homedir(), ".config", "Cursor");
+      return path2.join(os2.homedir(), ".config", "Cursor");
   }
 }
 function readVscdbViaSqlite(dbPath) {
   try {
     const { DatabaseSync } = require("node:sqlite");
-    const db = new DatabaseSync(dbPath, { readOnly: true });
-    const tokenRow = db.prepare("SELECT value FROM ItemTable WHERE key = ?").get("cursorAuth/accessToken");
-    const emailRow = db.prepare("SELECT value FROM ItemTable WHERE key = ?").get("cursorAuth/cachedEmail");
-    db.close();
+    const db2 = new DatabaseSync(dbPath, { readOnly: true });
+    const tokenRow = db2.prepare("SELECT value FROM ItemTable WHERE key = ?").get("cursorAuth/accessToken");
+    const emailRow = db2.prepare("SELECT value FROM ItemTable WHERE key = ?").get("cursorAuth/cachedEmail");
+    db2.close();
     if (tokenRow?.value) {
       return { token: tokenRow.value, email: emailRow?.value || "" };
     }
@@ -4578,18 +5045,18 @@ function readVscdbViaSqlite(dbPath) {
   return null;
 }
 function readCursorAuth() {
-  const gsDir = path.join(getCursorConfigDir(), "User", "globalStorage");
-  const dbPath = path.join(gsDir, "state.vscdb");
-  if (fs.existsSync(dbPath)) {
+  const gsDir = path2.join(getCursorConfigDir(), "User", "globalStorage");
+  const dbPath = path2.join(gsDir, "state.vscdb");
+  if (fs2.existsSync(dbPath)) {
     const result = readVscdbViaSqlite(dbPath);
     if (result) {
       return result;
     }
   }
-  const jsonPath = path.join(gsDir, "storage.json");
-  if (fs.existsSync(jsonPath)) {
+  const jsonPath = path2.join(gsDir, "storage.json");
+  if (fs2.existsSync(jsonPath)) {
     try {
-      const data = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
+      const data = JSON.parse(fs2.readFileSync(jsonPath, "utf-8"));
       const token = data["cursorAuth/accessToken"];
       if (token) {
         return { token, email: data["cursorAuth/cachedEmail"] || "" };
@@ -4597,10 +5064,10 @@ function readCursorAuth() {
     } catch {
     }
   }
-  const authPath = path.join(gsDir, "cursor.auth.json");
-  if (fs.existsSync(authPath)) {
+  const authPath = path2.join(gsDir, "cursor.auth.json");
+  if (fs2.existsSync(authPath)) {
     try {
-      const data = JSON.parse(fs.readFileSync(authPath, "utf-8"));
+      const data = JSON.parse(fs2.readFileSync(authPath, "utf-8"));
       if (data.token) {
         return { token: data.token, email: data.email || "" };
       }
@@ -4611,11 +5078,11 @@ function readCursorAuth() {
 }
 function readInjectedToken() {
   ensureDir();
-  if (!fs.existsSync(INJECTED_TOKEN_FILE)) {
+  if (!fs2.existsSync(INJECTED_TOKEN_FILE)) {
     return null;
   }
   try {
-    const data = JSON.parse(fs.readFileSync(INJECTED_TOKEN_FILE, "utf-8"));
+    const data = JSON.parse(fs2.readFileSync(INJECTED_TOKEN_FILE, "utf-8"));
     return data && data.token ? data : null;
   } catch {
     return null;
@@ -4623,11 +5090,11 @@ function readInjectedToken() {
 }
 function writeInjectedToken(token) {
   ensureDir();
-  fs.writeFileSync(INJECTED_TOKEN_FILE, JSON.stringify({ token }, null, 2), "utf-8");
+  fs2.writeFileSync(INJECTED_TOKEN_FILE, JSON.stringify({ token }, null, 2), "utf-8");
 }
 function clearInjectedToken() {
   try {
-    fs.unlinkSync(INJECTED_TOKEN_FILE);
+    fs2.unlinkSync(INJECTED_TOKEN_FILE);
   } catch {
   }
 }
@@ -4661,11 +5128,11 @@ async function fetchCursorUsage() {
   };
 }
 function getMcpServerPath() {
-  const extDir = path.dirname(path.dirname(__filename));
-  return path.join(extDir, "dist", "mcp-server.mjs");
+  const extDir = path2.dirname(path2.dirname(__filename));
+  return path2.join(extDir, "dist", "mcp-server.mjs");
 }
 function getGlobalMcpJsonPath() {
-  return path.join(os.homedir(), ".cursor", "mcp.json");
+  return path2.join(os2.homedir(), ".cursor", "mcp.json");
 }
 function applyMcpServerEntry(config, messengerDataDir) {
   if (!config.mcpServers) {
@@ -4686,13 +5153,13 @@ function applyMcpServerEntry(config, messengerDataDir) {
 }
 function setupGlobalMcpConfig(messengerDataDir) {
   const mcpJsonPath = getGlobalMcpJsonPath();
-  const cursorDir = path.dirname(mcpJsonPath);
-  if (!fs.existsSync(cursorDir)) {
-    fs.mkdirSync(cursorDir, { recursive: true });
+  const cursorDir = path2.dirname(mcpJsonPath);
+  if (!fs2.existsSync(cursorDir)) {
+    fs2.mkdirSync(cursorDir, { recursive: true });
   }
-  const previousContent = fs.existsSync(mcpJsonPath) ? fs.readFileSync(mcpJsonPath, "utf-8") : "";
+  const previousContent = fs2.existsSync(mcpJsonPath) ? fs2.readFileSync(mcpJsonPath, "utf-8") : "";
   let config = {};
-  if (fs.existsSync(mcpJsonPath)) {
+  if (fs2.existsSync(mcpJsonPath)) {
     try {
       config = JSON.parse(previousContent);
     } catch {
@@ -4701,20 +5168,20 @@ function setupGlobalMcpConfig(messengerDataDir) {
   applyMcpServerEntry(config, messengerDataDir);
   const nextContent = JSON.stringify(config, null, 2);
   if (nextContent !== previousContent) {
-    fs.writeFileSync(mcpJsonPath, nextContent, "utf-8");
+    fs2.writeFileSync(mcpJsonPath, nextContent, "utf-8");
     return true;
   }
   return false;
 }
 function setupMcpConfig(workspaceFolder, messengerDataDir) {
-  const cursorDir = path.join(workspaceFolder, ".cursor");
-  if (!fs.existsSync(cursorDir)) {
-    fs.mkdirSync(cursorDir, { recursive: true });
+  const cursorDir = path2.join(workspaceFolder, ".cursor");
+  if (!fs2.existsSync(cursorDir)) {
+    fs2.mkdirSync(cursorDir, { recursive: true });
   }
-  const mcpJsonPath = path.join(cursorDir, "mcp.json");
-  const previousContent = fs.existsSync(mcpJsonPath) ? fs.readFileSync(mcpJsonPath, "utf-8") : "";
+  const mcpJsonPath = path2.join(cursorDir, "mcp.json");
+  const previousContent = fs2.existsSync(mcpJsonPath) ? fs2.readFileSync(mcpJsonPath, "utf-8") : "";
   let config = {};
-  if (fs.existsSync(mcpJsonPath)) {
+  if (fs2.existsSync(mcpJsonPath)) {
     try {
       config = JSON.parse(previousContent);
     } catch {
@@ -4727,7 +5194,7 @@ function setupMcpConfig(workspaceFolder, messengerDataDir) {
   const nextContent = JSON.stringify(config, null, 2);
   let changed = false;
   if (nextContent !== previousContent) {
-    fs.writeFileSync(mcpJsonPath, nextContent, "utf-8");
+    fs2.writeFileSync(mcpJsonPath, nextContent, "utf-8");
     changed = true;
   }
   if (setupCursorRules(workspaceFolder)) {
@@ -4736,11 +5203,11 @@ function setupMcpConfig(workspaceFolder, messengerDataDir) {
   return changed;
 }
 function removeMcpConfig(workspaceFolder) {
-  const mcpJsonPath = path.join(workspaceFolder, ".cursor", "mcp.json");
+  const mcpJsonPath = path2.join(workspaceFolder, ".cursor", "mcp.json");
   let removed = false;
-  if (fs.existsSync(mcpJsonPath)) {
+  if (fs2.existsSync(mcpJsonPath)) {
     try {
-      const config = JSON.parse(fs.readFileSync(mcpJsonPath, "utf-8"));
+      const config = JSON.parse(fs2.readFileSync(mcpJsonPath, "utf-8"));
       if (!config.mcpServers) {
         config.mcpServers = {};
       }
@@ -4752,7 +5219,7 @@ function removeMcpConfig(workspaceFolder) {
         }
       }
       if (removed) {
-        fs.writeFileSync(mcpJsonPath, JSON.stringify(config, null, 2), "utf-8");
+        fs2.writeFileSync(mcpJsonPath, JSON.stringify(config, null, 2), "utf-8");
       }
     } catch {
     }
@@ -4792,45 +5259,45 @@ Updated xxx file..." }\`. \`send_progress\` returns immediately; continue to the
 ---
 **End of turn (mandatory)**: Only after the reply is **fully complete**, the last step must call the jefr MCP \`check_messages\` tool (CallMcpTool, server identifier for jefr, toolName \`check_messages\`, arguments \`{}\`). Never call it at the start of a turn or before the reply is done. Use \`ask_question\` only when the user must make a choice during the task (e.g. pick a framework or plan).`;
 function setupCursorRules(workspaceFolder) {
-  const rulesDir = path.join(workspaceFolder, ".cursor", "rules");
-  if (!fs.existsSync(rulesDir)) {
-    fs.mkdirSync(rulesDir, { recursive: true });
+  const rulesDir = path2.join(workspaceFolder, ".cursor", "rules");
+  if (!fs2.existsSync(rulesDir)) {
+    fs2.mkdirSync(rulesDir, { recursive: true });
   }
-  const currentRulesPath = path.join(rulesDir, RULES_FILE_NAME);
+  const currentRulesPath = path2.join(rulesDir, RULES_FILE_NAME);
   let changed = false;
-  const previousRulesContent = fs.existsSync(currentRulesPath) ? fs.readFileSync(currentRulesPath, "utf-8") : "";
+  const previousRulesContent = fs2.existsSync(currentRulesPath) ? fs2.readFileSync(currentRulesPath, "utf-8") : "";
   if (previousRulesContent !== RULES_CONTENT) {
-    fs.writeFileSync(currentRulesPath, RULES_CONTENT, "utf-8");
+    fs2.writeFileSync(currentRulesPath, RULES_CONTENT, "utf-8");
     changed = true;
   }
-  const legacyRulesPath = path.join(rulesDir, LEGACY_RULES_FILE_NAME);
+  const legacyRulesPath = path2.join(rulesDir, LEGACY_RULES_FILE_NAME);
   if (removeLegacyRulesIfManaged(legacyRulesPath)) {
     changed = true;
   }
   return changed;
 }
 function removeCursorRules(workspaceFolder) {
-  const rulesDir = path.join(workspaceFolder, ".cursor", "rules");
+  const rulesDir = path2.join(workspaceFolder, ".cursor", "rules");
   let removed = false;
-  const currentRulesPath = path.join(rulesDir, RULES_FILE_NAME);
-  if (fs.existsSync(currentRulesPath)) {
-    fs.unlinkSync(currentRulesPath);
+  const currentRulesPath = path2.join(rulesDir, RULES_FILE_NAME);
+  if (fs2.existsSync(currentRulesPath)) {
+    fs2.unlinkSync(currentRulesPath);
     removed = true;
   }
-  const legacyRulesPath = path.join(rulesDir, LEGACY_RULES_FILE_NAME);
+  const legacyRulesPath = path2.join(rulesDir, LEGACY_RULES_FILE_NAME);
   if (removeLegacyRulesIfManaged(legacyRulesPath)) {
     removed = true;
   }
   return removed;
 }
 function removeLegacyRulesIfManaged(filePath) {
-  if (!fs.existsSync(filePath)) {
+  if (!fs2.existsSync(filePath)) {
     return false;
   }
   try {
-    const content = fs.readFileSync(filePath, "utf-8");
+    const content = fs2.readFileSync(filePath, "utf-8");
     if (content === RULES_CONTENT) {
-      fs.unlinkSync(filePath);
+      fs2.unlinkSync(filePath);
       return true;
     }
   } catch {
@@ -4842,10 +5309,10 @@ function removeLegacyRulesIfManaged(filePath) {
 // src/local-server.ts
 var http = __toESM(require("http"));
 var crypto = __toESM(require("crypto"));
-var fs2 = __toESM(require("fs"));
-var os2 = __toESM(require("os"));
-var path2 = __toESM(require("path"));
-var CDP_STATUS_FILE = path2.join(os2.homedir(), ".moyu-message", "cdp-status.json");
+var fs3 = __toESM(require("fs"));
+var os3 = __toESM(require("os"));
+var path3 = __toESM(require("path"));
+var CDP_STATUS_FILE = path3.join(os3.homedir(), ".moyu-message", "cdp-status.json");
 var bridgeAgentModels = /* @__PURE__ */ new Map();
 function setBridgeAgentModels(agents) {
   bridgeAgentModels.clear();
@@ -4861,7 +5328,7 @@ function readCdpAgentModels() {
   if (map.size > 0)
     return map;
   try {
-    const data = JSON.parse(fs2.readFileSync(CDP_STATUS_FILE, "utf-8"));
+    const data = JSON.parse(fs3.readFileSync(CDP_STATUS_FILE, "utf-8"));
     for (const a of data.agents || []) {
       const id = a.id && String(a.id).trim();
       const model = a.model && String(a.model).trim();
@@ -4877,7 +5344,7 @@ function readCdpVisibleAgentIds() {
     return new Set(bridgeAgentModels.keys());
   }
   try {
-    const data = JSON.parse(fs2.readFileSync(CDP_STATUS_FILE, "utf-8"));
+    const data = JSON.parse(fs3.readFileSync(CDP_STATUS_FILE, "utf-8"));
     if (!data.cdpConnected)
       return null;
     const agents = data.agents || [];
@@ -4909,8 +5376,8 @@ function handlePastedImage(dataUrl, caption, target) {
     const extRaw = match[1].toLowerCase();
     const ext = extRaw === "jpeg" ? "jpg" : extRaw === "svg+xml" ? "svg" : extRaw;
     const buf = Buffer.from(match[2], "base64");
-    const tmpPath = path2.join(os2.tmpdir(), `jefr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`);
-    fs2.writeFileSync(tmpPath, buf);
+    const tmpPath = path3.join(os3.tmpdir(), `jefr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`);
+    fs3.writeFileSync(tmpPath, buf);
     const tgt = target !== void 0 ? target : targetAgentId();
     const item = sendImageTo(tgt, tmpPath, caption, dataUrl);
     pushHistoryItem({ ...item, dataUrl });
@@ -4919,7 +5386,7 @@ function handlePastedImage(dataUrl, caption, target) {
       kind: "image",
       dataUrl,
       caption,
-      name: path2.basename(tmpPath),
+      name: path3.basename(tmpPath),
       path: tmpPath,
       timestamp: item.timestamp
     });
@@ -4938,12 +5405,12 @@ function handlePastedImages(dataUrls, caption, target) {
       const extRaw = match[1].toLowerCase();
       const ext = extRaw === "jpeg" ? "jpg" : extRaw === "svg+xml" ? "svg" : extRaw;
       const buf = Buffer.from(match[2], "base64");
-      const tmpPath = path2.join(
-        os2.tmpdir(),
+      const tmpPath = path3.join(
+        os3.tmpdir(),
         `jefr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`
       );
-      fs2.writeFileSync(tmpPath, buf);
-      decoded.push({ path: tmpPath, dataUrl, name: path2.basename(tmpPath) });
+      fs3.writeFileSync(tmpPath, buf);
+      decoded.push({ path: tmpPath, dataUrl, name: path3.basename(tmpPath) });
     } catch {
     }
   }
@@ -4972,11 +5439,11 @@ var PREFERRED_PORT = 39517;
 var MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 var PORT_RETRY_MAX = 6;
 var PORT_RETRY_DELAY_MS = 400;
-var PORT_FILE = path2.join(os2.homedir(), ".moyu-message", "server.json");
+var PORT_FILE = path3.join(os3.homedir(), ".moyu-message", "server.json");
 function writePortFile(port) {
   try {
-    fs2.mkdirSync(path2.dirname(PORT_FILE), { recursive: true });
-    fs2.writeFileSync(
+    fs3.mkdirSync(path3.dirname(PORT_FILE), { recursive: true });
+    fs3.writeFileSync(
       PORT_FILE,
       JSON.stringify({ port, pid: process.pid, preferred: PREFERRED_PORT, ts: Date.now() }),
       "utf-8"
@@ -4986,7 +5453,7 @@ function writePortFile(port) {
 }
 function removePortFile() {
   try {
-    fs2.unlinkSync(PORT_FILE);
+    fs3.unlinkSync(PORT_FILE);
   } catch {
   }
 }
@@ -5991,7 +6458,13 @@ function reconcile(roster, stats, now, opts) {
       s.connected = false;
       s.connectedSince = 0;
     }
-    const lastAlive = r.ts > 0 ? Math.max(r.ts, s.lastSeen) : s.lastSeen;
+    const extAt = opts.externalAliveAt ? opts.externalAliveAt(r.id) : 0;
+    const extGrace = opts.externalAliveGraceMs ?? 0;
+    const busyElsewhere = extAt > 0 && extGrace > 0 && now - extAt < extGrace;
+    const lastAlive = Math.max(
+      r.ts > 0 ? Math.max(r.ts, s.lastSeen) : s.lastSeen,
+      extAt
+    );
     if (!r.connected && (lastAlive === 0 || now - lastAlive > opts.forgetMs)) {
       prune.push(r.id);
       continue;
@@ -5999,13 +6472,16 @@ function reconcile(roster, stats, now, opts) {
     views.push({
       id: r.id,
       connected: r.connected,
-      state: r.state,
+      // A stale heartbeat while Cursor is still advancing the conversation means
+      // the agent is WORKING, not idle. Reporting it accurately is what stops the
+      // panel showing a busy agent as down.
+      state: !r.connected && busyElsewhere ? "working" : r.state,
       queueCount: r.queueCount,
       connectCount: s.connectCount,
       reconnectCount: s.reconnectCount,
       connectedSince: r.connected ? s.connectedSince : 0
     });
-    if (!r.connected && s.connectCount > 0 && s.reconnectsSinceConnect < opts.maxReconnects) {
+    if (!r.connected && !busyElsewhere && s.connectCount > 0 && s.reconnectsSinceConnect < opts.maxReconnects) {
       dropped.push(r.id);
     }
   }
@@ -6819,22 +7295,29 @@ var CdpMonitor = class extends import_events.EventEmitter {
 
     const mcpRunning = mcpRunningIn(t);
     const toolWorking = toolWorkingIn(t);
+    // Visibly busy this poll \u2014 the strongest life signal. Every "ended" signal
+    // below is gated on its absence: a live MCP card, generation, planning, or a
+    // running tool means any cancelled card / stamp / standby text is stale.
+    const busyNow = mcpRunning || generating || planning || toolWorking;
     // A cancelled-card drop only counts when the tile isn't otherwise busy \u2014 an
     // agent that recovered and is generating / running a tool again must not read
     // as dropped from a stale "Cancelled" card left up the transcript.
-    const mcpErrored =
-      !mcpRunning && !generating && !planning && !toolWorking && mcpErroredIn(t);
+    const mcpErrored = !busyNow && mcpErroredIn(t);
 
-    // "Worked for ..." completion stamp = the turn ended (MCP cut out). Prefer the
-    // live status/followup area; fall back to the recent tail. We do NOT scan the
-    // whole transcript, so an old stamp from a prior turn won't mark a live tile.
+    // "Worked for ..." completion stamp = the turn ended (MCP cut out). Trust the
+    // live status/followup area directly. The tail fallback only counts when the
+    // stamp sits at the very END of the visible text: during a new turn the
+    // previous turn's stamp is still inside the last 400 chars (above the fresh
+    // content), and an unanchored match flipped working agents to "Dropped".
     const statusText = [
       ...[...t.querySelectorAll('.glass-chat-status-bar__segment-label')].map(e => e.textContent || ''),
       t.querySelector('.agent-panel-followup-status-area')?.textContent || '',
     ].join(' ').replace(/\\s+/g, ' ').trim();
     const full = (t.innerText || '').replace(/\\s+/g, ' ');
     const tail = full.length > 400 ? full.slice(-400) : full;
-    const worked = /worked for\\s+[\\dhms ]+/i.test(statusText) || /worked for\\s+[\\dhms ]+/i.test(tail);
+    const worked =
+      !busyNow &&
+      (/worked for\\s+[\\dhms ]+/i.test(statusText) || /worked for\\s+[\\dhms ]+\\s*$/i.test(tail));
 
     // Restored-draft signal: when a held-open turn dies, Cursor puts the un-sent
     // prompt back into the composer. A tile sitting idle with the injected spawn
@@ -6848,18 +7331,53 @@ var CdpMonitor = class extends import_events.EventEmitter {
       || t.querySelector('.tiptap.ProseMirror');
     const draftText = ((draftEl && draftEl.textContent) || '').trim();
     const draftPending =
-      !generating && !planning && !mcpRunning && !toolWorking &&
+      !busyNow &&
       draftText.length > 0 &&
       /keep the mcp connection|stand by|check\\s*messages|agent_id|invoke the mcp|call the mcp directly/i.test(draftText);
 
     // Standby-in-transcript: the agent replied "standing by / waiting" and stopped
     // re-calling check_messages. Catches the drop even when the composer is empty
     // and there's no "Worked for\u2026" stamp \u2014 the case that kept reading as Working.
+    // Anchored to the END of the visible text: once a new turn starts, fresh
+    // content follows the standby reply and pushes it out of this window \u2014 an
+    // unanchored match kept flagging working agents as "Server dropped".
     const standbyCutoff =
-      !generating && !planning && !mcpRunning && !toolWorking &&
-      /standing\\s+by|waiting for your next instruction/i.test(tail);
+      !busyNow &&
+      /standing\\s+by|waiting for your next (instruction|message)/i.test(tail.slice(-200));
 
     const model = modelOf(t);
+
+    // Live tool-card feed \u2014 what this agent is doing RIGHT NOW. Cursor buffers
+    // the .jsonl transcript until a turn ends, so for a long-running agent this
+    // DOM read is the only source of in-turn activity. Best-effort by design:
+    // wrapped so a selector change degrades to an empty list instead of taking
+    // down the whole tile query.
+    let liveTools = [];
+    let liveToolRunning = false;
+    try {
+      const cards = [...t.querySelectorAll('[data-message-kind="tool"]')];
+      const recent = cards.slice(-10);
+      for (const m of recent) {
+        // Card text starts with its status word ("Ran"/"Running"/"Cancelled"),
+        // then the action. Strip the status so the label reads as the action.
+        let txt = (m.textContent || '').replace(/\\s+/g, ' ').trim();
+        txt = txt.replace(/^(ran|running|cancelled|canceled|failed|errored|aborted|rejected|pending|queued)\\s*/i, '');
+        if (!txt) continue;
+        liveTools.push(txt.slice(0, 120));
+      }
+      const last = cards[cards.length - 1];
+      if (last) {
+        const st = (last.getAttribute('data-tool-status') || '').toLowerCase();
+        const cls = typeof last.className === 'string' ? last.className : '';
+        liveToolRunning =
+          /run|load|pend|progress|stream|active/.test(st) ||
+          /with-stop/.test(cls) ||
+          !!last.querySelector('[class*="shimmer"],[class*="spinner"],.codicon-modifier-spin,[data-state="stop"]');
+      }
+    } catch (e) {
+      liveTools = [];
+      liveToolRunning = false;
+    }
 
     // Billing-blocked banner: "Payment failed \u2026 Manage Billing" (a .ui-short-tray
     // with a Manage Billing button). Scoped to short tray/button text so a chat
@@ -6896,6 +7414,9 @@ var CdpMonitor = class extends import_events.EventEmitter {
       draftPending,
       standbyCutoff,
       billingBlocked,
+      liveTools,
+      liveToolRunning,
+      statusText: statusText.slice(0, 160),
     };
     });
 })()
@@ -6925,36 +7446,343 @@ function stopCdpMonitor() {
   }
 }
 
+// src/composerState.ts
+var fs4 = __toESM(require("fs"));
+var os4 = __toESM(require("os"));
+var path4 = __toESM(require("path"));
+var QUERY_THROTTLE_MS = 2500;
+var sqliteModule;
+var sqliteChecked = false;
+var sqliteAvailable = false;
+function loadSqlite() {
+  if (sqliteChecked)
+    return sqliteAvailable;
+  sqliteChecked = true;
+  try {
+    sqliteModule = require("node:sqlite");
+    sqliteAvailable = !!sqliteModule && typeof sqliteModule.DatabaseSync === "function";
+  } catch {
+    sqliteAvailable = false;
+  }
+  return sqliteAvailable;
+}
+function isComposerStateAvailable() {
+  return loadSqlite() && !!globalStateDbPath();
+}
+var cachedDbPath;
+function globalStateDbPath() {
+  if (cachedDbPath !== void 0)
+    return cachedDbPath;
+  const home = os4.homedir();
+  const candidates = [
+    path4.join(home, "AppData", "Roaming", "Cursor", "User", "globalStorage", "state.vscdb"),
+    path4.join(home, "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb"),
+    path4.join(home, ".config", "Cursor", "User", "globalStorage", "state.vscdb")
+  ];
+  cachedDbPath = candidates.find((p) => fs4.existsSync(p)) ?? null;
+  return cachedDbPath;
+}
+var db;
+var dbFailed = false;
+function openDb() {
+  if (db)
+    return db;
+  if (dbFailed || !loadSqlite())
+    return void 0;
+  const p = globalStateDbPath();
+  if (!p) {
+    dbFailed = true;
+    return void 0;
+  }
+  try {
+    const Ctor = sqliteModule.DatabaseSync;
+    db = new Ctor(p, { readOnly: true });
+    return db;
+  } catch {
+    dbFailed = true;
+    return void 0;
+  }
+}
+function resetDb() {
+  try {
+    db?.close();
+  } catch {
+  }
+  db = void 0;
+}
+var cache2 = /* @__PURE__ */ new Map();
+function getComposerLiveness(agentId) {
+  if (!agentId || agentId.startsWith("tile:"))
+    return void 0;
+  const now = Date.now();
+  const prev = cache2.get(agentId);
+  if (prev && now - prev.readAt < QUERY_THROTTLE_MS)
+    return prev.live;
+  const handle = openDb();
+  if (!handle)
+    return prev?.live;
+  let row;
+  try {
+    row = handle.prepare("SELECT value FROM cursorDiskKV WHERE key = ?").get(`composerData:${agentId}`);
+  } catch {
+    resetDb();
+    return prev?.live;
+  }
+  if (!row || row.value == null)
+    return prev?.live;
+  let parsed;
+  try {
+    const text = typeof row.value === "string" ? row.value : Buffer.from(row.value).toString("utf8");
+    parsed = JSON.parse(text);
+  } catch {
+    return prev?.live;
+  }
+  const headers = parsed.fullConversationHeadersOnly;
+  const headerCount = Array.isArray(headers) ? headers.length : 0;
+  const checkpointMs = numberOf(parsed.conversationCheckpointLastUpdatedAt) || numberOf(parsed.lastUpdatedAt) || 0;
+  const grew = !!prev && headerCount > prev.live.headerCount;
+  const live = {
+    headerCount,
+    checkpointMs,
+    advanced: grew,
+    lastAdvancedAt: grew ? now : prev?.live.lastAdvancedAt ?? 0,
+    contextTokensUsed: numberOf(parsed.contextTokensUsed) || void 0,
+    contextTokenLimit: numberOf(parsed.contextTokenLimit) || void 0,
+    name: typeof parsed.name === "string" ? parsed.name : void 0
+  };
+  cache2.set(agentId, { readAt: now, live });
+  return live;
+}
+function numberOf(v) {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+var FEED_BUBBLES = 12;
+function baseName(p) {
+  const s = String(p).replace(/\\/g, "/").replace(/\/+$/, "");
+  const i = s.lastIndexOf("/");
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+function firstString(o, keys) {
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "string" && v.trim())
+      return v.trim();
+  }
+  return "";
+}
+function labelForTool(name, args) {
+  const path6 = firstString(args, ["path", "relativeWorkspacePath", "targetFile"]);
+  switch (name) {
+    case "read_file_v2":
+      return path6 ? `Reading ${baseName(path6)}` : "Reading a file";
+    case "edit_file_v2":
+      return path6 ? `Editing ${baseName(path6)}` : "Editing a file";
+    case "delete_file":
+      return path6 ? `Deleting ${baseName(path6)}` : "Deleting a file";
+    case "run_terminal_command_v2": {
+      const cmd = firstString(args, ["command"]).replace(/\s+/g, " ");
+      return cmd ? `Shell: ${cmd.slice(0, 90)}` : "Running a command";
+    }
+    case "ripgrep_raw_search": {
+      const pat = firstString(args, ["pattern"]);
+      return pat ? `Searching: ${pat.slice(0, 60)}` : "Searching code";
+    }
+    case "glob_file_search": {
+      const g = firstString(args, ["globPattern"]);
+      return g ? `Finding: ${g.slice(0, 60)}` : "Finding files";
+    }
+    case "web_search": {
+      const q = firstString(args, ["searchTerm"]);
+      return q ? `Web search: ${q.slice(0, 60)}` : "Web search";
+    }
+    case "web_fetch": {
+      const u = firstString(args, ["url"]);
+      try {
+        return u ? `Fetching ${new URL(u).hostname}` : "Fetching a page";
+      } catch {
+        return "Fetching a page";
+      }
+    }
+    case "get_mcp_tools":
+      return "Checking MCP tools";
+    case "todo_write":
+      return "Updating todos";
+    case "await":
+      return "Waiting on a task";
+    case "mcp-jefr-check_messages":
+      return "Listening (MCP)";
+    case "mcp-jefr-send_progress":
+      return "Sending progress";
+    case "mcp-jefr-ask_question":
+      return "Asking a question";
+    default: {
+      const mcp = /^mcp-([^-]+)-(.+)$/.exec(name);
+      if (mcp)
+        return `MCP: ${mcp[2]}`;
+      return name.replace(/_v\d+$/, "").replace(/_/g, " ") || "Working";
+    }
+  }
+}
+var bubbleCache = /* @__PURE__ */ new Map();
+function bubblesFor(agentId) {
+  let m = bubbleCache.get(agentId);
+  if (!m) {
+    m = /* @__PURE__ */ new Map();
+    bubbleCache.set(agentId, m);
+  }
+  return m;
+}
+var TERMINAL = /^(completed|error|cancelled|canceled|aborted|rejected)$/i;
+var activityCache2 = /* @__PURE__ */ new Map();
+function getComposerActivity(agentId) {
+  if (!agentId || agentId.startsWith("tile:"))
+    return void 0;
+  const now = Date.now();
+  const cached = activityCache2.get(agentId);
+  if (cached && now - cached.readAt < QUERY_THROTTLE_MS)
+    return cached.activity;
+  const handle = openDb();
+  if (!handle)
+    return cached?.activity;
+  let headers = [];
+  try {
+    const row = handle.prepare("SELECT value FROM cursorDiskKV WHERE key = ?").get(`composerData:${agentId}`);
+    if (!row || row.value == null)
+      return cached?.activity;
+    const text = typeof row.value === "string" ? row.value : Buffer.from(row.value).toString("utf8");
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed.fullConversationHeadersOnly))
+      return cached?.activity;
+    headers = parsed.fullConversationHeadersOnly;
+  } catch {
+    resetDb();
+    return cached?.activity;
+  }
+  const known = bubblesFor(agentId);
+  const recent = headers.slice(-FEED_BUBBLES);
+  const steps = [];
+  for (const h of recent) {
+    const bid = h?.bubbleId;
+    if (!bid)
+      continue;
+    let entry = known.get(bid);
+    if (!entry || !TERMINAL.test(entry.status)) {
+      const parsedBubble = readBubble(handle, agentId, bid);
+      if (parsedBubble) {
+        entry = {
+          ...parsedBubble,
+          firstSeen: entry?.firstSeen ?? now
+        };
+        known.set(bid, entry);
+      }
+    }
+    if (entry && entry.label)
+      steps.push({ bubbleId: bid, ...entry });
+  }
+  if (known.size > FEED_BUBBLES * 8) {
+    const keep = new Set(recent.map((h) => h?.bubbleId));
+    for (const k of known.keys())
+      if (!keep.has(k))
+        known.delete(k);
+  }
+  const newest = steps[steps.length - 1];
+  const activity = {
+    steps,
+    running: !!newest && !TERMINAL.test(newest.status)
+  };
+  activityCache2.set(agentId, { readAt: now, activity });
+  return activity;
+}
+function readBubble(handle, agentId, bubbleId) {
+  let raw;
+  try {
+    const row = handle.prepare("SELECT value FROM cursorDiskKV WHERE key = ?").get(`bubbleId:${agentId}:${bubbleId}`);
+    if (!row || row.value == null)
+      return void 0;
+    raw = row.value;
+  } catch {
+    resetDb();
+    return void 0;
+  }
+  try {
+    const text = typeof raw === "string" ? raw : Buffer.from(raw).toString("utf8");
+    const b = JSON.parse(text);
+    const tf = b.toolFormerData;
+    if (!tf || typeof tf.name !== "string") {
+      const t = typeof b.text === "string" ? b.text.replace(/\s+/g, " ").trim() : "";
+      return t ? { label: t.slice(0, 140), tool: "", status: "completed" } : void 0;
+    }
+    let args = {};
+    const rawArgs = tf.rawArgs ?? tf.params;
+    if (typeof rawArgs === "string") {
+      try {
+        args = JSON.parse(rawArgs);
+      } catch {
+      }
+    } else if (rawArgs && typeof rawArgs === "object") {
+      args = rawArgs;
+    }
+    return {
+      label: labelForTool(tf.name, args),
+      tool: tf.name,
+      status: typeof tf.status === "string" ? tf.status : "completed"
+    };
+  } catch {
+    return void 0;
+  }
+}
+function composerAliveAt(agentId) {
+  const live = getComposerLiveness(agentId);
+  if (!live)
+    return 0;
+  return Math.max(live.lastAdvancedAt, live.checkpointMs);
+}
+
 // src/tile-state.ts
 var MISSING_TILE_GRACE_MS = 1e4;
 var MCP_GRACE_MS = 8e3;
 var BUSY_GRACE_MS = 8e3;
+var LIVENESS_GRACE_MS = 2e4;
+var UI_DROP_CONFIRM_MS = 6e3;
 function isLiveState(state) {
   return state !== "idle";
+}
+function isRecentlyAlive(a, now = Date.now()) {
+  return a.lastAliveAt > 0 && now - a.lastAliveAt < LIVENESS_GRACE_MS;
+}
+function dropConfirmed(a, now) {
+  return a.droppedSince > 0 && now - a.droppedSince >= UI_DROP_CONFIRM_MS;
 }
 function isConnectedState(state) {
   return state === "mcp_connected" || state === "waiting";
 }
-function isServerDropped(a) {
-  return a.connectCount > 0 && !isLiveState(a.state) && !a.worked && (a.mcpErrored || a.standbyCutoff || a.queueCount > 0 || !a.heartbeatAlive);
+function isServerDropped(a, now = Date.now()) {
+  if (a.connectCount === 0 || isLiveState(a.state) || a.worked)
+    return false;
+  if (a.mcpErrored)
+    return true;
+  if (isRecentlyAlive(a, now))
+    return false;
+  return a.heartbeatEverSeen && !a.heartbeatAlive || a.queueCount > 0 || a.transcriptErrorEnd || a.standbyCutoff;
 }
 function isUnhealthy(a) {
   return !a.agentId.startsWith("tile:") && a.tileIndex >= 0 && !isLiveState(a.state);
 }
-function resolveState(rawState, heartbeatState, loopAlive, mcpErrored, busyAlive, ended) {
+function resolveState(rawState, heartbeatState, loopAlive, mcpErrored, busyAlive, ended, aliveRecently) {
   if (rawState === "mcp_connected")
     return "mcp_connected";
   if (rawState === "generating" || rawState === "planning")
     return rawState;
-  if (mcpErrored)
+  if (heartbeatState === "waiting")
+    return "mcp_connected";
+  if (mcpErrored && !busyAlive)
     return "idle";
   if (loopAlive)
     return "mcp_connected";
   if (busyAlive && !ended)
     return "generating";
-  if (heartbeatState === "waiting" && rawState === "idle" && !ended) {
-    return "mcp_connected";
-  }
+  if (aliveRecently && !ended)
+    return "generating";
   return rawState;
 }
 var TileStateManager = class {
@@ -6993,14 +7821,34 @@ var TileStateManager = class {
       const rawBusy = tile.state === "generating" || tile.state === "planning";
       const lastBusyAt = rawBusy ? now : existing?.lastBusyAt ?? 0;
       const busyAlive = lastBusyAt > 0 && now - lastBusyAt < BUSY_GRACE_MS;
+      const heartbeatAlive = heartbeatStates.has(id);
+      const heartbeatEverSeen = heartbeatAlive || !!existing?.heartbeatEverSeen;
+      const turnEnd = id.startsWith("tile:") ? { ended: false, mtimeMs: void 0 } : getTranscriptTurnEnd(id);
+      const transcriptAliveAt = !turnEnd.ended && turnEnd.mtimeMs !== void 0 ? turnEnd.mtimeMs : 0;
+      const domAliveNow = rawMcp || rawBusy || !!tile.liveToolRunning;
+      const composerAliveAtMs = composerAliveAt(id);
+      const lastAliveAt = Math.max(
+        domAliveNow ? now : 0,
+        transcriptAliveAt,
+        composerAliveAtMs,
+        existing?.lastAliveAt ?? 0
+      );
+      const aliveRecently = lastAliveAt > 0 && now - lastAliveAt < LIVENESS_GRACE_MS;
+      const transcriptConfirmed = turnEnd.ended && !heartbeatAlive && !busyAlive && !rawMcp && !aliveRecently && (turnEnd.mtimeMs ?? 0) >= lastAliveAt;
+      const transcriptCleanEnd = transcriptConfirmed && turnEnd.status === "success";
+      const transcriptErrorEnd = transcriptConfirmed && turnEnd.status !== "success";
+      const turnOver = tile.worked || tile.draftPending || tile.standbyCutoff || transcriptConfirmed;
       const state = resolveState(
         tile.state,
         heartbeatStates.get(id),
         loopAlive,
-        tile.mcpErrored,
+        tile.mcpErrored || transcriptErrorEnd,
         busyAlive,
-        tile.worked || tile.draftPending || tile.standbyCutoff
+        turnOver,
+        aliveRecently
       );
+      const worked = tile.worked || transcriptCleanEnd;
+      const mcpErrored = tile.mcpErrored;
       if (!existing) {
         const newState = {
           agentId: id,
@@ -7012,21 +7860,27 @@ var TileStateManager = class {
           connectedSince: isConnectedState(state) ? now : 0,
           lastMcpAt,
           lastBusyAt,
+          lastAliveAt,
           // A "Worked for…" completion stamp proves the tile already ran a full
           // MCP turn, so even if we never caught it live (it finished before our
           // first poll, or was adopted via Refresh after the turn ended) it has
           // connected at least once. Seed connectCount so the present stamp can
           // classify it as a re-primeable "Dropped" tile instead of falling
           // through to a plain, unreconnectable "Down".
-          connectCount: isConnectedState(state) || tile.worked ? 1 : 0,
+          connectCount: isConnectedState(state) || worked || transcriptConfirmed ? 1 : 0,
           reconnectCount: 0,
           reconnectStreak: 0,
           lastReconnectAt: 0,
-          worked: tile.worked,
+          worked,
           draftPending: tile.draftPending,
           standbyCutoff: tile.standbyCutoff,
-          mcpErrored: tile.mcpErrored,
-          heartbeatAlive: heartbeatStates.has(id),
+          liveTools: tile.liveTools ?? [],
+          liveToolRunning: tile.liveToolRunning ?? false,
+          mcpErrored,
+          heartbeatAlive,
+          heartbeatEverSeen,
+          transcriptErrorEnd,
+          transcriptCleanEnd,
           lastSeen: now,
           lastConnectedMs: 0,
           droppedSince: 0
@@ -7044,13 +7898,19 @@ var TileStateManager = class {
         existing.tileIndex = tile.index;
         existing.model = tile.model;
         existing.queueCount = queueCounts.get(id) || 0;
-        existing.worked = tile.worked;
+        existing.worked = worked;
         existing.draftPending = tile.draftPending;
         existing.standbyCutoff = tile.standbyCutoff;
-        existing.mcpErrored = tile.mcpErrored;
-        existing.heartbeatAlive = heartbeatStates.has(id);
+        existing.liveTools = tile.liveTools ?? [];
+        existing.liveToolRunning = tile.liveToolRunning ?? false;
+        existing.mcpErrored = mcpErrored;
+        existing.heartbeatAlive = heartbeatAlive;
+        existing.heartbeatEverSeen = heartbeatEverSeen;
+        existing.transcriptErrorEnd = transcriptErrorEnd;
+        existing.transcriptCleanEnd = transcriptCleanEnd;
         existing.lastMcpAt = lastMcpAt;
         existing.lastBusyAt = lastBusyAt;
+        existing.lastAliveAt = lastAliveAt;
         existing.lastSeen = now;
         if (prevState !== state) {
           existing.state = state;
@@ -7082,7 +7942,7 @@ var TileStateManager = class {
             existing.connectedSince = 0;
           }
         }
-        if (existing.connectCount === 0 && tile.worked) {
+        if (existing.connectCount === 0 && (worked || transcriptConfirmed)) {
           existing.connectCount = 1;
         }
         if (isUnhealthy(existing)) {
@@ -7110,6 +7970,7 @@ var TileStateManager = class {
         agent.connectedSince = 0;
         agent.lastMcpAt = 0;
         agent.lastBusyAt = 0;
+        agent.lastAliveAt = 0;
         agent.worked = false;
         agent.draftPending = false;
         agent.standbyCutoff = false;
@@ -7171,7 +8032,7 @@ var TileStateManager = class {
         a.tileIndex >= 0 && // Must have connected before (so it's a DROP, not a new tile)
         a.connectCount > 0 && // Not currently live (MCP loop, working heartbeat, generating, or planning)
         !isLiveState(a.state) && // A clean cut-out (completion stamp) OR an abrupt server drop.
-        (a.worked || a.draftPending || isServerDropped(a)) && // CONFIRM window: only act on a tile that has stayed dropped for at least
+        (a.worked || a.draftPending || a.transcriptCleanEnd || isServerDropped(a)) && // CONFIRM window: only act on a tile that has stayed dropped for at least
         // `confirmMs` (0 = act immediately, used by the manual "Close dropped").
         (confirmMs <= 0 || a.droppedSince > 0 && now - a.droppedSince >= confirmMs)
       )
@@ -7213,7 +8074,10 @@ var TileStateManager = class {
   }
   /** Convert agent state to the view format expected by the webview. */
   toAgentViews() {
-    return this.getAgents().filter((a) => a.tileIndex >= 0).map((a) => ({
+    const now = Date.now();
+    return this.getAgents().filter((a) => a.tileIndex >= 0).sort(
+      (a, b) => a.firstSeen - b.firstSeen || a.agentId.localeCompare(b.agentId)
+    ).map((a) => ({
       id: a.agentId,
       // "connected" = a live state AND the tile has actually reached the MCP
       // loop at least once (connectCount > 0). Requiring connectCount closes
@@ -7227,11 +8091,11 @@ var TileStateManager = class {
       state: a.state,
       // A clean cut-out: previously connected, now idle, "Worked for..."
       // stamp present. Lets the UI show a distinct reconnectable state.
-      dropped: a.connectCount > 0 && !isLiveState(a.state) && (a.worked || a.draftPending),
+      dropped: dropConfirmed(a, now) && a.connectCount > 0 && !isLiveState(a.state) && (a.worked || a.draftPending || a.transcriptCleanEnd),
       // An abrupt server drop (no clean stamp) — surfaced separately so the UI
       // can flag it distinctly from a polite cut-off. Synthetic slot ids can't
       // be re-primed, so never mark them.
-      serverDropped: !a.agentId.startsWith("tile:") && isServerDropped(a),
+      serverDropped: dropConfirmed(a, now) && !a.agentId.startsWith("tile:") && isServerDropped(a, now),
       queueCount: a.queueCount,
       connectCount: a.connectCount,
       reconnectCount: a.reconnectCount,
@@ -7241,12 +8105,52 @@ var TileStateManager = class {
       // has been cleared back to 0.
       lastConnectedMs: a.lastConnectedMs,
       model: a.model,
-      tileIndex: a.tileIndex
+      tileIndex: a.tileIndex,
+      // Three tiers, best first:
+      //   1. live tile cards  — instant, but only while the Agents window is up
+      //   2. Cursor's bubbles — always available, about 30s behind
+      //   3. the transcript   — only ever describes finished turns
+      // The transcript is last because it isn't flushed mid-turn, so for a
+      // long-running agent it would otherwise describe the *previous* turn.
+      activity: mergeLiveActivity(
+        a.agentId,
+        a.liveTools,
+        a.liveToolRunning,
+        activityFromDb(
+          getComposerActivity(a.agentId),
+          getTranscriptActivity(a.agentId)
+        )
+      )
     }));
   }
 };
 
 // src/extension.ts
+var COMPOSER_ALIVE_GRACE_MS = 5 * 6e4;
+function liveActivityFor(agentId) {
+  const tr = getTranscriptActivity(agentId);
+  const reply = readReplyFor(agentId);
+  const content = reply?.content?.replace(/\s+/g, " ").trim();
+  if (!content)
+    return tr;
+  const boring = !tr || /^(Listening \(MCP\)|Checking MCP tools|No transcript activity yet)/i.test(
+    tr.summary
+  );
+  if (!boring)
+    return tr;
+  return {
+    summary: content.slice(0, 140),
+    tools: tr?.tools ?? [],
+    steps: tr?.steps ?? [],
+    stepCount: tr?.stepCount ?? 0,
+    stepCountPartial: tr?.stepCountPartial ?? false,
+    since: tr?.since,
+    ended: tr?.ended ?? false,
+    endStatus: tr?.endStatus,
+    error: tr?.error,
+    mtimeMs: tr?.mtimeMs
+  };
+}
 var mainPanel;
 var pollTimer2;
 var lastQuestionId;
@@ -7384,9 +8288,14 @@ function pushAgentListFromCdp() {
   resolveSpawnConnectingId(agents);
   recordConnectTime(agents);
   lastPushedAgentIds = new Set(agents.map((a) => a.id));
+  syncTranscriptWatchers(
+    agents.map((a) => a.id),
+    () => pushAgentList()
+  );
   const payload = {
     agents: agents.map((a) => ({
       ...a,
+      activity: liveActivityFor(a.id),
       connectMs: agentConnectMs.get(a.id),
       keepConnected: keepConnectedAgents.has(a.id)
     })),
@@ -7394,6 +8303,7 @@ function pushAgentListFromCdp() {
     targetAgentCount,
     workflowModel: poolModel,
     skipAutoPhase,
+    passAgentId: passAgentIdEnabled(),
     singleAgentMode,
     cdpConnected: lastCdpStatus?.connected ?? false,
     connectingAgentId: workflowProc ? activeWorkflowAgentId ?? null : null,
@@ -7410,7 +8320,7 @@ function pushAgentListFromCdp() {
 function writeCdpStatusFile(agents) {
   setBridgeAgentModels(agents);
   try {
-    const statusFile = path3.join(os3.homedir(), ".moyu-message", "cdp-status.json");
+    const statusFile = path5.join(os5.homedir(), ".moyu-message", "cdp-status.json");
     const status = {
       ts: Date.now(),
       cdpConnected: lastCdpStatus?.connected ?? false,
@@ -7425,7 +8335,7 @@ function writeCdpStatusFile(agents) {
         queueCount: a.queueCount
       }))
     };
-    fs3.writeFileSync(statusFile, JSON.stringify(status, null, 2), "utf-8");
+    fs5.writeFileSync(statusFile, JSON.stringify(status, null, 2), "utf-8");
   } catch {
   }
 }
@@ -7484,11 +8394,11 @@ function maybeRecordWorkflowConnect(line) {
   lastAgentListJson = void 0;
   pushAgentList();
 }
-function bundledWorkflowScript() {
-  return path3.join(__dirname, "..", "..", "automation", "workflow.py");
-}
-function bundledCdpScript() {
-  return path3.join(__dirname, "..", "..", "automation", "cdp.py");
+function bundledAutomationCandidates(filename) {
+  return [
+    path5.join(__dirname, "..", "automation", filename),
+    path5.join(__dirname, "..", "..", "automation", filename)
+  ];
 }
 var resolvedWorkflowScript;
 var resolvedWorkflowScriptFor;
@@ -7497,20 +8407,20 @@ function resolveWorkflowScript() {
   if (resolvedWorkflowScript !== void 0 && resolvedWorkflowScriptFor === wsKey) {
     return resolvedWorkflowScript || null;
   }
-  const candidates = [bundledWorkflowScript()];
+  const candidates = [...bundledAutomationCandidates("workflow.py")];
   for (const folder of vscode.workspace.workspaceFolders || []) {
-    candidates.push(path3.join(folder.uri.fsPath, "automation", "workflow.py"));
+    candidates.push(path5.join(folder.uri.fsPath, "automation", "workflow.py"));
   }
-  resolvedWorkflowScript = candidates.find((p) => fs3.existsSync(p)) ?? "";
+  resolvedWorkflowScript = candidates.find((p) => fs5.existsSync(p)) ?? "";
   resolvedWorkflowScriptFor = wsKey;
   return resolvedWorkflowScript || null;
 }
 function resolveCdpScript() {
-  const candidates = [bundledCdpScript()];
+  const candidates = [...bundledAutomationCandidates("cdp.py")];
   for (const folder of vscode.workspace.workspaceFolders || []) {
-    candidates.push(path3.join(folder.uri.fsPath, "automation", "cdp.py"));
+    candidates.push(path5.join(folder.uri.fsPath, "automation", "cdp.py"));
   }
-  return candidates.find((p) => fs3.existsSync(p)) ?? null;
+  return candidates.find((p) => fs5.existsSync(p)) ?? null;
 }
 var WORKFLOW_DEFAULT_MODEL = "Opus 4.8 1M Extra High Fast";
 var FALLBACK_WORKFLOW_MODELS = [
@@ -7528,8 +8438,15 @@ var WORKFLOW_MODELS_KEY = "jefr.workflowModels";
 var workflowModelsRefreshing = false;
 var skipAutoPhase = false;
 var SKIP_AUTO_KEY = "jefr.skipAutoPhase";
-var singleAgentMode = false;
+var singleAgentMode = true;
 var SINGLE_AGENT_KEY = "jefr.singleAgentMode";
+var PASS_AGENT_ID_KEY = "jefr.passAgentId";
+function passAgentIdEnabled() {
+  return !singleAgentMode;
+}
+function setPassAgentId(enabled) {
+  setSingleAgentMode(!enabled);
+}
 function normalizePoolModel(model) {
   const m = (model || "").trim();
   if (/^Opus 4\.5/i.test(m))
@@ -7549,6 +8466,7 @@ function setSingleAgentMode(enabled) {
     return;
   singleAgentMode = enabled;
   void extensionContext?.globalState.update(SINGLE_AGENT_KEY, enabled);
+  void extensionContext?.globalState.update(PASS_AGENT_ID_KEY, !enabled);
   lastAgentListJson = void 0;
   pushAgentList();
 }
@@ -7604,7 +8522,7 @@ function refreshWorkflowModelsFromPicker() {
   }
   if (!script) {
     pushWorkflowModels({
-      error: "cdp.py not found \u2014 open the jefr-cursor workspace."
+      error: "cdp.py not found \u2014 reinstall the extension (package includes automation/) or open the jefr-cursor workspace."
     });
     dlog("refresh models: cdp.py not found", "error");
     return;
@@ -7615,7 +8533,7 @@ function refreshWorkflowModelsFromPicker() {
   let proc;
   try {
     proc = (0, import_child_process.spawn)(py, [script, "--models", "--tile", "-1"], {
-      cwd: path3.dirname(script),
+      cwd: path5.dirname(script),
       windowsHide: true,
       env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" }
     });
@@ -7952,12 +8870,12 @@ function runWorkflow(opts) {
     postWorkflow({
       type: "workflowOutput",
       stream: "stderr",
-      line: "[jefr] Workflow script not found. Open the jefr-cursor workspace (automation/workflow.py) or install the extension from that repo."
+      line: "[jefr] Workflow script not found. Reinstall the extension (package includes automation/workflow.py) or open the jefr-cursor workspace."
     });
     postWorkflow({ type: "workflowExit", code: null });
     return;
   }
-  if (!fs3.existsSync(script)) {
+  if (!fs5.existsSync(script)) {
     postWorkflow({
       type: "workflowOutput",
       stream: "stderr",
@@ -8019,7 +8937,7 @@ function runWorkflow(opts) {
       });
     }
     proc = (0, import_child_process.spawn)(py, args, {
-      cwd: path3.dirname(script),
+      cwd: path5.dirname(script),
       windowsHide: true,
       env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" }
     });
@@ -8114,25 +9032,25 @@ function resetIdleTimer() {
   lastActivityTime = Date.now();
 }
 function computeDataDir(workspaceFolders) {
-  const rootDir = path3.join(os3.homedir(), ".moyu-message");
+  const rootDir = path5.join(os5.homedir(), ".moyu-message");
   if (workspaceFolders.length === 0) {
     return rootDir;
   }
   const primary = workspaceFolders[0].uri.fsPath;
   const hash = crypto2.createHash("md5").update(primary).digest("hex").slice(0, 12);
-  return path3.join(rootDir, hash);
+  return path5.join(rootDir, hash);
 }
 function readMcpDataDir(workspaceFolders = []) {
   const candidates = [
-    path3.join(os3.homedir(), ".cursor", "mcp.json"),
-    ...workspaceFolders.map((f) => path3.join(f.uri.fsPath, ".cursor", "mcp.json"))
+    path5.join(os5.homedir(), ".cursor", "mcp.json"),
+    ...workspaceFolders.map((f) => path5.join(f.uri.fsPath, ".cursor", "mcp.json"))
   ];
   for (const p of candidates) {
     try {
-      if (!fs3.existsSync(p)) {
+      if (!fs5.existsSync(p)) {
         continue;
       }
-      const config = JSON.parse(fs3.readFileSync(p, "utf-8"));
+      const config = JSON.parse(fs5.readFileSync(p, "utf-8"));
       const dir = config?.mcpServers?.jefr?.env?.MESSENGER_DATA_DIR;
       if (typeof dir === "string" && dir.trim()) {
         return dir.trim();
@@ -8145,6 +9063,11 @@ function readMcpDataDir(workspaceFolders = []) {
 function activate(context) {
   extensionVersion = context.extension.packageJSON?.version || "0.0.0";
   extensionContext = context;
+  syncTranscriptWorkspaceRoots();
+  dlog(
+    isComposerStateAvailable() ? "liveness: reading Cursor composer state (node:sqlite OK)" : "liveness: Cursor composer state unavailable \u2014 falling back to heartbeat/CDP only",
+    isComposerStateAvailable() ? "info" : "warn"
+  );
   targetAgentCount = Math.max(
     MIN_TARGET_AGENT_COUNT,
     Math.min(
@@ -8164,7 +9087,15 @@ function activate(context) {
     void context.globalState.update(WORKFLOW_MODEL_KEY, poolModel);
   }
   skipAutoPhase = context.globalState.get(SKIP_AUTO_KEY, false) === true;
-  singleAgentMode = context.globalState.get(SINGLE_AGENT_KEY, false) === true;
+  {
+    const storedPass = context.globalState.get(PASS_AGENT_ID_KEY);
+    if (typeof storedPass === "boolean") {
+      singleAgentMode = !storedPass;
+    } else {
+      const storedSingle = context.globalState.get(SINGLE_AGENT_KEY);
+      singleAgentMode = typeof storedSingle === "boolean" ? storedSingle === true : true;
+    }
+  }
   {
     const saved = context.globalState.get(KEEP_CONNECTED_KEY);
     keepConnectedAgents.clear();
@@ -8197,7 +9128,7 @@ function activate(context) {
         text: item.content,
         caption: item.caption,
         path: item.path,
-        name: item.name || (item.path ? path3.basename(item.path) : void 0),
+        name: item.name || (item.path ? path5.basename(item.path) : void 0),
         dataUrl: item.dataUrl,
         images: item.images,
         time: new Date(item.timestamp || Date.now()).toLocaleTimeString()
@@ -8278,6 +9209,7 @@ function activate(context) {
   );
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders((event) => {
+      syncTranscriptWorkspaceRoots();
       if (event.added.length > 0) {
         autoSetupMcp(event.added);
       }
@@ -8311,6 +9243,7 @@ function deactivate() {
   stopWorkflow();
   stopLocalServer();
   stopCdpMonitor();
+  stopTranscriptWatchers();
 }
 function startPolling() {
   const poll = () => {
@@ -8360,7 +9293,13 @@ function pushAgentListFromHeartbeats(cdpFallback = false) {
   const roster = scanAllAgents();
   const { views: agents, dropped, prune } = reconcile(roster, agentStats, now, {
     forgetMs: AGENT_FORGET_MS,
-    maxReconnects: MAX_RECONNECT_ATTEMPTS
+    maxReconnects: MAX_RECONNECT_ATTEMPTS,
+    // This is the path used when CDP can't see any tiles (Agents window closed),
+    // so it has no DOM signal at all — heartbeat only. Cursor's own conversation
+    // record is what keeps a quietly-working agent from being called dropped and
+    // having its tile re-primed mid-task.
+    externalAliveAt: composerAliveAt,
+    externalAliveGraceMs: COMPOSER_ALIVE_GRACE_MS
   });
   for (const id of prune) {
     agentStats.delete(id);
@@ -8401,7 +9340,8 @@ function pushAgentListFromHeartbeats(cdpFallback = false) {
   const agentsWithDropped = agents.map((a) => ({
     ...a,
     dropped: !a.connected && droppedSet.has(a.id),
-    keepConnected: keepConnectedAgents.has(a.id)
+    keepConnected: keepConnectedAgents.has(a.id),
+    activity: liveActivityFor(a.id)
   }));
   writeCdpStatusFile(agents);
   resolveSpawnConnectingId(agentsWithDropped);
@@ -8416,6 +9356,7 @@ function pushAgentListFromHeartbeats(cdpFallback = false) {
     targetAgentCount,
     workflowModel: poolModel,
     skipAutoPhase,
+    passAgentId: passAgentIdEnabled(),
     singleAgentMode,
     cdpConnected: cdpFallback ? lastCdpStatus?.connected ?? false : false,
     connectingAgentId: workflowProc ? activeWorkflowAgentId ?? null : null,
@@ -8523,6 +9464,11 @@ function getWorkspaceName() {
     return folders[0].name;
   }
   return "default";
+}
+function syncTranscriptWorkspaceRoots() {
+  const roots = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+  setTranscriptWorkspaceRoots(roots);
+  clearTranscriptCache();
 }
 function getWorkspacePath() {
   const folders = vscode.workspace.workspaceFolders;
@@ -8735,6 +9681,9 @@ var MessengerViewProvider = class {
           break;
         case "setSkipAutoPhase":
           setSkipAutoPhase(!!msg.enabled);
+          break;
+        case "setPassAgentId":
+          setPassAgentId(!!msg.enabled);
           break;
         case "setSingleAgentMode":
           setSingleAgentMode(!!msg.enabled);
@@ -9044,15 +9993,15 @@ var MessengerViewProvider = class {
       }
       const ext = match[1] === "jpeg" ? "jpg" : match[1];
       const buf = Buffer.from(match[2], "base64");
-      const tmpPath = path3.join(os3.tmpdir(), "mcp_" + Date.now() + "." + ext);
-      fs3.writeFileSync(tmpPath, buf);
+      const tmpPath = path5.join(os5.tmpdir(), "mcp_" + Date.now() + "." + ext);
+      fs5.writeFileSync(tmpPath, buf);
       const item = sendImageTo(selectedAgentId, tmpPath, caption, dataUrl);
       appendSharedHistory({
         id: item.id,
         kind: "image",
         dataUrl,
         caption,
-        name: path3.basename(tmpPath),
+        name: path5.basename(tmpPath),
         path: tmpPath,
         timestamp: item.timestamp
       });
@@ -9072,15 +10021,15 @@ var MessengerViewProvider = class {
         }
         const ext = match[1] === "jpeg" ? "jpg" : match[1];
         const buf = Buffer.from(match[2], "base64");
-        const tmpPath = path3.join(
-          os3.tmpdir(),
+        const tmpPath = path5.join(
+          os5.tmpdir(),
           "mcp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8) + "." + ext
         );
-        fs3.writeFileSync(tmpPath, buf);
+        fs5.writeFileSync(tmpPath, buf);
         decoded.push({
           path: tmpPath,
           dataUrl: img.dataUrl,
-          name: img.name || path3.basename(tmpPath)
+          name: img.name || path5.basename(tmpPath)
         });
       }
       if (decoded.length === 0) {
@@ -9117,13 +10066,13 @@ var MessengerViewProvider = class {
       return;
     }
     for (const uri of uris) {
-      const name = path3.basename(uri.fsPath);
+      const name = path5.basename(uri.fsPath);
       const isImage = /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(uri.fsPath);
       if (isImage) {
         let dataUrl = void 0;
         try {
-          const buf = fs3.readFileSync(uri.fsPath);
-          const ext = path3.extname(uri.fsPath).slice(1).toLowerCase() || "png";
+          const buf = fs5.readFileSync(uri.fsPath);
+          const ext = path5.extname(uri.fsPath).slice(1).toLowerCase() || "png";
           const mime = ext === "svg" ? "svg+xml" : ext === "jpg" ? "jpeg" : ext;
           dataUrl = `data:image/${mime};base64,${buf.toString("base64")}`;
         } catch {

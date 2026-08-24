@@ -66,10 +66,11 @@
 		"compile:css": "node -e \"require('fs').copyFileSync('src/webview/webview.css','dist/webview.css')\"",
 		"compile:webview": "esbuild src/webview/index.tsx --bundle --outfile=dist/webview.js --format=iife --platform=browser --minify && npm run compile:css",
 		"compile:mcp": "esbuild mcp-server/index.ts --bundle --outfile=dist/mcp-server.mjs --format=esm --platform=node",
+		"sync:automation": "node scripts/sync-automation.mjs",
 		"compile": "npm run compile:ext && npm run compile:webview && npm run compile:mcp",
 		"watch:ext": "npm run compile:ext -- --watch",
 		"watch:webview": "npm run compile:webview -- --watch",
-		"package": "npm run compile && npx @vscode/vsce package --no-dependencies"
+		"package": "npm run compile && npm run sync:automation && npx @vscode/vsce package --no-dependencies"
 	},
 	"dependencies": {
 		"@modelcontextprotocol/sdk": "^1.12.1",

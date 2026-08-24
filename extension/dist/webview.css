@@ -3139,6 +3139,16 @@ input:focus-visible {
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 .agent-id { font-family: var(--font-mono); font-weight: 700; color: var(--fg); letter-spacing: -0.01em; }
 .agent-meta { color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-activity {
+	color: var(--fg);
+	opacity: 0.78;
+	font-size: 11px;
+	line-height: 1.3;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	max-width: 100%;
+}
 
 /* ===== Agents hub: clickable cards ===== */
 .agent-active-tag {
@@ -3229,6 +3239,163 @@ input:focus-visible {
 	min-width: 0;
 	overflow-x: auto;
 	scrollbar-width: thin;
+}
+
+/* ===== Live activity panel (agent chat window) ===== */
+.activity-panel {
+	margin: 0 10px 8px;
+	padding: 7px 10px 6px;
+	border-radius: 8px;
+	background: color-mix(in srgb, var(--fg) 5%, transparent);
+	border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+	min-width: 0;
+}
+
+/* Headline: what the agent is doing right now. */
+.activity-now {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	min-width: 0;
+}
+.activity-now-label {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	flex-shrink: 0;
+	font-size: 10px;
+	font-weight: 700;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+.activity-now-text {
+	flex: 1 1 auto;
+	min-width: 0;
+	font-size: 12px;
+	line-height: 1.35;
+	color: var(--fg);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.activity-now-meta {
+	display: inline-flex;
+	align-items: baseline;
+	gap: 7px;
+	flex-shrink: 0;
+	font-family: var(--font-mono);
+	font-size: 10px;
+	font-variant-numeric: tabular-nums;
+	color: var(--fg-muted);
+}
+.activity-steps {
+	opacity: 0.75;
+}
+
+/* Freshness badge — says plainly whether this feed is instant or lagging, so a
+   30s-behind feed is never mistaken for a live one that has stalled. */
+.activity-source {
+	flex-shrink: 0;
+	padding: 0 5px;
+	border-radius: 999px;
+	font-family: var(--font-mono);
+	font-size: 9px;
+	letter-spacing: 0.02em;
+	cursor: help;
+}
+.activity-source.is-live {
+	color: var(--accent-strong, #4aa3ff);
+	background: color-mix(in srgb, var(--accent, #4aa3ff) 14%, transparent);
+}
+.activity-source.is-lagged {
+	color: var(--fg-muted);
+	background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+
+/* Breathing dot — the at-a-glance "it is still moving" signal. */
+.activity-pulse {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--accent, #4aa3ff);
+	animation: activity-pulse 1.6s ease-in-out infinite;
+}
+@keyframes activity-pulse {
+	0%, 100% { opacity: 1; transform: scale(1); }
+	50% { opacity: 0.3; transform: scale(0.7); }
+}
+@media (prefers-reduced-motion: reduce) {
+	.activity-pulse { animation: none; }
+}
+
+/* Nothing new for a while: dim the pulse and warm the timer. */
+.activity-now.is-stale .activity-pulse {
+	animation: none;
+	background: var(--fg-muted);
+}
+.activity-now.is-stale .activity-now-meta {
+	color: var(--warn, #d1a13a);
+}
+.activity-now.is-ended .activity-now-label {
+	color: var(--fg-muted);
+}
+.activity-now.is-error .activity-now-text {
+	color: var(--danger, #e5534b);
+}
+
+/* Rolling feed of preceding actions, newest first. */
+.activity-feed {
+	list-style: none;
+	margin: 5px 0 0;
+	padding: 5px 0 0;
+	border-top: 1px solid color-mix(in srgb, var(--fg) 8%, transparent);
+}
+.activity-row {
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
+	min-width: 0;
+	padding: 1px 0;
+	font-size: 11px;
+	line-height: 1.4;
+	color: var(--fg);
+	opacity: 0.72;
+}
+.activity-row:first-child {
+	opacity: 0.85;
+}
+.activity-icon {
+	flex-shrink: 0;
+	width: 12px;
+	text-align: center;
+	font-size: 9px;
+}
+.activity-label {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.activity-ago {
+	flex-shrink: 0;
+	font-family: var(--font-mono);
+	font-size: 10px;
+	font-variant-numeric: tabular-nums;
+	color: var(--fg-muted);
+}
+
+/* Agent tag, shown only when the feed is merged (General / shared). */
+.activity-who {
+	flex-shrink: 0;
+	margin-right: 5px;
+	padding: 0 4px;
+	border-radius: 4px;
+	font-family: var(--font-mono);
+	font-size: 9px;
+	color: var(--accent-strong, var(--fg-muted));
+	background: color-mix(in srgb, var(--accent, #4aa3ff) 14%, transparent);
 }
 
 /* One-line stat: value and label inline, no chip box. */

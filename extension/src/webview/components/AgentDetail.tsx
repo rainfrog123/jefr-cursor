@@ -8,6 +8,7 @@ import React, { useEffect, useState } from "react";
 import { post } from "../vscode";
 import type { Attachment, HistoryItem, LiveAgentInfo } from "../types";
 import { ChatTab } from "./ChatTab";
+import { ActivityFeed } from "./ActivityFeed";
 import { agentStatus, stateClass, stateLabel } from "../agentStatus";
 import { fmtConnect, fmtDuration } from "../format";
 
@@ -22,6 +23,8 @@ function Stat(props: { label: string; value: string; title?: string }): JSX.Elem
 
 export function AgentDetail(props: {
   agent: LiveAgentInfo | null;
+  /** Full roster — General / shared merges every agent's activity feed. */
+  agents: LiveAgentInfo[];
   connectingAgentId: string | null;
   workflowRunning?: boolean;
   sharedQueueCount?: number;
@@ -210,6 +213,8 @@ export function AgentDetail(props: {
           </div>
         )}
       </div>
+
+      <ActivityFeed agent={agent} agents={props.agents} />
 
       {deleteError && !closing && (
         <p className="agent-close-error-banner" role="alert">

@@ -152,6 +152,38 @@ export interface LiveAgentInfo {
   tileIndex?: number;
   /** When true, auto-reprime this tile if it drops (per-agent Keep). */
   keepConnected?: boolean;
+  /** Live "what is this agent doing?" from the Cursor transcript tail. */
+  activity?: AgentActivity;
+}
+
+/** One recovered action in an agent's activity feed. */
+export interface AgentActivityStep {
+  sig: string;
+  label: string;
+  tool?: string;
+  /** Epoch ms the host first observed this step (not when the agent acted). */
+  firstSeen: number;
+}
+
+/** Live activity snapshot for one agent, derived from its Cursor transcript. */
+export interface AgentActivity {
+  summary: string;
+  tools: string[];
+  /** Rolling feed, oldest → newest. */
+  steps: AgentActivityStep[];
+  /** Tool calls in the current turn (within the tail window). */
+  stepCount: number;
+  /** True when stepCount is a floor, not an exact count. */
+  stepCountPartial: boolean;
+  /** Epoch ms the current action was first observed. */
+  since?: number;
+  /** Which source produced this — drives the freshness hint in the UI.
+   *  dom = instant · db = ~30s behind · transcript = last finished turn. */
+  source?: "dom" | "db" | "transcript";
+  ended: boolean;
+  endStatus?: "success" | "error" | "other";
+  error?: string;
+  mtimeMs?: number;
 }
 
 /** Cursor usage info returned by `fetchUsage`. */
@@ -216,7 +248,9 @@ export type InboundMessage =
       workflowModel?: string;
       /** Skip Auto stand-by phase on spawn. Persisted host-side. */
       skipAutoPhase?: boolean;
-      /** Omit agent_id from MCP prompt (shared General queue). Persisted. */
+      /** Inject agent_id into the MCP prompt. Off = shared General queue. Persisted. */
+      passAgentId?: boolean;
+      /** @deprecated Prefer passAgentId. True when agent_id is omitted (shared queue). */
       singleAgentMode?: boolean;
       /** True when CDP real-time monitoring is active. */
       cdpConnected?: boolean;
@@ -303,6 +337,8 @@ export type OutboundMessage =
   | { type: "setTargetAgentCount"; count: number }
   | { type: "setWorkflowModel"; model: string }
   | { type: "setSkipAutoPhase"; enabled: boolean }
+  | { type: "setPassAgentId"; enabled: boolean }
+  /** @deprecated Prefer setPassAgentId. True = omit agent_id (shared queue). */
   | { type: "setSingleAgentMode"; enabled: boolean }
   /** Re-read Cursor's live model picker via CDP (`cdp.py --models`). */
   | { type: "refreshWorkflowModels" }

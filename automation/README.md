@@ -193,7 +193,7 @@ python mcp_alive.py --agent-id <uuid>  # per-agent MCP heartbeat check
 
 - **`no CDP workbench`** — Cursor isn't running with the debug flag, or the Agents window is closed.
 
-- **Wrong workflow script** — extension log should show `.../jefr-cursor/automation/workflow.py`, not any other path.
+- **Wrong workflow script** — extension log should show `.../jefr-cursor/automation/workflow.py` or `.../extensions/jefr.jefr-cursor-*/automation/workflow.py`, not any other path. If you see `cdp.py not found`, reinstall/repackage the extension so `automation/` is bundled, or open this repo as the workspace.
 
 - **`model not found`** — soft-fail; the run continues with the current model.
 
