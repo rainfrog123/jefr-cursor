@@ -45,10 +45,12 @@ const DEFAULT_SETTINGS = {
   autoReconnect: true,
   maxHistory: 400,
   minimized: false,
+  // Compact-mode pasted/uploaded image thumbnail edge length (px).
+  attachThumbSize: 26,
   // Fire a native OS (Windows) notification whenever the MCP Response Log is
   // rewritten by the agent. Path is vault-relative (forward slashes).
   notifyOnLogRewrite: true,
-  logNotifyPath: "Tech/Meta/MCP Response Log.md",
+  logNotifyPath: "_Vault/MCP Response Log.md",
 };
 
 /** Ensure settings have an endpoints[] list; map legacy host/port if needed. */
@@ -93,6 +95,8 @@ function migrateSettings(raw) {
     s.host = active.host;
     s.port = active.port;
   }
+  const thumb = parseInt(s.attachThumbSize, 10);
+  s.attachThumbSize = Number.isFinite(thumb) ? Math.min(240, Math.max(16, thumb)) : 26;
   return s;
 }
 
@@ -111,13 +115,13 @@ class JefrPlugin extends Plugin {
 
     this.registerView(VIEW_TYPE_JEFR, (leaf) => new JefrView(leaf, this));
 
-    this.addRibbonIcon("messages-square", "Open jefr chat", () => {
+    this.addRibbonIcon("messages-square", "Open JEFR Chat", () => {
       this.activateView();
     });
 
     this.addCommand({
       id: "open-jefr-chat",
-      name: "Open jefr chat",
+      name: "Open JEFR Chat",
       callback: () => this.activateView(),
     });
 
@@ -293,6 +297,10 @@ class JefrView extends ItemView {
     this.pendingQuestion = null;
     this.questionModal = null;
     this.questionMount = null;
+    // After submit/cancel we clear the UI immediately, but question.json can
+    // linger until the agent reads the answer — ignore rebroadcasts of that id
+    // so the card/modal does not flicker open again.
+    this._dismissedQuestionId = null;
     this.selected = {}; // questionId -> string[]
     this.connStatus = "offline";
     this.attachments = []; // staged images: { id, name, dataUrl }
@@ -322,7 +330,7 @@ class JefrView extends ItemView {
   }
 
   getDisplayText() {
-    return "jefr";
+    return "JEFR Chat";
   }
 
   getIcon() {
@@ -340,6 +348,7 @@ class JefrView extends ItemView {
   }
 
   onSettingsChanged() {
+    this.applyAttachThumbSize();
     this.teardownAll();
     this.activeEndpointId =
       (this.plugin.settings && this.plugin.settings.activeEndpointId) || "local";
@@ -362,7 +371,7 @@ class JefrView extends ItemView {
     const header = scroll.createDiv({ cls: "jefr-header" });
     this.headerEl = header;
     const brand = header.createDiv({ cls: "jefr-brand" });
-    brand.createSpan({ cls: "jefr-logo", text: "jefr" });
+    brand.createSpan({ cls: "jefr-logo", text: "JEFR Chat" });
     // The agent route picker now lives down with the composer (see below) so it's
     // always next to where you type. These just hold the picker state.
     this.liveAgents = [];
@@ -586,6 +595,7 @@ class JefrView extends ItemView {
   applyMinimized() {
     const on = !!this.plugin.settings.minimized;
     if (this.contentEl) this.contentEl.toggleClass("jefr-minimized", on);
+    this.applyAttachThumbSize();
     if (this.minimizeBtn) {
       this.minimizeBtn.empty();
       setIcon(this.minimizeBtn, on ? "maximize-2" : "minimize-2");
@@ -605,6 +615,14 @@ class JefrView extends ItemView {
       this.currentQuestionId = null;
       this.renderQuestion(q);
     }
+  }
+
+  /** Apply compact-mode attachment thumbnail size from settings (CSS var). */
+  applyAttachThumbSize() {
+    if (!this.contentEl) return;
+    const n = Number(this.plugin.settings && this.plugin.settings.attachThumbSize);
+    const px = Number.isFinite(n) ? Math.min(240, Math.max(16, Math.round(n))) : 26;
+    this.contentEl.style.setProperty("--jefr-attach-thumb-size", px + "px");
   }
 
   scrollPastHeader() {
@@ -824,7 +842,7 @@ class JefrView extends ItemView {
     this.messagesEl.empty();
     const empty = this.messagesEl.createDiv({ cls: "jefr-empty" });
     empty.createDiv({ cls: "jefr-empty-icon", text: "✦" });
-    empty.createDiv({ cls: "jefr-empty-title", text: "jefr chat" });
+    empty.createDiv({ cls: "jefr-empty-title", text: "JEFR Chat" });
     empty.createDiv({
       cls: "jefr-empty-sub",
       text: "Send a message to your Cursor agent. Everything here syncs with the jefr panel in Cursor.",
@@ -1269,6 +1287,14 @@ class JefrView extends ItemView {
       this.clearQuestionUi();
       return;
     }
+    // Stale rebroadcast after we already answered/cancelled this id.
+    if (this._dismissedQuestionId && q.id === this._dismissedQuestionId) {
+      return;
+    }
+    // New question — drop any prior dismiss suppress.
+    if (this._dismissedQuestionId && q.id !== this._dismissedQuestionId) {
+      this._dismissedQuestionId = null;
+    }
     // Don't wipe/re-render an already-shown question when other state updates
     // (queue count, reply, etc.) arrive — that was clearing the visible card.
     if (q.id === this.currentQuestionId) return;
@@ -1458,6 +1484,7 @@ class JefrView extends ItemView {
       });
     }
     sock.send(JSON.stringify({ type: "submitAnswer", data: { id: q.id, answers } }));
+    this._dismissedQuestionId = q.id;
     this.addSystemNote("Answer submitted");
     this.clearQuestionUi();
   }
@@ -1465,6 +1492,7 @@ class JefrView extends ItemView {
   cancelQuestion() {
     const epId = this.currentQuestionEndpointId || this.activeEndpointId;
     const c = this.conns[epId];
+    if (this.currentQuestionId) this._dismissedQuestionId = this.currentQuestionId;
     if (c && c.ws && c.ws.readyState === WebSocket.OPEN) {
       c.ws.send(JSON.stringify({ type: "cancelQuestion" }));
     }
@@ -1479,7 +1507,7 @@ class JefrView extends ItemView {
     if (!markdown.trim()) return;
     const rel =
       (this.plugin.settings.logNotifyPath || "").trim() ||
-      "Tech/Meta/MCP Response Log.md";
+      "_Vault/MCP Response Log.md";
     try {
       await writeVaultMarkdown(this.app, rel, markdown);
     } catch (e) {
@@ -1532,7 +1560,10 @@ class JefrView extends ItemView {
 
     // Questions: prefer active host; otherwise show from any host that asks.
     if (d.question) {
-      if (epId === this.activeEndpointId || !this.currentQuestionId) {
+      // Ignore stale question still on disk after we already submitted/cancelled.
+      if (this._dismissedQuestionId && d.question.id === this._dismissedQuestionId) {
+        /* keep suppressed until question file is cleared */
+      } else if (epId === this.activeEndpointId || !this.currentQuestionId) {
         this.currentQuestionEndpointId = epId;
         if (epId !== this.activeEndpointId) {
           this.activeEndpointId = epId;
@@ -1544,6 +1575,12 @@ class JefrView extends ItemView {
       this.currentQuestionEndpointId === epId
     ) {
       this.clearQuestionUi();
+    } else if (
+      this._dismissedQuestionId &&
+      this.currentQuestionEndpointId === epId
+    ) {
+      // Server finally dropped the question we already answered.
+      this._dismissedQuestionId = null;
     }
 
     // Shared history — prefix ids with host so Local/VPS don't collide.
@@ -2143,6 +2180,22 @@ class JefrSettingTab extends PluginSettingTab {
           }),
       );
 
+    new Setting(containerEl)
+      .setName("Compact paste thumbnail size")
+      .setDesc("Width/height (px) of pasted or uploaded image thumbnails in compact mode. Default 26.")
+      .addText((t) =>
+        t
+          .setPlaceholder("26")
+          .setValue(String(this.plugin.settings.attachThumbSize ?? 26))
+          .onChange(async (v) => {
+            const n = parseInt(v, 10);
+            this.plugin.settings.attachThumbSize = Number.isFinite(n)
+              ? Math.min(240, Math.max(16, n))
+              : 26;
+            await this.plugin.saveSettings();
+          }),
+      );
+
     containerEl.createEl("h3", { text: "Notifications" });
 
     new Setting(containerEl)
@@ -2161,10 +2214,10 @@ class JefrSettingTab extends PluginSettingTab {
       .setDesc("Vault-relative path to the MCP Response Log to watch (forward slashes).")
       .addText((t) =>
         t
-          .setPlaceholder("Tech/Meta/MCP Response Log.md")
+          .setPlaceholder("_Vault/MCP Response Log.md")
           .setValue(this.plugin.settings.logNotifyPath)
           .onChange(async (v) => {
-            this.plugin.settings.logNotifyPath = (v || "").trim() || "Tech/Meta/MCP Response Log.md";
+            this.plugin.settings.logNotifyPath = (v || "").trim() || "_Vault/MCP Response Log.md";
             await this.plugin.saveSettings();
           })
       );
