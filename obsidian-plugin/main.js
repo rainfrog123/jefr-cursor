@@ -2070,6 +2070,9 @@ class JefrSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     this.plugin.settings = migrateSettings(this.plugin.settings);
+    const ver = (this.plugin.manifest && this.plugin.manifest.version) || "";
+    containerEl.createEl("h2", { text: "JEFR Chat" });
+    new Setting(containerEl).setName("Version").setDesc(ver || "unknown");
 
     containerEl.createEl("h3", { text: "Endpoints (multi-host)" });
     containerEl.createEl("p", {

@@ -15,16 +15,16 @@ Archived **2026-08-11** so Cursor will not auto-load jefr / mcp-messenger.
 
 | Path | Note |
 | --- | --- |
-| `~/.cursor/extensions/jefr.jefr-cursor-1.0.5.bak-disabled-*` | Symlink to `Music/Tools/jefr-cursor/extension` renamed so Cursor won’t load it |
+| `~/.cursor/extensions/jefr.jefr-cursor-1.0.5.bak-disabled-*` | Symlink to `Music/Apps/jefr-cursor/extension` renamed so Cursor won’t load it |
 | `extensions.json` | `jefr.jefr-cursor` entry removed |
 
 Older bak already present: `jefr.jefr-cursor-1.0.5.bak-20260730/`.
 
 ## Other project archives (same pattern)
 
-- `C:\Users\jar71\blue\.cursor\archive\mcp\`
-- `C:\Users\jar71\Music\Tools\jefr-cursor\.cursor\archive\mcp\`
-- `C:\Users\jar71\Music\Tools\jefr-cursor-ssh\.cursor\archive\mcp\`
+- `C:\Users\jar71\Music\blue\.cursor\archive\mcp\`
+- `C:\Users\jar71\Music\Apps\jefr-cursor\.cursor\archive\mcp\`
+- `C:\Users\jar71\Music\Apps\jefr-cursor-ssh\.cursor\archive\mcp\`
 
 ## Restore (if needed)
 
